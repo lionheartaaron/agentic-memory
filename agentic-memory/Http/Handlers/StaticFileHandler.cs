@@ -1,3 +1,4 @@
+using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Http.Models;
 
 namespace AgenticMemory.Http.Handlers;
@@ -7,6 +8,13 @@ namespace AgenticMemory.Http.Handlers;
 /// </summary>
 public class StaticFileHandler : IHandler
 {
+    private readonly IMemoryRepository? _repository;
+
+    public StaticFileHandler(IMemoryRepository? repository = null)
+    {
+        _repository = repository;
+    }
+
     public Task<Response> HandleAsync(Request request, CancellationToken cancellationToken)
     {
         if (request.Method != Models.HttpMethod.GET)
@@ -72,6 +80,8 @@ public class StaticFileHandler : IHandler
                     
                     <script>
                     const textarea = document.querySelector('.search-box textarea');
+                    const form = textarea.closest('form');
+                    
                     textarea.addEventListener('input', function() {
                         this.style.height = 'auto';
                         this.style.height = Math.min(this.scrollHeight, 200) + 'px';
@@ -79,9 +89,20 @@ public class StaticFileHandler : IHandler
                     textarea.addEventListener('keydown', function(e) {
                         if (e.key === 'Enter' && !e.shiftKey) {
                             e.preventDefault();
-                            this.closest('form').submit();
+                            submitSearch();
                         }
                     });
+                    
+                    form.addEventListener('submit', function(e) {
+                        e.preventDefault();
+                        submitSearch();
+                    });
+                    
+                    function submitSearch() {
+                        const q = encodeURIComponent(textarea.value);
+                        const topN = form.querySelector('input[name="top_n"]').value;
+                        window.location.href = '/search?q=' + q + '&top_n=' + topN;
+                    }
                     </script>
                     
                     <div class="stats">
@@ -93,23 +114,40 @@ public class StaticFileHandler : IHandler
             """;
     }
 
-    private Task<Response> GetMemoryNodeHtmlAsync(Guid id, CancellationToken cancellationToken)
+    private async Task<Response> GetMemoryNodeHtmlAsync(Guid id, CancellationToken cancellationToken)
     {
-        // TODO: Call IMemoryRepository.GetAsync(id) when implemented
-        // For now, return a sample node
+        MemoryNode node;
 
-        var node = new MemoryNode
+        // Fetch actual memory from repository if available
+        if (_repository is not null)
         {
-            Id = id,
-            Title = "Sample Memory Node",
-            Summary = "This is a sample memory node.",
-            Content = "Full content of the memory node would go here with detailed information.",
-            Tags = ["sample", "demo"],
-            CreatedAt = DateTime.UtcNow.AddDays(-7),
-            LastAccessedAt = DateTime.UtcNow,
-            ReinforcementScore = 1.5,
-            LinkedNodeIds = [Guid.NewGuid(), Guid.NewGuid()]
-        };
+            var entity = await _repository.GetAsync(id, cancellationToken);
+            if (entity is null)
+            {
+                return Response.NotFound($"Memory node with ID {id} not found");
+            }
+
+            // Reinforce the memory on access
+            await _repository.ReinforceAsync(id, cancellationToken);
+
+            node = entity.ToHandlerModel();
+        }
+        else
+        {
+            // Fallback to sample data when no repository available
+            node = new MemoryNode
+            {
+                Id = id,
+                Title = "Sample Memory Node",
+                Summary = "This is a sample memory node.",
+                Content = "Full content of the memory node would go here with detailed information.",
+                Tags = ["sample", "demo"],
+                CreatedAt = DateTime.UtcNow.AddDays(-7),
+                LastAccessedAt = DateTime.UtcNow,
+                ReinforcementScore = 1.5,
+                LinkedNodeIds = [Guid.NewGuid(), Guid.NewGuid()]
+            };
+        }
 
         var linkedNodesHtml = node.LinkedNodeIds.Count > 0
             ? "<ul>" + string.Join("", node.LinkedNodeIds.Select(lid => $"<li><a href=\"/memory/{lid}.html\">{lid}</a></li>")) + "</ul>"
@@ -170,6 +208,6 @@ public class StaticFileHandler : IHandler
             </html>
             """;
 
-        return Task.FromResult(Response.Html(html));
+        return Response.Html(html);
     }
 }

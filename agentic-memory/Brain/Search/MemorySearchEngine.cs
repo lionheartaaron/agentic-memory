@@ -1,5 +1,6 @@
 using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Brain.Models;
+using Microsoft.Extensions.Logging;
 
 namespace AgenticMemory.Brain.Search;
 
@@ -12,6 +13,7 @@ public class MemorySearchEngine : ISearchService
 {
     private readonly IMemoryRepository _repository;
     private readonly IEmbeddingService? _embeddingService;
+    private readonly ILogger<MemorySearchEngine>? _logger;
 
     // Phase 2 scoring weights (with embeddings)
     private const double SemanticWeight = 0.4;
@@ -30,19 +32,21 @@ public class MemorySearchEngine : ISearchService
     /// <summary>
     /// Create a search engine without embedding support (Phase 1 scoring)
     /// </summary>
-    public MemorySearchEngine(IMemoryRepository repository)
+    public MemorySearchEngine(IMemoryRepository repository, ILogger<MemorySearchEngine>? logger = null)
     {
         _repository = repository;
         _embeddingService = null;
+        _logger = logger;
     }
 
     /// <summary>
     /// Create a search engine with optional embedding support (Phase 2 scoring when available)
     /// </summary>
-    public MemorySearchEngine(IMemoryRepository repository, IEmbeddingService? embeddingService)
+    public MemorySearchEngine(IMemoryRepository repository, IEmbeddingService? embeddingService, ILogger<MemorySearchEngine>? logger = null)
     {
         _repository = repository;
         _embeddingService = embeddingService;
+        _logger = logger;
     }
 
     /// <summary>
@@ -71,8 +75,8 @@ public class MemorySearchEngine : ISearchService
                 .ToList();
         }
 
-        // Filter out archived memories
-        candidates = candidates.Where(c => !c.IsArchived).ToList();
+        // Filter to only current memories (not archived and not superseded)
+        candidates = candidates.Where(c => c.IsCurrent).ToList();
 
         // Prepare query data
         var normalizedQuery = query.ToLowerInvariant().Trim();
@@ -101,10 +105,20 @@ public class MemorySearchEngine : ISearchService
             .Take(topN)
             .ToList();
 
-        // Reinforce accessed memories (async, fire and forget)
+        // Reinforce accessed memories (async, fire and forget with error handling)
         foreach (var result in scored)
         {
-            _ = _repository.ReinforceAsync(result.Memory.Id, cancellationToken);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _repository.ReinforceAsync(result.Memory.Id, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "Failed to reinforce memory {MemoryId}", result.Memory.Id);
+                }
+            });
         }
 
         return scored;
@@ -117,8 +131,13 @@ public class MemorySearchEngine : ISearchService
         DateTime now,
         float[]? queryEmbedding)
     {
+        // Extract query words for better matching
+        var queryWords = normalizedQuery.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Where(w => w.Length >= 2)
+            .ToHashSet();
+
         // Calculate fuzzy score
-        var fuzzyScore = CalculateFuzzyScore(memory, normalizedQuery, queryTrigrams);
+        var fuzzyScore = CalculateFuzzyScore(memory, normalizedQuery, queryTrigrams, queryWords);
 
         // Calculate strength score (normalized to 0-1)
         var strengthScore = CalculateStrengthScore(memory);
@@ -165,23 +184,64 @@ public class MemorySearchEngine : ISearchService
     private static double CalculateFuzzyScore(
         MemoryNodeEntity memory,
         string normalizedQuery,
-        HashSet<string> queryTrigrams)
+        HashSet<string> queryTrigrams,
+        HashSet<string> queryWords)
     {
-        // Exact match gets highest score
+        var scores = new List<double>();
+
+        // Exact match in content gets highest score
         if (memory.ContentNormalized.Contains(normalizedQuery))
         {
-            return 1.0;
+            scores.Add(1.0);
         }
 
         // Title match gets high score
-        if (memory.Title.ToLowerInvariant().Contains(normalizedQuery))
+        var titleLower = memory.Title.ToLowerInvariant();
+        if (titleLower.Contains(normalizedQuery))
         {
-            return 0.9;
+            scores.Add(0.95);
         }
 
-        // Trigram similarity
+        // Check if any query word matches a tag exactly or partially
+        foreach (var tag in memory.Tags)
+        {
+            var tagLower = tag.ToLowerInvariant();
+            if (normalizedQuery.Contains(tagLower) || tagLower.Contains(normalizedQuery))
+            {
+                scores.Add(0.9);
+                break;
+            }
+            if (queryWords.Any(w => tagLower.Contains(w) || w.Contains(tagLower)))
+            {
+                scores.Add(0.8);
+                break;
+            }
+        }
+
+        // Check individual word matches in title
+        var titleMatchCount = queryWords.Count(w => titleLower.Contains(w));
+        if (titleMatchCount > 0 && queryWords.Count > 0)
+        {
+            scores.Add(0.7 * titleMatchCount / queryWords.Count);
+        }
+
+        // Check individual word matches in content
+        var contentMatchCount = queryWords.Count(w => memory.ContentNormalized.Contains(w));
+        if (contentMatchCount > 0 && queryWords.Count > 0)
+        {
+            scores.Add(0.5 * contentMatchCount / queryWords.Count);
+        }
+
+        // Trigram similarity (always calculated as baseline)
         var storedTrigrams = new HashSet<string>(memory.Trigrams, StringComparer.OrdinalIgnoreCase);
-        return TrigramFuzzyMatcher.CalculateSimilarity(queryTrigrams, storedTrigrams);
+        var trigramScore = TrigramFuzzyMatcher.CalculateSimilarity(queryTrigrams, storedTrigrams);
+        if (trigramScore > 0.05)
+        {
+            scores.Add(trigramScore * 0.6); // Scale down trigram scores
+        }
+
+        // Return the best score, or 0 if no matches
+        return scores.Count > 0 ? scores.Max() : 0;
     }
 
     private static double CalculateStrengthScore(MemoryNodeEntity memory)

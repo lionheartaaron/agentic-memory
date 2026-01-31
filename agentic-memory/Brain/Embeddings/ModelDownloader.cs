@@ -6,11 +6,12 @@ namespace AgenticMemory.Brain.Embeddings;
 /// <summary>
 /// Downloads embedding models with console progress bar
 /// </summary>
-public class ModelDownloader
+public class ModelDownloader : IDisposable
 {
     private readonly EmbeddingsSettings _settings;
     private readonly ILogger<ModelDownloader>? _logger;
     private readonly HttpClient _httpClient;
+    private bool _disposed;
 
     public ModelDownloader(EmbeddingsSettings settings, ILogger<ModelDownloader>? logger = null)
     {
@@ -178,5 +179,15 @@ public class ModelDownloader
             var sizeKb = bytesRead / 1024.0;
             Console.Write($"{sizeKb:F0} KB downloaded...");
         }
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            _httpClient.Dispose();
+            _disposed = true;
+        }
+        GC.SuppressFinalize(this);
     }
 }

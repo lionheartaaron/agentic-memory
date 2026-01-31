@@ -3,8 +3,10 @@ using System.Net;
 using System.Net.Sockets;
 using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Brain.Maintenance;
+using AgenticMemory.Configuration;
 using AgenticMemory.Http.Configuration;
 using AgenticMemory.Http.Handlers;
+using AgenticMemory.Http.Mcp;
 using AgenticMemory.Http.Middleware;
 using AgenticMemory.Http.Models;
 using Microsoft.Extensions.Logging;
@@ -139,7 +141,7 @@ public class TcpMemoryServer : IAsyncDisposable
                 _activeConnections.TryAdd(connectionId, connectionTask);
 
                 // Clean up completed connection task
-                _ = connectionTask.ContinueWith(_ => _activeConnections.TryRemove(connectionId, out _), TaskScheduler.Default);
+                _ = connectionTask.ContinueWith(_ => _activeConnections.TryRemove(connectionId, out Task? _), TaskScheduler.Default);
             }
             catch (OperationCanceledException)
             {
@@ -261,13 +263,19 @@ public class TcpMemoryServer : IAsyncDisposable
         ILoggerFactory loggerFactory,
         IMemoryRepository? repository = null,
         ISearchService? searchService = null,
-        IMaintenanceService? maintenanceService = null)
+        IMaintenanceService? maintenanceService = null,
+        IEmbeddingService? embeddingService = null,
+        IConflictAwareStorage? conflictStorage = null,
+        StorageSettings? storageSettings = null)
     {
         var searchHandler = new SearchHandler(searchService);
-        var memoryHandler = new MemoryHandler(repository);
-        var staticFileHandler = new StaticFileHandler();
+        var memoryHandler = new MemoryHandler(repository, embeddingService);
+        var staticFileHandler = new StaticFileHandler(repository);
         var adminHandler = new AdminHandler(repository, maintenanceService);
         var cssHandler = new CssHandler();
+        var mcpHandler = new McpHandler(repository, searchService, conflictStorage, storageSettings, loggerFactory.CreateLogger<McpHandler>());
+        var batchHandler = new BatchHandler(repository, searchService, embeddingService);
+        var graphHandler = new GraphHandler(repository);
 
         var router = new Router()
             // Middleware
@@ -288,11 +296,23 @@ public class TcpMemoryServer : IAsyncDisposable
             .MapGet("/search", searchHandler)
             .MapPost("/api/memory/search", searchHandler)
 
+            // Batch operations
+            .MapPost("/api/memory/batch", batchHandler)
+            .MapPut("/api/memory/batch", batchHandler)
+            .MapDelete("/api/memory/batch", batchHandler)
+            .MapPost("/api/memory/search/batch", batchHandler)
+
             // Memory CRUD routes
             .MapGet("/api/memory/{id}", memoryHandler)
             .MapPost("/api/memory", memoryHandler)
             .MapPut("/api/memory/{id}", memoryHandler)
             .MapDelete("/api/memory/{id}", memoryHandler)
+
+            // Memory graph routes
+            .MapGet("/api/memory/{id}/links", graphHandler)
+            .MapPost("/api/memory/{id}/link/{targetId}", graphHandler)
+            .MapDelete("/api/memory/{id}/link/{targetId}", graphHandler)
+            .MapGet("/api/memory/{id}/graph", graphHandler)
 
             // Memory HTML routes
             .MapGet("/memory/{id}.html", staticFileHandler)
@@ -304,7 +324,10 @@ public class TcpMemoryServer : IAsyncDisposable
             .MapPost("/api/admin/reindex", adminHandler)
             .MapPost("/api/admin/compact", adminHandler)
             .MapGet("/api/admin/maintenance/status", adminHandler)
-            .MapGet("/api/admin/health", adminHandler);
+            .MapGet("/api/admin/health", adminHandler)
+
+            // MCP (Model Context Protocol) endpoint
+            .MapPost("/mcp", mcpHandler);
 
         return router;
     }

@@ -89,13 +89,57 @@ public class MemoryNodeEntity
     public Guid? SupersededBy { get; set; }
 
     /// <summary>
+    /// When this memory became valid/current (for temporal tracking)
+    /// </summary>
+    public DateTime ValidFrom { get; set; } = DateTime.UtcNow;
+
+    /// <summary>
+    /// When this memory was superseded (null if still current)
+    /// </summary>
+    public DateTime? ValidUntil { get; set; }
+
+    /// <summary>
+    /// IDs of memories that this memory superseded
+    /// </summary>
+    public List<Guid> SupersededIds { get; set; } = [];
+
+    /// <summary>
+    /// Whether this memory is currently active (not archived and not superseded)
+    /// </summary>
+    public bool IsCurrent => ValidUntil is null && !IsArchived;
+
+    /// <summary>
+    /// Optional expiration time - memory will be auto-deleted after this time
+    /// </summary>
+    public DateTime? ExpiresAt { get; set; }
+
+    /// <summary>
+    /// Initial importance score (0.0-1.0) - affects decay rate and search ranking
+    /// </summary>
+    public double Importance { get; set; } = 0.5;
+
+    /// <summary>
+    /// Whether this memory is pinned (never decays)
+    /// </summary>
+    public bool IsPinned { get; set; } = false;
+
+    /// <summary>
+    /// Check if this memory has expired
+    /// </summary>
+    public bool IsExpired => ExpiresAt.HasValue && DateTime.UtcNow > ExpiresAt.Value;
+
+    /// <summary>
     /// Calculate the current strength with exponential time decay
     /// Strength = BaseStrength * e^(-DecayRate * DaysSinceAccess)
+    /// Pinned memories don't decay. Importance affects effective decay rate.
     /// </summary>
     public double GetCurrentStrength()
     {
+        if (IsPinned) return BaseStrength;
+        
         var daysSinceAccess = (DateTime.UtcNow - LastAccessedAt).TotalDays;
-        return BaseStrength * Math.Exp(-DecayRate * daysSinceAccess);
+        var effectiveDecayRate = DecayRate * (1.0 - Importance * 0.5); // Higher importance = slower decay
+        return BaseStrength * Math.Exp(-effectiveDecayRate * daysSinceAccess);
     }
 
     /// <summary>
@@ -147,7 +191,11 @@ public class MemoryNodeEntity
             LastAccessedAt = LastAccessedAt,
             ReinforcementScore = GetCurrentStrength(),
             LinkedNodeIds = LinkedNodeIds,
-            Embedding = GetEmbedding()
+            Embedding = GetEmbedding(),
+            ExpiresAt = ExpiresAt,
+            Importance = Importance,
+            IsPinned = IsPinned,
+            IsArchived = IsArchived
         };
     }
 
@@ -161,11 +209,15 @@ public class MemoryNodeEntity
             Title = request.Title,
             Summary = request.Summary,
             Content = request.Content ?? string.Empty,
-            Tags = request.Tags ?? []
+            Tags = request.Tags ?? [],
+            ExpiresAt = request.ExpiresAt,
+            Importance = Math.Clamp(request.Importance ?? 0.5, 0.0, 1.0),
+            IsPinned = request.IsPinned ?? false
         };
 
-        // Generate normalized content for search
-        entity.ContentNormalized = $"{entity.Title} {entity.Summary} {entity.Content}".ToLowerInvariant().Trim();
+        // Generate normalized content for search (including tags for searchability)
+        var tagsText = entity.Tags.Count > 0 ? " " + string.Join(" ", entity.Tags) : "";
+        entity.ContentNormalized = $"{entity.Title} {entity.Summary} {entity.Content}{tagsText}".ToLowerInvariant().Trim();
 
         return entity;
     }

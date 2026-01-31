@@ -92,15 +92,36 @@ public partial class LocalEmbeddingService : IEmbeddingService
         return Task.FromResult(embedding);
     }
 
+    /// <summary>
+    /// Preprocesses text for embedding generation.
+    /// Normalizes to ASCII-safe characters to ensure tokenizer compatibility.
+    /// </summary>
     private string PreprocessText(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
             return string.Empty;
 
-        // Normalize whitespace
+        // 0. Remove unpaired surrogates FIRST - Regex will throw ArgumentException on invalid UTF-16
+        // Unpaired surrogates (e.g., \uD83D without its pair) are invalid and crash the regex engine
+        text = RemoveUnpairedSurrogates(text);
+
+        // 1. Remove ALL non-ASCII characters using regex (most robust approach)
+        // This handles emojis, surrogates, CJK, etc. in one simple operation
+        text = NonAsciiRegex().Replace(text, "");
+
+        // 2. Normalize URLs to placeholder (preserves semantic meaning without URL noise)
+        text = UrlRegex().Replace(text, " [URL] ");
+
+        // 3. Normalize email addresses to placeholder
+        text = EmailRegex().Replace(text, " [EMAIL] ");
+
+        // 4. Collapse repeated punctuation (e.g., "!!!" -> "!", "..." -> ".")
+        text = RepeatedPunctuationRegex().Replace(text, "$1");
+
+        // 5. Normalize whitespace (collapse multiple spaces, tabs, newlines)
         text = WhitespaceRegex().Replace(text, " ");
 
-        // Trim and limit length (rough character limit before tokenization)
+        // 6. Trim and limit length (rough character limit before tokenization)
         text = text.Trim();
         if (text.Length > 1024)
         {
@@ -115,6 +136,7 @@ public partial class LocalEmbeddingService : IEmbeddingService
         // Use the BERT tokenizer
         var encoding = _tokenizer!.EncodeToIds(text, _maxSequenceLength, out _, out _);
         var tokenIds = encoding.ToArray();
+
 
         // Ensure we don't exceed max length
         var length = Math.Min(tokenIds.Length, _maxSequenceLength);
@@ -148,6 +170,7 @@ public partial class LocalEmbeddingService : IEmbeddingService
             NamedOnnxValue.CreateFromTensor("attention_mask", attentionMaskTensor),
             NamedOnnxValue.CreateFromTensor("token_type_ids", tokenTypeIdsTensor)
         };
+
 
         // Run inference
         using var results = _session!.Run(inputs);
@@ -201,6 +224,67 @@ public partial class LocalEmbeddingService : IEmbeddingService
         GC.SuppressFinalize(this);
     }
 
+    // Regex patterns for text preprocessing (compiled at build time for performance)
+
+    /// <summary>
+    /// Removes unpaired surrogate characters that would cause Regex to throw ArgumentException.
+    /// In UTF-16, surrogates must appear in pairs (high surrogate 0xD800-0xDBFF followed by low surrogate 0xDC00-0xDFFF).
+    /// An unpaired surrogate is invalid UTF-16 and crashes the .NET Regex engine.
+    /// </summary>
+    private static string RemoveUnpairedSurrogates(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text;
+
+        // Use StringBuilder for efficient character-by-character processing
+        var sb = new System.Text.StringBuilder(text.Length);
+
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+
+            if (char.IsHighSurrogate(c))
+            {
+                // High surrogate must be followed by a low surrogate
+                if (i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+                {
+                    // Valid surrogate pair - include both characters
+                    sb.Append(c);
+                    sb.Append(text[i + 1]);
+                    i++; // Skip the low surrogate in next iteration
+                }
+                // else: Unpaired high surrogate - skip it
+            }
+            else if (char.IsLowSurrogate(c))
+            {
+                // Low surrogate without preceding high surrogate - skip it
+            }
+            else
+            {
+                // Regular character - include it
+                sb.Append(c);
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Matches any character outside printable ASCII range (0x20-0x7E) and common whitespace.
+    /// This removes emojis, surrogates, CJK characters, extended Latin, and all other non-ASCII.
+    /// </summary>
+    [GeneratedRegex(@"[^\x20-\x7E\t\n\r]")]
+    private static partial Regex NonAsciiRegex();
+
     [GeneratedRegex(@"\s+")]
     private static partial Regex WhitespaceRegex();
+
+    [GeneratedRegex(@"https?://[^\s]+|www\.[^\s]+", RegexOptions.IgnoreCase)]
+    private static partial Regex UrlRegex();
+
+    [GeneratedRegex(@"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", RegexOptions.IgnoreCase)]
+    private static partial Regex EmailRegex();
+
+    [GeneratedRegex(@"([!?.,;:])\1+")]
+    private static partial Regex RepeatedPunctuationRegex();
 }

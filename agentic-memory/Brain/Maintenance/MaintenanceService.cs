@@ -18,7 +18,7 @@ public class MaintenanceService : IMaintenanceService
     private DateTime? _lastConsolidationRun;
     private DateTime? _lastReindexRun;
     private DateTime? _lastCompactRun;
-    private volatile bool _isRunning;
+    private readonly SemaphoreSlim _operationLock = new(1, 1);
     private string? _currentOperation;
 
     public MaintenanceService(
@@ -35,7 +35,7 @@ public class MaintenanceService : IMaintenanceService
     {
         var startedAt = DateTime.UtcNow;
 
-        if (_isRunning)
+        if (!await _operationLock.WaitAsync(0, cancellationToken))
         {
             return new DecayResult
             {
@@ -48,7 +48,6 @@ public class MaintenanceService : IMaintenanceService
 
         try
         {
-            _isRunning = true;
             _currentOperation = "Decay";
 
             _logger?.LogInformation("Starting decay operation with prune threshold {Threshold}", pruneThreshold);
@@ -118,8 +117,8 @@ public class MaintenanceService : IMaintenanceService
         }
         finally
         {
-            _isRunning = false;
             _currentOperation = null;
+            _operationLock.Release();
         }
     }
 
@@ -127,7 +126,7 @@ public class MaintenanceService : IMaintenanceService
     {
         var startedAt = DateTime.UtcNow;
 
-        if (_isRunning)
+        if (!await _operationLock.WaitAsync(0, cancellationToken))
         {
             return new ConsolidationResult
             {
@@ -140,7 +139,6 @@ public class MaintenanceService : IMaintenanceService
 
         try
         {
-            _isRunning = true;
             _currentOperation = "Consolidation";
 
             _logger?.LogInformation("Starting consolidation with similarity threshold {Threshold}", similarityThreshold);
@@ -253,8 +251,8 @@ public class MaintenanceService : IMaintenanceService
         }
         finally
         {
-            _isRunning = false;
             _currentOperation = null;
+            _operationLock.Release();
         }
     }
 
@@ -262,7 +260,7 @@ public class MaintenanceService : IMaintenanceService
     {
         var startedAt = DateTime.UtcNow;
 
-        if (_isRunning)
+        if (!await _operationLock.WaitAsync(0, cancellationToken))
         {
             return new ReindexResult
             {
@@ -275,7 +273,6 @@ public class MaintenanceService : IMaintenanceService
 
         try
         {
-            _isRunning = true;
             _currentOperation = "Reindex";
 
             _logger?.LogInformation("Starting reindex operation");
@@ -359,8 +356,8 @@ public class MaintenanceService : IMaintenanceService
         }
         finally
         {
-            _isRunning = false;
             _currentOperation = null;
+            _operationLock.Release();
         }
     }
 
@@ -368,7 +365,7 @@ public class MaintenanceService : IMaintenanceService
     {
         var startedAt = DateTime.UtcNow;
 
-        if (_isRunning)
+        if (!await _operationLock.WaitAsync(0, cancellationToken))
         {
             return new CompactResult
             {
@@ -381,7 +378,6 @@ public class MaintenanceService : IMaintenanceService
 
         try
         {
-            _isRunning = true;
             _currentOperation = "Compact";
 
             _logger?.LogInformation("Starting database compact operation");
@@ -439,10 +435,15 @@ public class MaintenanceService : IMaintenanceService
         }
         finally
         {
-            _isRunning = false;
             _currentOperation = null;
+            _operationLock.Release();
         }
     }
+
+    /// <summary>
+    /// Check if a maintenance operation is currently running
+    /// </summary>
+    public bool IsRunning => _operationLock.CurrentCount == 0;
 
     public MaintenanceStatus GetStatus()
     {
@@ -452,7 +453,7 @@ public class MaintenanceService : IMaintenanceService
             LastConsolidationRun = _lastConsolidationRun,
             LastReindexRun = _lastReindexRun,
             LastCompactRun = _lastCompactRun,
-            IsRunning = _isRunning,
+            IsRunning = IsRunning,
             CurrentOperation = _currentOperation
         };
     }

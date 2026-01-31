@@ -10,10 +10,12 @@ namespace AgenticMemory.Http.Handlers;
 public class MemoryHandler : IHandler
 {
     private readonly IMemoryRepository? _repository;
+    private readonly IEmbeddingService? _embeddingService;
 
-    public MemoryHandler(IMemoryRepository? repository = null)
+    public MemoryHandler(IMemoryRepository? repository = null, IEmbeddingService? embeddingService = null)
     {
         _repository = repository;
+        _embeddingService = embeddingService;
     }
 
     public Task<Response> HandleAsync(Request request, CancellationToken cancellationToken)
@@ -27,6 +29,7 @@ public class MemoryHandler : IHandler
             _ => Task.FromResult(Response.MethodNotAllowed("Use GET, POST, PUT, or DELETE"))
         };
     }
+
 
     private async Task<Response> HandleGetAsync(Request request, CancellationToken cancellationToken)
     {
@@ -91,6 +94,22 @@ public class MemoryHandler : IHandler
         if (_repository is not null)
         {
             var entity = MemoryNodeEntity.FromCreateRequest(createRequest);
+            
+            // Generate embedding if service is available
+            if (_embeddingService?.IsAvailable == true)
+            {
+                try
+                {
+                    var textForEmbedding = $"{entity.Title} {entity.Summary} {entity.Content}";
+                    var embedding = await _embeddingService.GetEmbeddingAsync(textForEmbedding, cancellationToken);
+                    entity.SetEmbedding(embedding);
+                }
+                catch
+                {
+                    // Continue without embedding if generation fails
+                }
+            }
+            
             await _repository.SaveAsync(entity, cancellationToken);
             return Response.Created($"/api/memory/{entity.Id}", entity.ToHandlerModel());
         }
@@ -136,14 +155,45 @@ public class MemoryHandler : IHandler
             }
 
             // Update fields
+            var contentChanged = false;
             if (updateRequest.Title is not null)
+            {
                 existing.Title = updateRequest.Title;
+                contentChanged = true;
+            }
             if (updateRequest.Summary is not null)
+            {
                 existing.Summary = updateRequest.Summary;
+                contentChanged = true;
+            }
             if (updateRequest.Content is not null)
+            {
                 existing.Content = updateRequest.Content;
+                contentChanged = true;
+            }
             if (updateRequest.Tags is not null)
                 existing.Tags = updateRequest.Tags;
+            if (updateRequest.ExpiresAt is not null)
+                existing.ExpiresAt = updateRequest.ExpiresAt;
+            if (updateRequest.Importance is not null)
+                existing.Importance = Math.Clamp(updateRequest.Importance.Value, 0.0, 1.0);
+            if (updateRequest.IsPinned is not null)
+                existing.IsPinned = updateRequest.IsPinned.Value;
+
+            // Regenerate embedding if content changed and service is available
+            if (contentChanged && _embeddingService?.IsAvailable == true)
+            {
+                try
+                {
+                    var textForEmbedding = $"{existing.Title} {existing.Summary} {existing.Content}";
+                    var embedding = await _embeddingService.GetEmbeddingAsync(textForEmbedding, cancellationToken);
+                    existing.SetEmbedding(embedding);
+                }
+                catch
+                {
+                    // Continue without embedding update if generation fails
+                }
+            }
 
             existing.Reinforce();
             await _repository.SaveAsync(existing, cancellationToken);
@@ -202,6 +252,10 @@ public record MemoryNode
     public double ReinforcementScore { get; init; }
     public List<Guid> LinkedNodeIds { get; init; } = [];
     public float[]? Embedding { get; init; }
+    public DateTime? ExpiresAt { get; init; }
+    public double Importance { get; init; }
+    public bool IsPinned { get; init; }
+    public bool IsArchived { get; init; }
 }
 
 public record CreateMemoryRequest
@@ -210,6 +264,9 @@ public record CreateMemoryRequest
     public string Summary { get; init; } = string.Empty;
     public string? Content { get; init; }
     public List<string>? Tags { get; init; }
+    public DateTime? ExpiresAt { get; init; }
+    public double? Importance { get; init; }
+    public bool? IsPinned { get; init; }
 }
 
 public record UpdateMemoryRequest
@@ -218,4 +275,7 @@ public record UpdateMemoryRequest
     public string? Summary { get; init; }
     public string? Content { get; init; }
     public List<string>? Tags { get; init; }
+    public DateTime? ExpiresAt { get; init; }
+    public double? Importance { get; init; }
+    public bool? IsPinned { get; init; }
 }

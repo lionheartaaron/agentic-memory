@@ -8,7 +8,7 @@ namespace AgenticMemory.Http;
 /// <summary>
 /// Route requests to appropriate handlers
 /// </summary>
-public class Router
+public partial class Router
 {
     private readonly List<Route> _routes = [];
     private readonly List<IMiddleware> _middlewares = [];
@@ -106,7 +106,7 @@ public class Router
                 continue;
 
             // Try to match path
-            var parameters = ExtractParameters(route.Pattern, path);
+            var parameters = route.ExtractParameters(path);
             if (parameters is not null)
             {
                 return (route, parameters);
@@ -116,28 +116,62 @@ public class Router
         return (null, []);
     }
 
-    private static Dictionary<string, string>? ExtractParameters(string pattern, string path)
+    [GeneratedRegex(@"\{(\w+)\}")]
+    private static partial Regex ParameterRegex();
+}
+
+/// <summary>
+/// Represents a registered route with pre-compiled regex
+/// </summary>
+public class Route
+{
+    public Models.HttpMethod? Method { get; }
+    public string Pattern { get; }
+    public IHandler Handler { get; }
+    
+    private readonly bool _hasParameters;
+    private readonly Regex? _compiledRegex;
+    private readonly List<string> _parameterNames = [];
+
+    public Route(Models.HttpMethod? method, string pattern, IHandler handler)
+    {
+        Method = method;
+        Pattern = pattern;
+        Handler = handler;
+        _hasParameters = pattern.Contains('{');
+
+        if (_hasParameters)
+        {
+            // Pre-compile the regex for parameter extraction
+            var regexPattern = "^" + Regex.Replace(pattern, @"\{(\w+)\}", m =>
+            {
+                _parameterNames.Add(m.Groups[1].Value);
+                return $"(?<{m.Groups[1].Value}>[^/]+)";
+            }) + "$";
+
+            _compiledRegex = new Regex(regexPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        }
+    }
+
+    public Dictionary<string, string>? ExtractParameters(string path)
     {
         var parameters = new Dictionary<string, string>();
 
-        // Exact match
-        if (!pattern.Contains('{'))
+        // Exact match for patterns without parameters
+        if (!_hasParameters)
         {
-            return pattern.Equals(path, StringComparison.OrdinalIgnoreCase) ? parameters : null;
+            return Pattern.Equals(path, StringComparison.OrdinalIgnoreCase) ? parameters : null;
         }
 
-        // Convert pattern to regex
-        // /api/memory/{id} -> ^/api/memory/(?<id>[^/]+)$
-        var regexPattern = "^" + Regex.Replace(pattern, @"\{(\w+)\}", m => $"(?<{m.Groups[1].Value}>[^/]+)") + "$";
-
-        var match = Regex.Match(path, regexPattern, RegexOptions.IgnoreCase);
+        // Use pre-compiled regex
+        var match = _compiledRegex!.Match(path);
         if (!match.Success)
             return null;
 
         // Extract named groups
-        foreach (var groupName in match.Groups.Keys)
+        foreach (var groupName in _parameterNames)
         {
-            if (groupName != "0" && match.Groups[groupName].Success)
+            if (match.Groups[groupName].Success)
             {
                 parameters[groupName] = match.Groups[groupName].Value;
             }
@@ -146,8 +180,3 @@ public class Router
         return parameters;
     }
 }
-
-/// <summary>
-/// Represents a registered route
-/// </summary>
-public record Route(Models.HttpMethod? Method, string Pattern, IHandler Handler);

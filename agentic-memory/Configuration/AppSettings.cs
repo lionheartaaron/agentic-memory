@@ -9,6 +9,7 @@ public class AppSettings
     public StorageSettings Storage { get; set; } = new();
     public EmbeddingsSettings Embeddings { get; set; } = new();
     public MaintenanceSettings Maintenance { get; set; } = new();
+    public ConflictSettings Conflict { get; set; } = new();
 }
 
 /// <summary>
@@ -24,6 +25,16 @@ public class ServerSettings
     public int ShutdownTimeoutSeconds { get; set; } = 30;
     public bool EnableKeepAlive { get; set; } = false;
     public string ServerName { get; set; } = "AgenticMemory/1.0";
+
+    /// <summary>
+    /// Maximum request body size in bytes (default: 10MB)
+    /// </summary>
+    public int MaxRequestSizeBytes { get; set; } = 10485760;
+
+    /// <summary>
+    /// Maximum HTTP header size in bytes (default: 8KB)
+    /// </summary>
+    public int MaxHeaderSizeBytes { get; set; } = 8192;
 }
 
 /// <summary>
@@ -31,7 +42,28 @@ public class ServerSettings
 /// </summary>
 public class StorageSettings
 {
-    public string DatabasePath { get; set; } = "./data/agentic-memory.db";
+    public string DatabasePath { get; set; } = "./Data/agentic-memory.db";
+
+    /// <summary>
+    /// Maximum memory content size in bytes (default: 512KB)
+    /// Content exceeding this limit will be truncated
+    /// </summary>
+    public int MaxContentSizeBytes { get; set; } = 524288;
+
+    /// <summary>
+    /// Maximum title length in characters (default: 500)
+    /// </summary>
+    public int MaxTitleLength { get; set; } = 500;
+
+    /// <summary>
+    /// Maximum summary length in characters (default: 2000)
+    /// </summary>
+    public int MaxSummaryLength { get; set; } = 2000;
+
+    /// <summary>
+    /// Maximum number of tags per memory (default: 20)
+    /// </summary>
+    public int MaxTagsPerMemory { get; set; } = 20;
 }
 
 
@@ -41,7 +73,7 @@ public class StorageSettings
 public class EmbeddingsSettings
 {
     public bool Enabled { get; set; } = true;
-    public string ModelsPath { get; set; } = "./models";
+    public string ModelsPath { get; set; } = "./Models";
     public bool AutoDownload { get; set; } = true;
     public string ModelUrlOnnx { get; set; } = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx";
     public string ModelVocabUrlTxt { get; set; } = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt";
@@ -114,4 +146,31 @@ public class MaintenanceSettings
     /// Minutes to wait after startup before running first maintenance task
     /// </summary>
     public int InitialDelayMinutes { get; set; } = 5;
+}
+
+/// <summary>
+/// Conflict resolution settings for handling contradictory or duplicate memories.
+/// Uses content similarity to determine when memories should be superseded.
+/// </summary>
+public class ConflictSettings
+{
+    /// <summary>
+    /// Similarity threshold for detecting duplicate memories (0.0-1.0).
+    /// Memories above this threshold are considered duplicates and will reinforce the existing memory.
+    /// </summary>
+    public double DuplicateSimilarityThreshold { get; set; } = 0.95;
+
+    /// <summary>
+    /// Similarity threshold for superseding memories (0.0-1.0).
+    /// When a new memory's similarity to an existing memory is above this threshold but below
+    /// the duplicate threshold, the old memory is superseded (archived) and replaced by the new one.
+    /// This is ideal for AI agents where updated information should replace outdated facts.
+    /// </summary>
+    public double SupersedeSimilarityThreshold { get; set; } = 0.8;
+
+    /// <summary>
+    /// Similarity threshold for detecting related memories that should coexist (0.0-1.0).
+    /// Memories above this threshold but below the supersede threshold are stored as related but coexisting.
+    /// </summary>
+    public double CoexistSimilarityThreshold { get; set; } = 0.6;
 }

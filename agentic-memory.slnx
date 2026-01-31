@@ -1,3 +1,7 @@
 <Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="agentic-memory-tests/agentic-memory-tests.csproj" Id="bc66ab2f-51a8-4747-b789-c79280f9a8bb" />
   <Project Path="agentic-memory/agentic-memory.csproj" />
 </Solution>

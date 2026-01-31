@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Text;
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -20,7 +21,7 @@ public sealed class OptimizedRequestParser
     private static readonly byte Space = (byte)' ';
     private static readonly byte QuestionMark = (byte)'?';
     private static readonly byte Ampersand = (byte)'&';
-    private static readonly byte Equals = (byte)'=';
+    private static readonly byte EqualsSign = (byte)'=';
 
     private readonly int _maxHeaderSize;
     private readonly int _maxBodySize;
@@ -215,11 +216,12 @@ public sealed class OptimizedRequestParser
                 query = ReadOnlySpan<byte>.Empty;
             }
 
-            int equalsIndex = pair.IndexOf(Equals);
+            int equalsIndex = pair.IndexOf(EqualsSign);
             if (equalsIndex >= 0)
             {
-                var key = Uri.UnescapeDataString(Encoding.UTF8.GetString(pair[..equalsIndex]));
-                var value = Uri.UnescapeDataString(Encoding.UTF8.GetString(pair[(equalsIndex + 1)..]));
+                // Use WebUtility.UrlDecode to properly handle both + and %20 as space
+                var key = WebUtility.UrlDecode(Encoding.UTF8.GetString(pair[..equalsIndex]));
+                var value = WebUtility.UrlDecode(Encoding.UTF8.GetString(pair[(equalsIndex + 1)..]));
                 dict[key] = value;
             }
         }

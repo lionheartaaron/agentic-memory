@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using AgenticMemory.Http.Models;
@@ -150,11 +151,12 @@ public class RequestParser
                 var kv = pair.Split('=', 2);
                 if (kv.Length == 2)
                 {
-                    queryString[Uri.UnescapeDataString(kv[0])] = Uri.UnescapeDataString(kv[1]);
+                    // Use WebUtility.UrlDecode to properly handle both + and %20 as space
+                    queryString[WebUtility.UrlDecode(kv[0])] = WebUtility.UrlDecode(kv[1]);
                 }
                 else if (kv.Length == 1 && !string.IsNullOrEmpty(kv[0]))
                 {
-                    queryString[Uri.UnescapeDataString(kv[0])] = string.Empty;
+                    queryString[WebUtility.UrlDecode(kv[0])] = string.Empty;
                 }
             }
         }

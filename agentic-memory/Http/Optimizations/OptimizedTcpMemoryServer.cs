@@ -125,7 +125,7 @@ public sealed class OptimizedTcpMemoryServer : IAsyncDisposable
                 var connectionTask = HandleConnectionAsync(client, connectionId, cancellationToken);
                 _activeConnections.TryAdd(connectionId, connectionTask);
 
-                _ = connectionTask.ContinueWith(_ => _activeConnections.TryRemove(connectionId, out _), TaskScheduler.Default);
+                _ = connectionTask.ContinueWith(_ => _activeConnections.TryRemove(connectionId, out Task? _), TaskScheduler.Default);
             }
             catch (OperationCanceledException)
             {

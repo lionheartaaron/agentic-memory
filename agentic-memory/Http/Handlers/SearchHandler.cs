@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Http.Models;
 
@@ -6,9 +7,15 @@ namespace AgenticMemory.Http.Handlers;
 /// <summary>
 /// Handle memory search requests
 /// </summary>
-public class SearchHandler : IHandler
+public partial class SearchHandler : IHandler
 {
     private readonly ISearchService? _searchService;
+
+    // Validation constants
+    private const int MaxTopN = 100;
+    private const int MaxQueryLength = 1000;
+    private const int MaxTagLength = 50;
+    private const int MaxTags = 20;
 
     public SearchHandler(ISearchService? searchService = null)
     {
@@ -42,9 +49,22 @@ public class SearchHandler : IHandler
             return Response.BadRequest("Query is required");
         }
 
-        if (searchRequest.TopN <= 0)
+        // Validate query length
+        if (searchRequest.Query.Length > MaxQueryLength)
         {
-            searchRequest = searchRequest with { TopN = 5 };
+            return Response.BadRequest($"Query exceeds maximum length of {MaxQueryLength} characters");
+        }
+
+        // Validate and clamp topN
+        var topN = searchRequest.TopN;
+        if (topN <= 0) topN = 5;
+        if (topN > MaxTopN) topN = MaxTopN;
+
+        // Validate tags
+        var tags = ValidateTags(searchRequest.Tags);
+        if (tags is null)
+        {
+            return Response.BadRequest($"Invalid tags: max {MaxTags} tags, max {MaxTagLength} chars per tag, alphanumeric and hyphens only");
         }
 
         SearchResponse results;
@@ -54,8 +74,8 @@ public class SearchHandler : IHandler
         {
             var scored = await _searchService.SearchAsync(
                 searchRequest.Query,
-                searchRequest.TopN,
-                searchRequest.Tags,
+                topN,
+                tags,
                 cancellationToken);
 
             results = new SearchResponse
@@ -111,10 +131,18 @@ public class SearchHandler : IHandler
             return Response.BadRequest("Query parameter 'q' is required");
         }
 
+        // Validate query length
+        if (query.Length > MaxQueryLength)
+        {
+            return Response.BadRequest($"Query exceeds maximum length of {MaxQueryLength} characters");
+        }
+
+        // Validate and clamp topN
         if (!int.TryParse(topNStr, out var topN) || topN <= 0)
         {
             topN = 5;
         }
+        if (topN > MaxTopN) topN = MaxTopN;
 
         SearchResponse results;
 
@@ -165,6 +193,31 @@ public class SearchHandler : IHandler
 
         return Response.Ok(results);
     }
+
+    /// <summary>
+    /// Validate tags - returns null if invalid, or sanitized list if valid
+    /// </summary>
+    private List<string>? ValidateTags(IEnumerable<string>? tags)
+    {
+        if (tags is null) return [];
+
+        var tagList = tags.ToList();
+        if (tagList.Count > MaxTags) return null;
+
+        var validatedTags = new List<string>();
+        foreach (var tag in tagList)
+        {
+            if (string.IsNullOrWhiteSpace(tag)) continue;
+            if (tag.Length > MaxTagLength) return null;
+            if (!TagValidationRegex().IsMatch(tag)) return null;
+            validatedTags.Add(tag.ToLowerInvariant());
+        }
+
+        return validatedTags;
+    }
+
+    [GeneratedRegex(@"^[a-zA-Z0-9\-_]+$")]
+    private static partial Regex TagValidationRegex();
 
     private static string RenderSearchResultsHtml(SearchResponse response)
     {
