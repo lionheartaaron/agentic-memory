@@ -11,7 +11,7 @@
 
 *The missing memory layer for AI assistants. Works with GitHub Copilot, Claude, Cursor, and any MCP-compatible agent.*
 
-[Quick Start](#-quick-start) • [Copilot Setup](#-github-copilot-integration) • [Claude Setup](#-claude-desktop-setup) • [API Reference](#-api-reference)
+[Quick Start](#quick-start) • [Copilot Setup](#github-copilot-integration) • [Claude Setup](#claude-desktop-setup) • [API Reference](#api-reference)
 
 </div>
 
