@@ -35,41 +35,34 @@ public class RequestParser
 
             while (totalRead < _maxHeaderSize)
             {
-                if (!stream.DataAvailable && totalRead == 0)
-                {
-                    // Wait for data with timeout
-                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                    timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));
+                // Use ReadAsync with cancellation token - it will block until data arrives
+                // or cancellation is requested. Don't rely on DataAvailable which can be
+                // false even when more data is coming (network latency between packets).
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));
 
-                    try
-                    {
-                        int read = await stream.ReadAsync(buffer.AsMemory(totalRead, _maxHeaderSize - totalRead), timeoutCts.Token);
-                        if (read == 0)
-                            return null; // Connection closed
-
-                        totalRead += read;
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        return null;
-                    }
-                }
-                else if (stream.DataAvailable)
+                try
                 {
-                    int read = await stream.ReadAsync(buffer.AsMemory(totalRead, _maxHeaderSize - totalRead), cancellationToken);
+                    int read = await stream.ReadAsync(buffer.AsMemory(totalRead, _maxHeaderSize - totalRead), timeoutCts.Token);
                     if (read == 0)
-                        return null;
+                        return null; // Connection closed
 
                     totalRead += read;
+                }
+                catch (OperationCanceledException)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                        return null; // External cancellation
+                    // Timeout - if we have data, try to parse it; otherwise return null
+                    if (totalRead == 0)
+                        return null;
+                    break;
                 }
 
                 // Check for end of headers
                 headerEnd = FindHeaderEnd(buffer.AsSpan(0, totalRead));
                 if (headerEnd >= 0)
                     break;
-
-                if (!stream.DataAvailable && totalRead > 0)
-                    break; // No more data and no header end found yet - might be incomplete
             }
 
             if (headerEnd < 0)
@@ -80,8 +73,9 @@ public class RequestParser
             var (method, path, queryString) = ParseRequestLine(headerSpan);
             var headers = ParseHeaders(headerSpan);
 
-            // Read body if Content-Length is present
+            // Read body based on Content-Length or Transfer-Encoding
             byte[]? body = null;
+            
             if (headers.TryGetValue("Content-Length", out var contentLengthStr) &&
                 int.TryParse(contentLengthStr, out var contentLength) &&
                 contentLength > 0)
@@ -90,6 +84,12 @@ public class RequestParser
                     throw new InvalidOperationException($"Body too large: {contentLength} bytes");
 
                 body = await ReadBodyAsync(stream, buffer, totalRead, headerEnd + 4, contentLength, cancellationToken);
+            }
+            else if (headers.TryGetValue("Transfer-Encoding", out var transferEncoding) &&
+                     transferEncoding.Contains("chunked", StringComparison.OrdinalIgnoreCase))
+            {
+                // Handle chunked transfer encoding
+                body = await ReadChunkedBodyAsync(stream, buffer, totalRead, headerEnd + 4, cancellationToken);
             }
 
             return new Request
@@ -214,5 +214,99 @@ public class RequestParser
         }
 
         return body;
+    }
+
+    /// <summary>
+    /// Read chunked transfer-encoded body per HTTP/1.1 spec (RFC 7230)
+    /// Format: {chunk-size in hex}\r\n{chunk-data}\r\n ... 0\r\n\r\n
+    /// </summary>
+    private async Task<byte[]> ReadChunkedBodyAsync(NetworkStream stream, byte[] headerBuffer, int totalHeaderRead, int bodyStart, CancellationToken cancellationToken)
+    {
+        using var bodyStream = new MemoryStream();
+        var readBuffer = new byte[8192];
+        
+        // First, handle any data already in the header buffer after the headers
+        int leftoverStart = bodyStart;
+        int leftoverLength = totalHeaderRead - bodyStart;
+        byte[] leftoverData = leftoverLength > 0 
+            ? headerBuffer[leftoverStart..totalHeaderRead] 
+            : [];
+        
+        var chunkBuffer = new List<byte>(leftoverData);
+        
+        while (true)
+        {
+            // Ensure we have enough data to read chunk size line
+            while (!ContainsCrlf(chunkBuffer))
+            {
+                int read = await stream.ReadAsync(readBuffer, cancellationToken);
+                if (read == 0)
+                    throw new InvalidOperationException("Connection closed while reading chunked body");
+                chunkBuffer.AddRange(readBuffer.Take(read));
+            }
+            
+            // Extract chunk size line
+            int crlfIndex = FindCrlfIndex(chunkBuffer);
+            var sizeLine = Encoding.ASCII.GetString(chunkBuffer.Take(crlfIndex).ToArray()).Trim();
+            chunkBuffer.RemoveRange(0, crlfIndex + 2); // Remove size line + CRLF
+            
+            // Parse chunk size (hex, may have extensions after semicolon)
+            var sizeStr = sizeLine.Split(';')[0].Trim();
+            if (!int.TryParse(sizeStr, System.Globalization.NumberStyles.HexNumber, null, out var chunkSize))
+                throw new InvalidOperationException($"Invalid chunk size: {sizeLine}");
+            
+            // Size 0 means end of chunks
+            if (chunkSize == 0)
+                break;
+            
+            if (bodyStream.Length + chunkSize > _maxBodySize)
+                throw new InvalidOperationException($"Chunked body too large: exceeds {_maxBodySize} bytes");
+            
+            // Read chunk data
+            while (chunkBuffer.Count < chunkSize + 2) // +2 for trailing CRLF
+            {
+                int read = await stream.ReadAsync(readBuffer, cancellationToken);
+                if (read == 0)
+                    throw new InvalidOperationException("Connection closed while reading chunk data");
+                chunkBuffer.AddRange(readBuffer.Take(read));
+            }
+            
+            // Write chunk data to body stream (excluding trailing CRLF)
+            bodyStream.Write(chunkBuffer.Take(chunkSize).ToArray());
+            chunkBuffer.RemoveRange(0, chunkSize + 2); // Remove chunk data + CRLF
+        }
+        
+        // Skip trailing headers (if any) - read until final CRLF
+        while (!ContainsCrlf(chunkBuffer))
+        {
+            if (!stream.DataAvailable)
+                break; // No trailing headers
+            int read = await stream.ReadAsync(readBuffer, cancellationToken);
+            if (read == 0)
+                break;
+            chunkBuffer.AddRange(readBuffer.Take(read));
+        }
+        
+        return bodyStream.ToArray();
+    }
+    
+    private static bool ContainsCrlf(List<byte> buffer)
+    {
+        for (int i = 0; i < buffer.Count - 1; i++)
+        {
+            if (buffer[i] == '\r' && buffer[i + 1] == '\n')
+                return true;
+        }
+        return false;
+    }
+    
+    private static int FindCrlfIndex(List<byte> buffer)
+    {
+        for (int i = 0; i < buffer.Count - 1; i++)
+        {
+            if (buffer[i] == '\r' && buffer[i + 1] == '\n')
+                return i;
+        }
+        return -1;
     }
 }

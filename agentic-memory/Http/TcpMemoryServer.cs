@@ -270,6 +270,7 @@ public class TcpMemoryServer : IAsyncDisposable
     {
         var searchHandler = new SearchHandler(searchService);
         var memoryHandler = new MemoryHandler(repository, embeddingService);
+        var reinforceHandler = new ReinforceHandler(repository);
         var staticFileHandler = new StaticFileHandler(repository);
         var adminHandler = new AdminHandler(repository, maintenanceService);
         var cssHandler = new CssHandler();
@@ -307,6 +308,9 @@ public class TcpMemoryServer : IAsyncDisposable
             .MapPost("/api/memory", memoryHandler)
             .MapPut("/api/memory/{id}", memoryHandler)
             .MapDelete("/api/memory/{id}", memoryHandler)
+            
+            // Memory reinforcement
+            .MapPost("/api/memory/{id}/reinforce", reinforceHandler)
 
             // Memory graph routes
             .MapGet("/api/memory/{id}/links", graphHandler)
@@ -326,8 +330,13 @@ public class TcpMemoryServer : IAsyncDisposable
             .MapGet("/api/admin/maintenance/status", adminHandler)
             .MapGet("/api/admin/health", adminHandler)
 
-            // MCP (Model Context Protocol) endpoint
-            .MapPost("/mcp", mcpHandler);
+            // MCP (Model Context Protocol) endpoint - Streamable HTTP 2025-03-26 spec
+            // POST: Send JSON-RPC messages to server
+            // GET: Request SSE stream (returns 405 if not supported)
+            // DELETE: Terminate session
+            .MapPost("/mcp", mcpHandler)
+            .MapGet("/mcp", mcpHandler)
+            .MapDelete("/mcp", mcpHandler);
 
         return router;
     }

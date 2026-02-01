@@ -33,10 +33,13 @@ public class StaticFileHandler : IHandler
         // Memory node HTML - /memory/{id}.html
         if (path.StartsWith("/memory/") && path.EndsWith(".html"))
         {
-            var idStr = path["/memory/".Length..^".html".Length];
+            // Extract just the path before query string if present
+            var pathWithoutQuery = path.Contains('?') ? path[..path.IndexOf('?')] : path;
+            var idStr = pathWithoutQuery["/memory/".Length..^".html".Length];
             if (Guid.TryParse(idStr, out var id))
             {
-                return GetMemoryNodeHtmlAsync(id, cancellationToken);
+                var searchQuery = request.GetQueryParameter("q");
+                return GetMemoryNodeHtmlAsync(id, searchQuery, cancellationToken);
             }
         }
 
@@ -114,7 +117,7 @@ public class StaticFileHandler : IHandler
             """;
     }
 
-    private async Task<Response> GetMemoryNodeHtmlAsync(Guid id, CancellationToken cancellationToken)
+    private async Task<Response> GetMemoryNodeHtmlAsync(Guid id, string? searchQuery, CancellationToken cancellationToken)
     {
         MemoryNode node;
 
@@ -155,6 +158,15 @@ public class StaticFileHandler : IHandler
 
         var tagsHtml = string.Join("", node.Tags.Select(t => $"<span class=\"tag\">{System.Web.HttpUtility.HtmlEncode(t)}</span>"));
 
+        // Build back link - return to search results if we came from a search, otherwise home
+        var backLink = string.IsNullOrEmpty(searchQuery)
+            ? "<a href=\"/\">&#8592; Back to Search</a>"
+            : $"<a href=\"/search?q={System.Web.HttpUtility.UrlEncode(searchQuery)}\">&#8592; Back to Search Results</a>";
+        
+        var deleteRedirectUrl = string.IsNullOrEmpty(searchQuery)
+            ? "/"
+            : $"/search?q={System.Web.HttpUtility.UrlEncode(searchQuery)}";
+
         var html = $$"""
             <!DOCTYPE html>
             <html lang="en">
@@ -168,7 +180,7 @@ public class StaticFileHandler : IHandler
             <body>
                 <div class="container">
                     <div class="breadcrumb">
-                        <a href="/">&#8592; Back to Search</a>
+                        {{backLink}}
                     </div>
                     
                     <div class="memory-header">
@@ -203,7 +215,74 @@ public class StaticFileHandler : IHandler
                         <h3>Linked Nodes</h3>
                         {{linkedNodesHtml}}
                     </div>
+                    
+                    <div class="management-actions">
+                        <h3>Actions</h3>
+                        <div class="action-buttons">
+                            <button class="btn btn-danger" onclick="deleteMemory('{{node.Id}}')">
+                                Delete Memory
+                            </button>
+                            <button class="btn btn-secondary" onclick="reinforceMemory('{{node.Id}}')">
+                                Reinforce
+                            </button>
+                            <button class="btn btn-secondary" onclick="copyId('{{node.Id}}')">
+                                Copy ID
+                            </button>
+                        </div>
+                    </div>
                 </div>
+                
+                <script>
+                const deleteRedirectUrl = '{{deleteRedirectUrl}}';
+                
+                async function deleteMemory(id) {
+                    if (!confirm('Are you sure you want to delete this memory? This action cannot be undone.')) {
+                        return;
+                    }
+                    
+                    try {
+                        const response = await fetch('/api/memory/' + id, {
+                            method: 'DELETE'
+                        });
+                        
+                        if (response.ok || response.status === 204) {
+                            alert('Memory deleted successfully');
+                            window.location.href = deleteRedirectUrl;
+                        } else {
+                            const error = await response.text();
+                            alert('Failed to delete memory: ' + error);
+                        }
+                    } catch (e) {
+                        alert('Error deleting memory: ' + e.message);
+                    }
+                }
+                
+                async function reinforceMemory(id) {
+                    try {
+                        const response = await fetch('/api/memory/' + id + '/reinforce', {
+                            method: 'POST'
+                        });
+                        
+                        if (response.ok) {
+                            alert('Memory reinforced successfully');
+                            location.reload();
+                        } else {
+                            const error = await response.text();
+                            alert('Failed to reinforce memory: ' + error);
+                        }
+                    } catch (e) {
+                        alert('Error reinforcing memory: ' + e.message);
+                    }
+                }
+                
+                function copyId(id) {
+                    navigator.clipboard.writeText(id).then(() => {
+                        alert('Memory ID copied to clipboard');
+                    }).catch(e => {
+                        alert('Failed to copy: ' + e.message);
+                    });
+                }
+                </script>
             </body>
             </html>
             """;

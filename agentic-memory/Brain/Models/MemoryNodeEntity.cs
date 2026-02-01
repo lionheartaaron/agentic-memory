@@ -5,7 +5,7 @@ namespace AgenticMemory.Brain.Models;
 /// <summary>
 /// LiteDB entity for memory nodes with fuzzy search support, time decay, and reinforcement
 /// </summary>
-public class MemoryNodeEntity
+public class MemoryNodeEntity : IEquatable<MemoryNodeEntity>
 {
     /// <summary>
     /// Unique identifier for the memory node
@@ -221,4 +221,45 @@ public class MemoryNodeEntity
 
         return entity;
     }
+
+    #region IEquatable<MemoryNodeEntity>
+
+    /// <summary>
+    /// Determines whether the specified MemoryNodeEntity is equal to the current instance based on Id.
+    /// </summary>
+    public bool Equals(MemoryNodeEntity? other)
+    {
+        if (other is null) return false;
+        if (ReferenceEquals(this, other)) return true;
+        return Id == other.Id;
+    }
+
+    /// <summary>
+    /// Determines whether the specified object is equal to the current instance.
+    /// </summary>
+    public override bool Equals(object? obj)
+    {
+        return Equals(obj as MemoryNodeEntity);
+    }
+
+    /// <summary>
+    /// Returns a hash code based on the Id.
+    /// </summary>
+    public override int GetHashCode()
+    {
+        return Id.GetHashCode();
+    }
+
+    public static bool operator ==(MemoryNodeEntity? left, MemoryNodeEntity? right)
+    {
+        if (left is null) return right is null;
+        return left.Equals(right);
+    }
+
+    public static bool operator !=(MemoryNodeEntity? left, MemoryNodeEntity? right)
+    {
+        return !(left == right);
+    }
+
+    #endregion
 }

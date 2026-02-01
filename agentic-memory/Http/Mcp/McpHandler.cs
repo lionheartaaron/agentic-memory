@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Brain.Models;
@@ -10,15 +11,32 @@ namespace AgenticMemory.Http.Mcp;
 
 /// <summary>
 /// MCP (Model Context Protocol) handler for AI agent integration
-/// Implements JSON-RPC 2.0 over HTTP for tool and resource access
+/// Implements JSON-RPC 2.0 over Streamable HTTP per specification 2025-03-26
+/// Supports Visual Studio's strict Streamable HTTP requirements including session management
 /// </summary>
-public class McpHandler : IHandler
+public partial class McpHandler : IHandler
 {
     private readonly IMemoryRepository? _repository;
     private readonly ISearchService? _searchService;
     private readonly IConflictAwareStorage? _conflictStorage;
     private readonly StorageSettings _storageSettings;
     private readonly ILogger<McpHandler>? _logger;
+
+    /// <summary>
+    /// Session management for MCP Streamable HTTP protocol (2025-03-26)
+    /// Key: Session ID, Value: Session state with last access time
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, SessionState> Sessions = new();
+    
+    /// <summary>
+    /// Session timeout for cleanup (1 hour)
+    /// </summary>
+    private static readonly TimeSpan SessionTimeout = TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// Allowed origins for DNS rebinding protection (null = allow all for local dev)
+    /// </summary>
+    private readonly HashSet<string>? _allowedOrigins;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -27,717 +45,466 @@ public class McpHandler : IHandler
         WriteIndented = false
     };
 
+    /// <summary>
+    /// Pretty-print JSON options for logging
+    /// </summary>
+    private static readonly JsonSerializerOptions JsonPrettyOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+        WriteIndented = true
+    };
+
     public McpHandler(
         IMemoryRepository? repository = null,
         ISearchService? searchService = null,
         IConflictAwareStorage? conflictStorage = null,
         StorageSettings? storageSettings = null,
-        ILogger<McpHandler>? logger = null)
+        ILogger<McpHandler>? logger = null,
+        HashSet<string>? allowedOrigins = null)
     {
         _repository = repository;
         _searchService = searchService;
         _conflictStorage = conflictStorage;
         _storageSettings = storageSettings ?? new StorageSettings();
         _logger = logger;
+        _allowedOrigins = allowedOrigins;
     }
 
     public async Task<Response> HandleAsync(Request request, CancellationToken cancellationToken)
     {
-        if (request.Method != Models.HttpMethod.POST)
+        // Periodic session cleanup (non-blocking)
+        CleanupExpiredSessions();
+
+        // Log incoming request details
+        LogIncomingRequest(request);
+
+        // Security: Validate Origin header for DNS rebinding protection (2025-03-26 spec)
+        if (!ValidateOrigin(request))
         {
-            return Response.MethodNotAllowed("MCP requires POST requests");
+            _logger?.LogWarning("[MCP] Request rejected: invalid Origin header '{Origin}'", 
+                request.GetHeader("Origin") ?? "(none)");
+            return Response.Forbidden("Invalid Origin header");
         }
 
+        // Route based on HTTP method per 2025-03-26 spec
+        var response = request.Method switch
+        {
+            Models.HttpMethod.POST => await HandlePostAsync(request, cancellationToken),
+            Models.HttpMethod.GET => HandleGet(request),
+            Models.HttpMethod.DELETE => HandleDelete(request),
+            _ => Response.MethodNotAllowed("MCP endpoint supports POST, GET, and DELETE methods")
+        };
+
+        // Log outgoing response
+        LogOutgoingResponse(request.Method, response);
+
+        return response;
+    }
+
+    /// <summary>
+    /// Log details about incoming MCP request
+    /// </summary>
+    private void LogIncomingRequest(Request request)
+    {
+        if (_logger is null) return;
+
+        _logger.LogInformation("[MCP] --> Incoming {Method} request", request.Method);
+        
+        // Log headers at debug level
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            var sessionId = request.GetHeader("Mcp-Session-Id");
+            var contentType = request.GetHeader("Content-Type");
+            var accept = request.GetHeader("Accept");
+            var origin = request.GetHeader("Origin");
+            var contentLength = request.GetHeader("Content-Length");
+            var transferEncoding = request.GetHeader("Transfer-Encoding");
+            
+            _logger.LogDebug("[MCP] Headers: Session={SessionId}, Content-Type={ContentType}, Accept={Accept}, Origin={Origin}, Content-Length={ContentLength}, Transfer-Encoding={TransferEncoding}",
+                sessionId ?? "(none)", contentType ?? "(none)", accept ?? "(none)", origin ?? "(none)", 
+                contentLength ?? "(none)", transferEncoding ?? "(none)");
+            
+            // Log ALL headers for deep debugging
+            _logger.LogDebug("[MCP] All headers: {Headers}", 
+                string.Join(", ", request.Headers.Select(h => $"{h.Key}={h.Value}")));
+        }
+
+        // Log request body at debug level with pretty-print
+        if (request.Body is not null && request.Body.Length > 0 && _logger.IsEnabled(LogLevel.Debug))
+        {
+            try
+            {
+                var rawBody = System.Text.Encoding.UTF8.GetString(request.Body);
+                
+                // Try to pretty-print JSON
+                var jsonDoc = JsonDocument.Parse(rawBody);
+                var prettyJson = JsonSerializer.Serialize(jsonDoc, JsonPrettyOptions);
+                
+                _logger.LogDebug("[MCP] Request Body ({Length} bytes):\n{Body}", request.Body.Length, prettyJson);
+            }
+            catch
+            {
+                // If not valid JSON, log raw
+                var rawBody = System.Text.Encoding.UTF8.GetString(request.Body);
+                _logger.LogDebug("[MCP] Request Body (raw, {Length} bytes): {Body}", request.Body.Length, rawBody);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Log details about outgoing MCP response
+    /// </summary>
+    private void LogOutgoingResponse(Models.HttpMethod method, Response response)
+    {
+        if (_logger is null) return;
+
+        var statusIndicator = response.StatusCode switch
+        {
+            >= 200 and < 300 => "OK",
+            >= 400 and < 500 => "WARN",
+            >= 500 => "ERROR",
+            _ => "OUT"
+        };
+
+        _logger.LogInformation("[MCP] [{Status}] Response: {StatusCode} {ReasonPhrase}", 
+        statusIndicator, response.StatusCode, response.ReasonPhrase);
+
+        // Log session header if present
+        if (response.Headers.TryGetValue("Mcp-Session-Id", out var sessionId))
+        {
+            _logger.LogDebug("[MCP] Response Session-Id: {SessionId}", sessionId);
+        }
+
+        // Log response body at debug level with pretty-print
+        if (response.Body is not null && _logger.IsEnabled(LogLevel.Debug))
+        {
+            try
+            {
+                string prettyJson;
+                if (response.Body is JsonRpcResponse rpcResponse)
+                {
+                    prettyJson = JsonSerializer.Serialize(rpcResponse, JsonPrettyOptions);
+                }
+                else if (response.Body is List<JsonRpcResponse> rpcResponses)
+                {
+                    prettyJson = JsonSerializer.Serialize(rpcResponses, JsonPrettyOptions);
+                }
+                else
+                {
+                    prettyJson = JsonSerializer.Serialize(response.Body, JsonPrettyOptions);
+                }
+                
+                _logger.LogDebug("[MCP] Response Body:\n{Body}", prettyJson);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug("[MCP] Response Body: (could not serialize: {Error})", ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Handle POST requests - main JSON-RPC message handler (2025-03-26 spec)
+    /// </summary>
+    private async Task<Response> HandlePostAsync(Request request, CancellationToken cancellationToken)
+    {
         try
         {
-            var rpcRequest = request.GetBodyAs<JsonRpcRequest>();
-            if (rpcRequest is null)
+            // Parse the JSON-RPC message(s) - can be single or batched
+            var (messages, isBatch) = ParseJsonRpcMessages(request.Body);
+            
+            if (messages is null || messages.Count == 0)
             {
-                return CreateErrorResponse(null, -32700, "Parse error: Invalid JSON");
+                var rawBody = request.Body is not null && request.Body.Length > 0
+                    ? System.Text.Encoding.UTF8.GetString(request.Body)
+                    : "(empty)";
+                _logger?.LogWarning("[MCP] Request body could not be parsed as JSON-RPC. Raw body ({Length} bytes): {Body}", 
+                    request.Body?.Length ?? 0, rawBody);
+                return CreateErrorResponse(null, -32700, "Parse error: Invalid JSON", null);
             }
 
-            _logger?.LogDebug("MCP request: {Method} (id: {Id})", rpcRequest.Method, rpcRequest.Id);
+            _logger?.LogDebug("[MCP] Parsed {Count} message(s), isBatch={IsBatch}", messages.Count, isBatch);
 
-            var response = rpcRequest.Method switch
+            // Check if this is an initialization request
+            var isInitRequest = messages.Any(m => m.Method == "initialize" && m.Id is not null);
+            
+            // Session management per 2025-03-26 spec
+            string? sessionId = null;
+            if (isInitRequest)
             {
-                "initialize" => HandleInitialize(rpcRequest),
-                "initialized" => HandleInitialized(rpcRequest),
-                "tools/list" => HandleToolsList(rpcRequest),
-                "tools/call" => await HandleToolsCallAsync(rpcRequest, cancellationToken),
-                "resources/list" => await HandleResourcesListAsync(rpcRequest, cancellationToken),
-                "resources/read" => await HandleResourcesReadAsync(rpcRequest, cancellationToken),
-                "ping" => HandlePing(rpcRequest),
-                _ => CreateErrorResponse(rpcRequest.Id, -32601, $"Method not found: {rpcRequest.Method}")
+                // Initialize creates a new session - don't require existing session
+                sessionId = CreateNewSession();
+                _logger?.LogInformation("[MCP] New session created: {SessionId}", sessionId);
+            }
+            else
+            {
+                // All other requests require a valid session
+                sessionId = request.GetHeader("Mcp-Session-Id");
+                if (string.IsNullOrEmpty(sessionId))
+                {
+                    _logger?.LogWarning("[MCP] Request missing Mcp-Session-Id header");
+                    return Response.BadRequest("Missing Mcp-Session-Id header");
+                }
+                
+                if (!Sessions.TryGetValue(sessionId, out var session))
+                {
+                    _logger?.LogWarning("[MCP] Session not found or expired: {SessionId}", sessionId);
+                    return Response.NotFound("Session not found or expired");
+                }
+                
+                // Update last access time
+                session.LastAccessTime = DateTime.UtcNow;
+                _logger?.LogDebug("[MCP] Session validated: {SessionId}", sessionId);
+            }
+
+            // Classify messages: requests have id, notifications/responses don't need response
+            var requests = messages.Where(m => m.Id is not null && !string.IsNullOrEmpty(m.Method)).ToList();
+            var notifications = messages.Where(m => m.Id is null && !string.IsNullOrEmpty(m.Method)).ToList();
+            var responses = messages.Where(m => m.Id is not null && string.IsNullOrEmpty(m.Method)).ToList();
+
+            _logger?.LogDebug("[MCP] Message classification: {RequestCount} requests, {NotificationCount} notifications, {ResponseCount} responses",
+                requests.Count, notifications.Count, responses.Count);
+
+            // Per spec: If input consists solely of notifications or responses, return 202 Accepted
+            if (requests.Count == 0)
+            {
+                _logger?.LogDebug("[MCP] No requests in message, processing notifications only");
+                
+                // Process notifications (fire and forget)
+                foreach (var notification in notifications)
+                {
+                    await ProcessNotificationAsync(notification, sessionId, cancellationToken);
+                }
+                
+                var acceptedResponse = Response.Accepted();
+                if (!string.IsNullOrEmpty(sessionId))
+                {
+                    acceptedResponse.Headers["Mcp-Session-Id"] = sessionId;
+                }
+                return acceptedResponse;
+            }
+
+            // Process requests and build responses
+            var jsonRpcResponses = new List<JsonRpcResponse>();
+            foreach (var rpcRequest in requests)
+            {
+                _logger?.LogInformation("[MCP] Processing request: method={Method}, id={Id}", 
+                rpcRequest.Method, NormalizeId(rpcRequest.Id));
+                
+                var response = await ProcessRequestAsync(rpcRequest, sessionId, cancellationToken);
+                jsonRpcResponses.Add(response);
+                
+                // Log result
+                if (response.Error is not null)
+                {
+                    _logger?.LogWarning("[MCP] Response error: code={Code}, message={Message}", 
+                    response.Error.Code, response.Error.Message);
+                }
+                else
+                {
+                    _logger?.LogInformation("[MCP] Response success for id={Id}", response.Id);
+                }
+            }
+
+            // Also process any notifications in the batch
+            foreach (var notification in notifications)
+            {
+                await ProcessNotificationAsync(notification, sessionId, cancellationToken);
+            }
+
+            // Return response(s) with Content-Type: application/json
+            Response httpResponse;
+            if (isBatch || jsonRpcResponses.Count > 1)
+            {
+                // Return as array for batched requests
+                httpResponse = Response.Ok(jsonRpcResponses);
+            }
+            else
+            {
+                // Return single response
+                httpResponse = Response.Ok(jsonRpcResponses[0]);
+            }
+
+            // Add session header
+            if (!string.IsNullOrEmpty(sessionId))
+            {
+                httpResponse.Headers["Mcp-Session-Id"] = sessionId;
+            }
+
+            return httpResponse;
+        }
+        catch (JsonException ex)
+        {
+            _logger?.LogWarning(ex, "[MCP] JSON parse error: {Message}", ex.Message);
+            return CreateErrorResponse(null, -32700, "Parse error: " + ex.Message, null);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "[MCP] Internal error: {Message}", ex.Message);
+            return CreateErrorResponse(null, -32603, "Internal error: " + ex.Message, null);
+        }
+    }
+
+    /// <summary>
+    /// Handle GET requests - SSE stream for server-to-client messages (2025-03-26 spec)
+    /// We don't support SSE streaming, so return 405 Method Not Allowed
+    /// </summary>
+    private Response HandleGet(Request request)
+    {
+        // Per 2025-03-26 spec: Server MUST return 405 if it doesn't offer SSE stream
+        _logger?.LogDebug("[MCP] GET request received - SSE not supported, returning 405");
+        return Response.MethodNotAllowed("This server does not support SSE streaming via GET");
+    }
+
+    /// <summary>
+    /// Handle DELETE requests - session termination (2025-03-26 spec)
+    /// </summary>
+    private Response HandleDelete(Request request)
+    {
+        var sessionId = request.GetHeader("Mcp-Session-Id");
+        
+        if (string.IsNullOrEmpty(sessionId))
+        {
+            _logger?.LogWarning("[MCP] DELETE request missing Mcp-Session-Id header");
+            return Response.BadRequest("Missing Mcp-Session-Id header");
+        }
+
+        if (Sessions.TryRemove(sessionId, out _))
+        {
+            _logger?.LogInformation("[MCP] Session terminated by client: {SessionId}", sessionId);
+            return Response.NoContent();
+        }
+
+        _logger?.LogWarning("[MCP] DELETE request for unknown session: {SessionId}", sessionId);
+        return Response.NotFound("Session not found");
+    }
+
+    /// <summary>
+    /// Validate Origin header to prevent DNS rebinding attacks (2025-03-26 spec)
+    /// </summary>
+    private bool ValidateOrigin(Request request)
+    {
+        // If no allowed origins configured, allow all (for local development)
+        if (_allowedOrigins is null || _allowedOrigins.Count == 0)
+            return true;
+
+        var origin = request.GetHeader("Origin");
+        if (string.IsNullOrEmpty(origin))
+        {
+            // No Origin header - allow for non-browser clients
+            return true;
+        }
+
+        return _allowedOrigins.Contains(origin);
+    }
+
+    /// <summary>
+    /// Parse JSON-RPC messages from request body (single or batch)
+    /// </summary>
+    private (List<JsonRpcRequest>? messages, bool isBatch) ParseJsonRpcMessages(byte[]? body)
+    {
+        if (body is null || body.Length == 0)
+            return (null, false);
+
+        var json = System.Text.Encoding.UTF8.GetString(body);
+        var trimmed = json.TrimStart();
+
+        if (trimmed.StartsWith('['))
+        {
+            // Batch request
+            var batch = JsonSerializer.Deserialize<List<JsonRpcRequest>>(body, JsonOptions);
+            return (batch, true);
+        }
+        else
+        {
+            // Single request
+            var single = JsonSerializer.Deserialize<JsonRpcRequest>(body, JsonOptions);
+            return (single is not null ? [single] : null, false);
+        }
+    }
+
+    /// <summary>
+    /// Process a JSON-RPC notification (no response expected)
+    /// </summary>
+    private Task ProcessNotificationAsync(JsonRpcRequest notification, string? sessionId, CancellationToken cancellationToken)
+    {
+        _logger?.LogInformation("[MCP] Notification received: {Method}", notification.Method);
+        
+        // Handle known notifications
+        switch (notification.Method)
+        {
+            case "initialized":
+                // Client has completed initialization
+                _logger?.LogInformation("[MCP] Client initialization complete, session: {SessionId}", sessionId);
+                break;
+            case "notifications/cancelled":
+                // Client cancelled a request
+                _logger?.LogInformation("[MCP] Request cancelled by client");
+                break;
+            default:
+                _logger?.LogDebug("[MCP] Unknown notification: {Method}", notification.Method);
+                break;
+        }
+        
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Process a JSON-RPC request and return a response
+    /// </summary>
+    private async Task<JsonRpcResponse> ProcessRequestAsync(JsonRpcRequest request, string? sessionId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = request.Method switch
+            {
+                "initialize" => HandleInitialize(request, sessionId),
+                "tools/list" => HandleToolsList(request),
+                "tools/call" => await HandleToolsCallAsync(request, cancellationToken),
+                "resources/list" => await HandleResourcesListAsync(request, cancellationToken),
+                "resources/read" => await HandleResourcesReadAsync(request, cancellationToken),
+                "resources/templates/list" => HandleResourcesTemplatesList(request),
+                "prompts/list" => HandlePromptsList(request),
+                "ping" => HandlePing(request),
+                _ => CreateJsonRpcErrorResponse(request.Id, -32601, $"Method not found: {request.Method}")
             };
 
             return response;
         }
-        catch (JsonException ex)
-        {
-            _logger?.LogWarning(ex, "MCP JSON parse error");
-            return CreateErrorResponse(null, -32700, "Parse error: " + ex.Message);
-        }
         catch (Exception ex)
         {
-            _logger?.LogError(ex, "MCP internal error");
-            return CreateErrorResponse(null, -32603, "Internal error: " + ex.Message);
+            _logger?.LogError(ex, "[MCP] Error processing request '{Method}': {Message}", request.Method, ex.Message);
+            return CreateJsonRpcErrorResponse(request.Id, -32603, $"Internal error: {ex.Message}");
         }
     }
 
-    private Response HandleInitialize(JsonRpcRequest request)
+    /// <summary>
+    /// Create a new session ID (2025-03-26 spec: globally unique, cryptographically secure)
+    /// </summary>
+    private string CreateNewSession()
     {
-        var result = new InitializeResult
+        var sessionId = Guid.NewGuid().ToString();
+        Sessions[sessionId] = new SessionState { LastAccessTime = DateTime.UtcNow };
+        _logger?.LogDebug("[MCP] Session storage now contains {Count} active session(s)", Sessions.Count);
+        return sessionId;
+    }
+
+    /// <summary>
+    /// Remove expired sessions (older than SessionTimeout)
+    /// </summary>
+    private void CleanupExpiredSessions()
+    {
+        var cutoff = DateTime.UtcNow - SessionTimeout;
+        var expiredSessions = Sessions.Where(kvp => kvp.Value.LastAccessTime < cutoff).Select(kvp => kvp.Key).ToList();
+        
+        foreach (var sessionId in expiredSessions)
         {
-            ProtocolVersion = "2024-11-05",
-            Capabilities = new ServerCapabilities
+            if (Sessions.TryRemove(sessionId, out _))
             {
-                Tools = new ToolsCapability { ListChanged = false },
-                Resources = new ResourcesCapability { Subscribe = false, ListChanged = false }
-            },
-            ServerInfo = new ServerInfo
-            {
-                Name = "agentic-memory",
-                Version = "1.0.0"
+                _logger?.LogDebug("Removed expired MCP session: {SessionId}", sessionId);
             }
-        };
-
-        return CreateSuccessResponse(request.Id, result);
-    }
-
-    private Response HandleInitialized(JsonRpcRequest request)
-    {
-        // Notification - no response needed, but we return success for HTTP
-        return CreateSuccessResponse(request.Id, new { });
-    }
-
-    private Response HandlePing(JsonRpcRequest request)
-    {
-        return CreateSuccessResponse(request.Id, new { });
-    }
-
-    private Response HandleToolsList(JsonRpcRequest request)
-    {
-        var tools = new List<ToolDefinition>
-        {
-            new()
-            {
-                Name = "search_memories",
-                Description = "Search for memories using semantic vector similarity and fuzzy text matching. Use this FIRST before storing new memories to check if related information already exists. Returns memories ranked by relevance score.",
-                InputSchema = new ToolInputSchema
-                {
-                    Type = "object",
-                    Properties = new Dictionary<string, PropertySchema>
-                    {
-                        ["query"] = new() { Type = "string", Description = "Natural language search query. Can include concepts, keywords, or questions." },
-                        ["top_n"] = new() { Type = "integer", Description = "Maximum number of results to return (1-100)", Default = 5 },
-                        ["tags"] = new() { Type = "array", Description = "Optional: Filter results to only memories containing these tags", Items = new PropertySchema { Type = "string" } }
-                    },
-                    Required = ["query"]
-                }
-            },
-            new()
-            {
-                Name = "store_memory",
-                Description = "Store a new memory with automatic conflict resolution. Duplicates are detected and reinforced. Singular-state tags (employment, residence, etc.) automatically supersede older memories. Good for: facts learned, user preferences, decisions made, important context.",
-                InputSchema = new ToolInputSchema
-                {
-                    Type = "object",
-                    Properties = new Dictionary<string, PropertySchema>
-                    {
-                        ["title"] = new() { Type = "string", Description = "Short, descriptive title (used in search results)" },
-                        ["summary"] = new() { Type = "string", Description = "1-2 sentence summary of the key information" },
-                        ["content"] = new() { Type = "string", Description = "Full details, context, and any relevant information" },
-                        ["tags"] = new() { Type = "array", Description = "Categorization tags. Singular-state tags (employment, residence, relationship-status) auto-supersede older memories with the same tag.", Items = new PropertySchema { Type = "string" } },
-                        ["importance"] = new() { Type = "number", Description = "Priority 0.0-1.0 (higher = slower decay). Default 0.5" }
-                    },
-                    Required = ["title", "summary"]
-                }
-            },
-            new()
-            {
-                Name = "update_memory",
-                Description = "Update an existing memory by ID. Use this to correct information, add details, or update tags. The memory's last accessed time will be refreshed.",
-                InputSchema = new ToolInputSchema
-                {
-                    Type = "object",
-                    Properties = new Dictionary<string, PropertySchema>
-                    {
-                        ["id"] = new() { Type = "string", Format = "uuid", Description = "Memory ID (from search results or previous store)" },
-                        ["title"] = new() { Type = "string", Description = "Updated title (optional)" },
-                        ["summary"] = new() { Type = "string", Description = "Updated summary (optional)" },
-                        ["content"] = new() { Type = "string", Description = "Updated content (optional)" },
-                        ["tags"] = new() { Type = "array", Description = "Replace all tags with these (optional)", Items = new PropertySchema { Type = "string" } }
-                    },
-                    Required = ["id"]
-                }
-            },
-            new()
-            {
-                Name = "get_memory",
-                Description = "Retrieve full details of a specific memory by ID. Also reinforces the memory (increases strength). Use when you need complete content from a search result.",
-                InputSchema = new ToolInputSchema
-                {
-                    Type = "object",
-                    Properties = new Dictionary<string, PropertySchema>
-                    {
-                        ["id"] = new() { Type = "string", Format = "uuid", Description = "Memory ID from search results" }
-                    },
-                    Required = ["id"]
-                }
-            },
-            new()
-            {
-                Name = "delete_memory",
-                Description = "Permanently delete a memory. Use sparingly - memories naturally decay if unused. Only delete if information is wrong or explicitly requested.",
-                InputSchema = new ToolInputSchema
-                {
-                    Type = "object",
-                    Properties = new Dictionary<string, PropertySchema>
-                    {
-                        ["id"] = new() { Type = "string", Format = "uuid", Description = "Memory ID to delete" }
-                    },
-                    Required = ["id"]
-                }
-            },
-            new()
-            {
-                Name = "get_stats",
-                Description = "Get memory system statistics: total memories, average strength, database size. Useful for understanding memory health.",
-                InputSchema = new ToolInputSchema
-                {
-                    Type = "object",
-                    Properties = new Dictionary<string, PropertySchema>()
-                }
-            },
-            new()
-            {
-                Name = "get_tag_history",
-                Description = "Get the history of memories for a specific tag, including superseded/archived memories. Useful for seeing how information changed over time (e.g., employment history, location changes).",
-                InputSchema = new ToolInputSchema
-                {
-                    Type = "object",
-                    Properties = new Dictionary<string, PropertySchema>
-                    {
-                        ["tag"] = new() { Type = "string", Description = "The tag to get history for (e.g., 'employment', 'residence')" },
-                        ["include_archived"] = new() { Type = "boolean", Description = "Include archived/superseded memories", Default = true }
-                    },
-                    Required = ["tag"]
-                }
-            }
-        };
-
-        return CreateSuccessResponse(request.Id, new { tools });
-    }
-
-    private async Task<Response> HandleToolsCallAsync(JsonRpcRequest request, CancellationToken cancellationToken)
-    {
-        var paramsJson = JsonSerializer.Serialize(request.Params, JsonOptions);
-        var callParams = JsonSerializer.Deserialize<ToolCallParams>(paramsJson, JsonOptions);
-
-        if (callParams is null || string.IsNullOrEmpty(callParams.Name))
-        {
-            return CreateErrorResponse(request.Id, -32602, "Invalid params: missing tool name");
         }
-
-        try
-        {
-            var result = callParams.Name switch
-            {
-                "search_memories" => await ExecuteSearchMemoriesAsync(callParams.Arguments, cancellationToken),
-                "store_memory" => await ExecuteStoreMemoryAsync(callParams.Arguments, cancellationToken),
-                "update_memory" => await ExecuteUpdateMemoryAsync(callParams.Arguments, cancellationToken),
-                "get_memory" => await ExecuteGetMemoryAsync(callParams.Arguments, cancellationToken),
-                "delete_memory" => await ExecuteDeleteMemoryAsync(callParams.Arguments, cancellationToken),
-                "get_stats" => await ExecuteGetStatsAsync(cancellationToken),
-                "get_tag_history" => await ExecuteGetTagHistoryAsync(callParams.Arguments, cancellationToken),
-                _ => new ToolCallResult
-                {
-                    IsError = true,
-                    Content = [new ToolContent { Type = "text", Text = $"Unknown tool: {callParams.Name}" }]
-                }
-            };
-
-            return CreateSuccessResponse(request.Id, result);
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError(ex, "Tool execution error: {Tool}", callParams.Name);
-            return CreateSuccessResponse(request.Id, new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = $"Error executing {callParams.Name}: {ex.Message}" }]
-            });
-        }
-    }
-
-    private async Task<ToolCallResult> ExecuteSearchMemoriesAsync(Dictionary<string, object?>? args, CancellationToken cancellationToken)
-    {
-        if (_searchService is null)
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Search service not available" }]
-            };
-        }
-
-        var query = GetStringArg(args, "query") ?? "";
-        var topN = GetIntArg(args, "top_n") ?? 5;
-        var tags = GetStringArrayArg(args, "tags");
-
-        var results = await _searchService.SearchAsync(query, topN, tags, cancellationToken);
-
-        var text = results.Count == 0
-            ? "No memories found matching the query."
-            : string.Join("\n\n", results.Select(r =>
-                $"**{r.Memory.Title}** (Score: {r.Score:F2})\n" +
-                $"ID: {r.Memory.Id}\n" +
-                $"Summary: {r.Memory.Summary}\n" +
-                $"Tags: {string.Join(", ", r.Memory.Tags)}"));
-
-        return new ToolCallResult
-        {
-            Content = [new ToolContent { Type = "text", Text = text }]
-        };
-    }
-
-    private async Task<ToolCallResult> ExecuteStoreMemoryAsync(Dictionary<string, object?>? args, CancellationToken cancellationToken)
-    {
-        if (_repository is null)
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Repository not available" }]
-            };
-        }
-
-        var title = GetStringArg(args, "title");
-        var summary = GetStringArg(args, "summary");
-        var content = GetStringArg(args, "content") ?? "";
-        var tags = GetStringArrayArg(args, "tags") ?? [];
-        var importance = GetDoubleArg(args, "importance") ?? 0.5;
-
-        if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(summary))
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Title and summary are required" }]
-            };
-        }
-
-        // Validate and enforce size limits
-        if (title.Length > _storageSettings.MaxTitleLength)
-        {
-            title = title[.._storageSettings.MaxTitleLength];
-            _logger?.LogDebug("Title truncated to {MaxLength} characters", _storageSettings.MaxTitleLength);
-        }
-
-        if (summary.Length > _storageSettings.MaxSummaryLength)
-        {
-            summary = summary[.._storageSettings.MaxSummaryLength];
-            _logger?.LogDebug("Summary truncated to {MaxLength} characters", _storageSettings.MaxSummaryLength);
-        }
-
-        if (content.Length > _storageSettings.MaxContentSizeBytes)
-        {
-            content = content[.._storageSettings.MaxContentSizeBytes];
-            _logger?.LogDebug("Content truncated to {MaxLength} bytes", _storageSettings.MaxContentSizeBytes);
-        }
-
-        if (tags.Count > _storageSettings.MaxTagsPerMemory)
-        {
-            tags = tags[.._storageSettings.MaxTagsPerMemory];
-            _logger?.LogDebug("Tags limited to {MaxTags}", _storageSettings.MaxTagsPerMemory);
-        }
-
-        // Clamp importance to valid range
-        importance = Math.Clamp(importance, 0.0, 1.0);
-
-        var entity = new MemoryNodeEntity
-        {
-            Title = title,
-            Summary = summary,
-            Content = content,
-            Tags = tags.ToList(),
-            Importance = importance
-        };
-
-        // Use conflict-aware storage if available
-        if (_conflictStorage is not null)
-        {
-            var result = await _conflictStorage.StoreAsync(entity, cancellationToken);
-            
-            var responseText = result.Action switch
-            {
-                StoreAction.ReinforcedExisting => 
-                    $"Similar memory already exists.\n{result.Message}\nID: {result.Memory.Id}\nTitle: {result.Memory.Title}",
-                StoreAction.StoredWithSupersede => 
-                    $"Memory stored with conflict resolution.\n{result.Message}\nID: {result.Memory.Id}\nTitle: {result.Memory.Title}\nImportance: {importance:F1}",
-                StoreAction.StoredCoexist => 
-                    $"Memory stored (coexists with similar).\n{result.Message}\nID: {result.Memory.Id}\nTitle: {result.Memory.Title}\nImportance: {importance:F1}",
-                _ => 
-                    $"Memory stored successfully.\nID: {result.Memory.Id}\nTitle: {result.Memory.Title}\nImportance: {importance:F1}"
-            };
-
-            return new ToolCallResult
-            {
-                Content = [new ToolContent { Type = "text", Text = responseText }]
-            };
-        }
-
-        // Fallback to direct repository save
-        await _repository.SaveAsync(entity, cancellationToken);
-
-        return new ToolCallResult
-        {
-            Content = [new ToolContent { Type = "text", Text = $"Memory stored successfully.\nID: {entity.Id}\nTitle: {entity.Title}\nImportance: {importance:F1}" }]
-        };
-    }
-
-    private async Task<ToolCallResult> ExecuteUpdateMemoryAsync(Dictionary<string, object?>? args, CancellationToken cancellationToken)
-    {
-        if (_repository is null)
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Repository not available" }]
-            };
-        }
-
-        var idStr = GetStringArg(args, "id");
-        if (!Guid.TryParse(idStr, out var id))
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Invalid memory ID format" }]
-            };
-        }
-
-        var existing = await _repository.GetAsync(id, cancellationToken);
-        if (existing is null)
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = $"Memory not found: {id}" }]
-            };
-        }
-
-        // Update only provided fields
-        var title = GetStringArg(args, "title");
-        var summary = GetStringArg(args, "summary");
-        var content = GetStringArg(args, "content");
-        var tags = GetStringArrayArg(args, "tags");
-
-        if (title is not null) existing.Title = title;
-        if (summary is not null) existing.Summary = summary;
-        if (content is not null) existing.Content = content;
-        if (tags is not null) existing.Tags = tags.ToList();
-
-        await _repository.SaveAsync(existing, cancellationToken);
-
-        return new ToolCallResult
-        {
-            Content = [new ToolContent { Type = "text", Text = $"Memory updated successfully.\nID: {existing.Id}\nTitle: {existing.Title}" }]
-        };
-    }
-
-    private async Task<ToolCallResult> ExecuteGetMemoryAsync(Dictionary<string, object?>? args, CancellationToken cancellationToken)
-    {
-        if (_repository is null)
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Repository not available" }]
-            };
-        }
-
-        var idStr = GetStringArg(args, "id");
-        if (!Guid.TryParse(idStr, out var id))
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Invalid memory ID" }]
-            };
-        }
-
-        var memory = await _repository.GetAsync(id, cancellationToken);
-        if (memory is null)
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = $"Memory not found: {id}" }]
-            };
-        }
-
-        await _repository.ReinforceAsync(id, cancellationToken);
-
-        var text = $"**{memory.Title}**\n\n" +
-                   $"ID: {memory.Id}\n" +
-                   $"Summary: {memory.Summary}\n\n" +
-                   $"Content:\n{memory.Content}\n\n" +
-                   $"Tags: {string.Join(", ", memory.Tags)}\n" +
-                   $"Created: {memory.CreatedAt:yyyy-MM-dd HH:mm:ss} UTC\n" +
-                   $"Strength: {memory.GetCurrentStrength():F2}";
-
-        return new ToolCallResult
-        {
-            Content = [new ToolContent { Type = "text", Text = text }]
-        };
-    }
-
-    private async Task<ToolCallResult> ExecuteDeleteMemoryAsync(Dictionary<string, object?>? args, CancellationToken cancellationToken)
-    {
-        if (_repository is null)
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Repository not available" }]
-            };
-        }
-
-        var idStr = GetStringArg(args, "id");
-        if (!Guid.TryParse(idStr, out var id))
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Invalid memory ID" }]
-            };
-        }
-
-        var deleted = await _repository.DeleteAsync(id, cancellationToken);
-
-        return new ToolCallResult
-        {
-            Content = [new ToolContent { Type = "text", Text = deleted ? $"Memory deleted: {id}" : $"Memory not found: {id}" }]
-        };
-    }
-
-    private async Task<ToolCallResult> ExecuteGetStatsAsync(CancellationToken cancellationToken)
-    {
-        if (_repository is null)
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Repository not available" }]
-            };
-        }
-
-        var stats = await _repository.GetStatsAsync(cancellationToken);
-
-        var text = $"**Memory Repository Statistics**\n\n" +
-                   $"Total Nodes: {stats.TotalNodes}\n" +
-                   $"Average Strength: {stats.AverageStrength:F2}\n" +
-                   $"Weak Memories: {stats.WeakMemoriesCount}\n" +
-                   $"Database Size: {stats.DatabaseSizeBytes / 1024.0 / 1024.0:F2} MB\n" +
-                   $"Oldest Memory: {stats.OldestMemory?.ToString("yyyy-MM-dd HH:mm:ss") ?? "N/A"}\n" +
-                   $"Newest Memory: {stats.NewestMemory?.ToString("yyyy-MM-dd HH:mm:ss") ?? "N/A"}";
-
-        return new ToolCallResult
-        {
-            Content = [new ToolContent { Type = "text", Text = text }]
-        };
-    }
-
-    private Task<Response> HandleResourcesListAsync(JsonRpcRequest request, CancellationToken cancellationToken)
-    {
-        // Only expose lightweight resources - no memory://all to prevent loading entire database
-        var resources = new List<ResourceDefinition>
-        {
-            new()
-            {
-                Uri = "memory://recent",
-                Name = "Recent Memories",
-                Description = "Recently accessed memories (last 10)",
-                MimeType = "application/json"
-            },
-            new()
-            {
-                Uri = "memory://stats",
-                Name = "Statistics",
-                Description = "Memory repository statistics",
-                MimeType = "application/json"
-            }
-        };
-
-        // Note: Individual memories should be accessed via get_memory tool or memory://{id} URI
-        // We don't enumerate all memories here for performance reasons
-
-        return Task.FromResult(CreateSuccessResponse(request.Id, new { resources }));
-    }
-
-    private async Task<Response> HandleResourcesReadAsync(JsonRpcRequest request, CancellationToken cancellationToken)
-    {
-        var paramsJson = JsonSerializer.Serialize(request.Params, JsonOptions);
-        var readParams = JsonSerializer.Deserialize<ResourceReadParams>(paramsJson, JsonOptions);
-
-        if (readParams is null || string.IsNullOrEmpty(readParams.Uri))
-        {
-            return CreateErrorResponse(request.Id, -32602, "Invalid params: missing uri");
-        }
-
-        var uri = readParams.Uri;
-
-        if (!uri.StartsWith("memory://"))
-        {
-            return CreateErrorResponse(request.Id, -32602, $"Invalid URI scheme. Expected memory://, got: {uri}");
-        }
-
-        var path = uri["memory://".Length..];
-
-        try
-        {
-            string content;
-
-            if (path == "recent")
-            {
-                if (_repository is null)
-                {
-                    content = JsonSerializer.Serialize(new { error = "Repository not available" }, JsonOptions);
-                }
-                else
-                {
-                    var memories = await _repository.GetAllAsync(cancellationToken);
-                    var recent = memories.OrderByDescending(m => m.LastAccessedAt).Take(10);
-                    content = JsonSerializer.Serialize(recent.Select(m => new
-                    {
-                        m.Id,
-                        m.Title,
-                        m.Summary,
-                        m.LastAccessedAt,
-                        Strength = m.GetCurrentStrength()
-                    }), JsonOptions);
-                }
-            }
-            else if (path == "stats")
-            {
-                if (_repository is null)
-                {
-                    content = JsonSerializer.Serialize(new { error = "Repository not available" }, JsonOptions);
-                }
-                else
-                {
-                    var stats = await _repository.GetStatsAsync(cancellationToken);
-                    content = JsonSerializer.Serialize(stats, JsonOptions);
-                }
-            }
-            else if (Guid.TryParse(path, out var memoryId))
-            {
-                if (_repository is null)
-                {
-                    content = JsonSerializer.Serialize(new { error = "Repository not available" }, JsonOptions);
-                }
-                else
-                {
-                    var memory = await _repository.GetAsync(memoryId, cancellationToken);
-                    if (memory is null)
-                    {
-                        return CreateErrorResponse(request.Id, -32602, $"Memory not found: {memoryId}");
-                    }
-                    await _repository.ReinforceAsync(memoryId, cancellationToken);
-                    content = JsonSerializer.Serialize(new
-                    {
-                        memory.Id,
-                        memory.Title,
-                        memory.Summary,
-                        memory.Content,
-                        memory.Tags,
-                        memory.CreatedAt,
-                        memory.LastAccessedAt,
-                        Strength = memory.GetCurrentStrength(),
-                        memory.LinkedNodeIds
-                    }, JsonOptions);
-                }
-            }
-            else
-            {
-                return CreateErrorResponse(request.Id, -32602, $"Invalid resource path: {path}");
-            }
-
-            var result = new ResourceReadResult
-            {
-                Contents =
-                [
-                    new ResourceContent
-                    {
-                        Uri = uri,
-                        MimeType = "application/json",
-                        Text = content
-                    }
-                ]
-            };
-
-            return CreateSuccessResponse(request.Id, result);
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError(ex, "Error reading resource: {Uri}", uri);
-            return CreateErrorResponse(request.Id, -32603, $"Error reading resource: {ex.Message}");
-        }
-    }
-
-    private async Task<ToolCallResult> ExecuteGetTagHistoryAsync(Dictionary<string, object?>? args, CancellationToken cancellationToken)
-    {
-        if (_conflictStorage is null)
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Conflict-aware storage not available. Tag history requires conflict resolution feature." }]
-            };
-        }
-
-        var tag = GetStringArg(args, "tag");
-        var includeArchived = GetBoolArg(args, "include_archived") ?? true;
-
-        if (string.IsNullOrWhiteSpace(tag))
-        {
-            return new ToolCallResult
-            {
-                IsError = true,
-                Content = [new ToolContent { Type = "text", Text = "Tag parameter is required" }]
-            };
-        }
-
-        var history = await _conflictStorage.GetTagHistoryAsync(tag, includeArchived, cancellationToken);
-
-        if (history.Count == 0)
-        {
-            return new ToolCallResult
-            {
-                Content = [new ToolContent { Type = "text", Text = $"No memories found with tag '{tag}'." }]
-            };
-        }
-
-        var text = $"**Memory History for tag '{tag}'** ({history.Count} memor{(history.Count == 1 ? "y" : "ies")})\n\n" +
-            string.Join("\n\n", history.Select(m =>
-            {
-                var status = m.IsCurrent ? "? CURRENT" : "? Superseded";
-                var validity = m.ValidUntil.HasValue
-                    ? $"Valid: {m.ValidFrom:yyyy-MM-dd} ? {m.ValidUntil:yyyy-MM-dd}"
-                    : $"Valid from: {m.ValidFrom:yyyy-MM-dd}";
-                var supersededBy = m.SupersededBy.HasValue ? $"\nSuperseded by: {m.SupersededBy}" : "";
-
-                return $"**{m.Title}** [{status}]\n" +
-                       $"ID: {m.Id}\n" +
-                       $"Summary: {m.Summary}\n" +
-                       $"{validity}{supersededBy}";
-            }));
-
-        return new ToolCallResult
-        {
-            Content = [new ToolContent { Type = "text", Text = text }]
-        };
     }
 
     private static string? GetStringArg(Dictionary<string, object?>? args, string key)
@@ -839,31 +606,71 @@ public class McpHandler : IHandler
         return null;
     }
 
-    private Response CreateSuccessResponse(object? id, object result)
+    private Response CreateErrorResponse(object? id, int code, string message, string? sessionId)
     {
-        var response = new JsonRpcResponse
+        var response = CreateJsonRpcErrorResponse(id, code, message);
+        var httpResponse = Response.Ok(response);
+        
+        if (!string.IsNullOrEmpty(sessionId))
         {
-            Jsonrpc = "2.0",
-            Id = id,
-            Result = result
-        };
-
-        return Response.Ok(response);
+            httpResponse.Headers["Mcp-Session-Id"] = sessionId;
+        }
+        
+        return httpResponse;
     }
 
-    private Response CreateErrorResponse(object? id, int code, string message)
+    private JsonRpcResponse CreateJsonRpcSuccessResponse(object? id, object result)
     {
-        var response = new JsonRpcResponse
+        return new JsonRpcResponse
         {
             Jsonrpc = "2.0",
-            Id = id,
+            Id = NormalizeId(id),
+            Result = result
+        };
+    }
+
+    private JsonRpcResponse CreateJsonRpcErrorResponse(object? id, int code, string message)
+    {
+        return new JsonRpcResponse
+        {
+            Jsonrpc = "2.0",
+            Id = NormalizeId(id),
             Error = new JsonRpcError
             {
                 Code = code,
                 Message = message
             }
         };
-
-        return Response.Ok(response);
     }
+
+    /// <summary>
+    /// Normalize JSON-RPC ID from deserialized JsonElement to a primitive type
+    /// that will serialize correctly in the response
+    /// </summary>
+    private static object? NormalizeId(object? id)
+    {
+        if (id is null)
+            return null;
+
+        if (id is JsonElement je)
+        {
+            return je.ValueKind switch
+            {
+                JsonValueKind.Number => je.TryGetInt64(out var l) ? l : je.GetDouble(),
+                JsonValueKind.String => je.GetString(),
+                JsonValueKind.Null => null,
+                _ => id // Fallback: keep as-is
+            };
+        }
+
+        return id;
+    }
+}
+
+/// <summary>
+/// Session state for MCP 2025-03-26 protocol
+/// </summary>
+internal class SessionState
+{
+    public DateTime LastAccessTime { get; set; }
 }

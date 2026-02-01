@@ -221,6 +221,8 @@ public partial class SearchHandler : IHandler
 
     private static string RenderSearchResultsHtml(SearchResponse response)
     {
+        var encodedQuery = System.Web.HttpUtility.UrlEncode(response.Query);
+        
         var tagsHtml = (List<string> tags) => tags.Count > 0 
             ? string.Join("", tags.Select(t => $"<span>{System.Web.HttpUtility.HtmlEncode(t)}</span>"))
             : "";
@@ -228,7 +230,7 @@ public partial class SearchHandler : IHandler
         var resultsHtml = response.Results.Count > 0
             ? string.Join("\n", response.Results.Select(r => $"""
                 <article class="result">
-                    <h2><a href="/memory/{r.Id}.html">{System.Web.HttpUtility.HtmlEncode(r.Title)}</a></h2>
+                    <h2><a href="/memory/{r.Id}.html?q={encodedQuery}">{System.Web.HttpUtility.HtmlEncode(r.Title)}</a></h2>
                     <p>{System.Web.HttpUtility.HtmlEncode(r.Summary)}</p>
                     <div class="meta">
                         <span class="score">{r.Score:F2}</span>

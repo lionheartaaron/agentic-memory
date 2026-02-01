@@ -94,8 +94,11 @@ public class ConflictAwareStorageService : IConflictAwareStorage
 
             foreach (var candidate in supersedeCandidates)
             {
-                var oldMemory = candidate.Memory;
-                if (oldMemory.Id == entity.Id) continue; // Skip self if updating
+                if (candidate.Memory.Id == entity.Id) continue; // Skip self if updating
+
+                // Fetch fresh copy from repository to avoid race conditions with search reinforcement
+                var oldMemory = await _repository.GetAsync(candidate.Memory.Id, cancellationToken);
+                if (oldMemory is null || oldMemory.IsArchived) continue; // Already archived or deleted
 
                 _logger?.LogInformation(
                     "Superseding memory '{OldTitle}' with new memory '{NewTitle}' (similarity: {Score:F2})",

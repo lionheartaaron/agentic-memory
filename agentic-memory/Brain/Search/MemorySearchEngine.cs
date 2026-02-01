@@ -105,20 +105,17 @@ public class MemorySearchEngine : ISearchService
             .Take(topN)
             .ToList();
 
-        // Reinforce accessed memories (async, fire and forget with error handling)
+        // Reinforce accessed memories
         foreach (var result in scored)
         {
-            _ = Task.Run(async () =>
+            try
             {
-                try
-                {
-                    await _repository.ReinforceAsync(result.Memory.Id, CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    _logger?.LogWarning(ex, "Failed to reinforce memory {MemoryId}", result.Memory.Id);
-                }
-            });
+                await _repository.ReinforceAsync(result.Memory.Id, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Failed to reinforce memory {MemoryId}", result.Memory.Id);
+            }
         }
 
         return scored;

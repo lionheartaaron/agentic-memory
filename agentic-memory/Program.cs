@@ -29,12 +29,12 @@ internal class Program
         var settings = new AppSettings();
         configuration.Bind(settings);
 
-        // Setup logging
+        // Setup logging from configuration
         using var loggerFactory = LoggerFactory.Create(builder =>
         {
             builder
-                .AddConsole()
-                .SetMinimumLevel(LogLevel.Information);
+                .AddConfiguration(configuration.GetSection("Logging"))
+                .AddConsole();
         });
 
         var logger = loggerFactory.CreateLogger<Program>();
@@ -204,41 +204,70 @@ internal class Program
         {
             await server.StartAsync(cts.Token);
 
-            // Start background maintenance after server is running
-            backgroundMaintenance?.Start();
+
+            const int boxWidth = 72;
+            string Line(string text) => $"║  {text.PadRight(boxWidth - 4)}║";
+            string Header(string text) => $"║{text.PadLeft((boxWidth + text.Length) / 2).PadRight(boxWidth - 2)}║";
+            string Status(bool enabled, bool active) => enabled ? (active ? "Enabled ✓" : "Enabled (inactive)") : "Disabled";
+            string Endpoint(string method, string path, string desc) => $"  {method,-6} {path,-34} {desc}";
+
+            var listeningOn = $"http://{settings.Server.BindAddress}:{settings.Server.Port}";
+            var embeddingsActive = embeddingService != null && searchEngine?.SemanticSearchAvailable == true;
 
             Console.WriteLine();
-            Console.WriteLine("╔════════════════════════════════════════════════════════════════╗");
-            Console.WriteLine("║              Agentic Memory TCP Server                         ║");
-            Console.WriteLine("╠════════════════════════════════════════════════════════════════╣");
-            Console.WriteLine($"║  Listening on: http://{settings.Server.BindAddress}:{settings.Server.Port,-30}║");
-            Console.WriteLine($"║  Semantic Search: {(searchEngine?.SemanticSearchAvailable == true ? "Enabled ✓" : "Disabled"),-44}║");
-            Console.WriteLine($"║  Conflict Resolution: Enabled ✓                                 ║");
-            Console.WriteLine($"║  Background Maintenance: {(backgroundMaintenance?.IsRunning == true ? "Enabled ✓" : "Disabled"),-37}║");
-            Console.WriteLine($"║  MCP Protocol: Enabled ✓                                        ║");
-            Console.WriteLine("║  Press Ctrl+C to stop                                          ║");
-            Console.WriteLine("╠════════════════════════════════════════════════════════════════╣");
-            Console.WriteLine("║  Core Endpoints:                                               ║");
-            Console.WriteLine("║    GET  /                      - Search interface              ║");
-            Console.WriteLine("║    GET  /search?q=query        - Search memories               ║");
-            Console.WriteLine("║    POST /api/memory            - Create memory                 ║");
-            Console.WriteLine("║    GET  /api/memory/{id}       - Get memory                    ║");
-            Console.WriteLine("║    PUT  /api/memory/{id}       - Update memory                 ║");
-            Console.WriteLine("║    DELETE /api/memory/{id}     - Delete memory                 ║");
-            Console.WriteLine("╠════════════════════════════════════════════════════════════════╣");
-            Console.WriteLine("║  Batch & Graph:                                                ║");
-            Console.WriteLine("║    POST /api/memory/batch      - Batch create                  ║");
-            Console.WriteLine("║    POST /api/memory/search/batch - Batch search                ║");
-            Console.WriteLine("║    GET  /api/memory/{id}/links - Get linked memories           ║");
-            Console.WriteLine("║    POST /api/memory/{id}/link/{targetId} - Create link         ║");
-            Console.WriteLine("║    GET  /api/memory/{id}/graph - Get memory graph              ║");
-            Console.WriteLine("╠════════════════════════════════════════════════════════════════╣");
-            Console.WriteLine("║  MCP & Admin:                                                  ║");
-            Console.WriteLine("║    POST /mcp                   - MCP JSON-RPC endpoint         ║");
-            Console.WriteLine("║    GET  /api/admin/stats       - Server statistics             ║");
-            Console.WriteLine("║    GET  /api/admin/health      - Health check                  ║");
-            Console.WriteLine("╚════════════════════════════════════════════════════════════════╝");
+            Console.WriteLine($"╔{new string('═', boxWidth - 2)}╗");
+            Console.WriteLine(Header("Agentic Memory TCP Server"));
+            Console.WriteLine($"╠{new string('═', boxWidth - 2)}╣");
+            Console.WriteLine(Line($"Listening on: {listeningOn}"));
+            Console.WriteLine(Line($"Semantic Search: {Status(settings.Embeddings.Enabled, embeddingsActive)}"));
+            Console.WriteLine(Line($"Conflict Resolution: Enabled ✓"));
+            Console.WriteLine(Line($"Background Maintenance: {Status(settings.Maintenance.Enabled, true)}"));
+            Console.WriteLine(Line($"MCP Protocol: Enabled ✓"));
+            Console.WriteLine(Line("Press Ctrl+C to stop"));
+            Console.WriteLine($"╠{new string('═', boxWidth - 2)}╣");
+            Console.WriteLine(Line("UI & Search:"));
+            Console.WriteLine(Line(Endpoint("GET",    "/",                       "Search interface")));
+            Console.WriteLine(Line(Endpoint("GET",    "/search?q=query",         "Search memories")));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/memory/search",      "Search (POST)")));
+            Console.WriteLine(Line(Endpoint("GET",    "/memory/{id}.html",       "Memory detail page")));
+            Console.WriteLine($"╠{new string('═', boxWidth - 2)}╣");
+            Console.WriteLine(Line("Memory CRUD:"));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/memory",             "Create memory")));
+            Console.WriteLine(Line(Endpoint("GET",    "/api/memory/{id}",        "Get memory")));
+            Console.WriteLine(Line(Endpoint("PUT",    "/api/memory/{id}",        "Update memory")));
+            Console.WriteLine(Line(Endpoint("DELETE", "/api/memory/{id}",        "Delete memory")));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/memory/{id}/reinforce", "Reinforce memory")));
+            Console.WriteLine($"╠{new string('═', boxWidth - 2)}╣");
+            Console.WriteLine(Line("Batch Operations:"));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/memory/batch",       "Batch create")));
+            Console.WriteLine(Line(Endpoint("PUT",    "/api/memory/batch",       "Batch update")));
+            Console.WriteLine(Line(Endpoint("DELETE", "/api/memory/batch",       "Batch delete")));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/memory/search/batch", "Batch search")));
+            Console.WriteLine($"╠{new string('═', boxWidth - 2)}╣");
+            Console.WriteLine(Line("Graph & Links:"));
+            Console.WriteLine(Line(Endpoint("GET",    "/api/memory/{id}/links",  "Get linked memories")));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/memory/{id}/link/{targetId}", "Create link")));
+            Console.WriteLine(Line(Endpoint("DELETE", "/api/memory/{id}/link/{targetId}", "Delete link")));
+            Console.WriteLine(Line(Endpoint("GET",    "/api/memory/{id}/graph",  "Get memory graph")));
+            Console.WriteLine($"╠{new string('═', boxWidth - 2)}╣");
+            Console.WriteLine(Line("Admin & Maintenance:"));
+            Console.WriteLine(Line(Endpoint("GET",    "/api/admin/health",       "Health check")));
+            Console.WriteLine(Line(Endpoint("GET",    "/api/admin/stats",        "Server statistics")));
+            Console.WriteLine(Line(Endpoint("GET",    "/api/admin/maintenance/status", "Maintenance status")));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/admin/consolidate",  "Run consolidation")));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/admin/prune",        "Run pruning")));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/admin/reindex",      "Reindex embeddings")));
+            Console.WriteLine(Line(Endpoint("POST",   "/api/admin/compact",      "Compact database")));
+            Console.WriteLine($"╠{new string('═', boxWidth - 2)}╣");
+            Console.WriteLine(Line("MCP Protocol:"));
+            Console.WriteLine(Line(Endpoint("POST",   "/mcp",                    "JSON-RPC messages")));
+            Console.WriteLine(Line(Endpoint("GET",    "/mcp",                    "SSE stream")));
+            Console.WriteLine(Line(Endpoint("DELETE", "/mcp",                    "Terminate session")));
+            Console.WriteLine($"╚{new string('═', boxWidth - 2)}╝");
             Console.WriteLine();
+
+            // Start background maintenance after server is running
+            backgroundMaintenance?.Start();
 
             // Wait for cancellation
             await Task.Delay(Timeout.Infinite, cts.Token);

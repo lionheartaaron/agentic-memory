@@ -33,7 +33,15 @@ public class LiteDbMemoryRepository : IMemoryRepository
             Connection = ConnectionType.Shared
         };
 
-        _database = new LiteDatabase(connectionString);
+        // Create a dedicated BsonMapper instance to avoid race conditions with BsonMapper.Global
+        // when multiple database instances are created in parallel (e.g., during testing)
+        var mapper = new BsonMapper();
+        
+        // Explicitly register the entity type to ensure all properties are mapped
+        mapper.Entity<MemoryNodeEntity>()
+            .Id(x => x.Id);
+
+        _database = new LiteDatabase(connectionString, mapper);
         _collection = _database.GetCollection<MemoryNodeEntity>(CollectionName);
 
         EnsureIndexes();
@@ -347,8 +355,9 @@ public class LiteDbMemoryRepository : IMemoryRepository
         cancellationToken.ThrowIfCancellationRequested();
 
         var entity = _collection.FindById(id);
-        if (entity is not null)
+        if (entity is not null && !entity.IsArchived)
         {
+            // Only reinforce non-archived memories
             entity.Reinforce();
             _collection.Update(entity);
         }

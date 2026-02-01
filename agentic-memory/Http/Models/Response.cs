@@ -9,8 +9,10 @@ public class Response
     {
         [200] = "OK",
         [201] = "Created",
+        [202] = "Accepted",
         [204] = "No Content",
         [400] = "Bad Request",
+        [403] = "Forbidden",
         [404] = "Not Found",
         [405] = "Method Not Allowed",
         [500] = "Internal Server Error"
@@ -71,6 +73,15 @@ public class Response
     };
 
     /// <summary>
+    /// Create a 202 Accepted response (for MCP notifications)
+    /// </summary>
+    public static Response Accepted() => new()
+    {
+        StatusCode = 202,
+        ReasonPhrase = "Accepted"
+    };
+
+    /// <summary>
     /// Create a 204 No Content response
     /// </summary>
     public static Response NoContent() => new()
@@ -86,6 +97,17 @@ public class Response
     {
         StatusCode = 400,
         ReasonPhrase = "Bad Request",
+        Body = new { error = message },
+        ContentType = ContentTypeJsonUtf8
+    };
+
+    /// <summary>
+    /// Create a 403 Forbidden response
+    /// </summary>
+    public static Response Forbidden(string message = "Forbidden") => new()
+    {
+        StatusCode = 403,
+        ReasonPhrase = "Forbidden",
         Body = new { error = message },
         ContentType = ContentTypeJsonUtf8
     };

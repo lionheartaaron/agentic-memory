@@ -37,7 +37,7 @@ public class JsonRpcError
 /// </summary>
 public class InitializeParams
 {
-    public string ProtocolVersion { get; set; } = "2024-11-05";
+    public string ProtocolVersion { get; set; } = "2025-03-26";
     public ClientCapabilities? Capabilities { get; set; }
     public ClientInfo? ClientInfo { get; set; }
 }
@@ -65,7 +65,7 @@ public class ClientInfo
 /// </summary>
 public class InitializeResult
 {
-    public string ProtocolVersion { get; set; } = "2024-11-05";
+    public string ProtocolVersion { get; set; } = "2025-03-26";
     public ServerCapabilities Capabilities { get; set; } = new();
     public ServerInfo ServerInfo { get; set; } = new();
 }
@@ -77,6 +77,7 @@ public class ServerCapabilities
 {
     public ToolsCapability? Tools { get; set; }
     public ResourcesCapability? Resources { get; set; }
+    public PromptsCapability? Prompts { get; set; }
 }
 
 /// <summary>
@@ -93,6 +94,14 @@ public class ToolsCapability
 public class ResourcesCapability
 {
     public bool Subscribe { get; set; } = false;
+    public bool ListChanged { get; set; } = false;
+}
+
+/// <summary>
+/// MCP Prompts capability
+/// </summary>
+public class PromptsCapability
+{
     public bool ListChanged { get; set; } = false;
 }
 
@@ -199,4 +208,71 @@ public class ResourceReadParams
 public class ResourceReadResult
 {
     public List<ResourceContent> Contents { get; set; } = [];
+}
+
+/// <summary>
+/// MCP Resource template definition (parameterized resources)
+/// </summary>
+public class ResourceTemplateDefinition
+{
+    public string UriTemplate { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public string? Description { get; set; }
+    public string? MimeType { get; set; }
+}
+
+/// <summary>
+/// MCP Prompt definition
+/// </summary>
+public class PromptDefinition
+{
+    public string Name { get; set; } = string.Empty;
+    public string? Description { get; set; }
+    public List<PromptArgument>? Arguments { get; set; }
+}
+
+/// <summary>
+/// MCP Prompt argument definition
+/// </summary>
+public class PromptArgument
+{
+    public string Name { get; set; } = string.Empty;
+    public string? Description { get; set; }
+    public bool Required { get; set; } = false;
+}
+
+/// <summary>
+/// MCP Prompts/get params
+/// </summary>
+public class PromptGetParams
+{
+    public string Name { get; set; } = string.Empty;
+    public Dictionary<string, string>? Arguments { get; set; }
+}
+
+/// <summary>
+/// MCP Prompts/get result
+/// </summary>
+public class PromptGetResult
+{
+    public string? Description { get; set; }
+    public List<PromptMessage> Messages { get; set; } = [];
+}
+
+/// <summary>
+/// MCP Prompt message
+/// </summary>
+public class PromptMessage
+{
+    public string Role { get; set; } = "user";
+    public PromptContent Content { get; set; } = new();
+}
+
+/// <summary>
+/// MCP Prompt content
+/// </summary>
+public class PromptContent
+{
+    public string Type { get; set; } = "text";
+    public string Text { get; set; } = string.Empty;
 }
