@@ -19,22 +19,6 @@ public class ServerSettings
 {
     public int Port { get; set; } = 3377;
     public string BindAddress { get; set; } = "0.0.0.0";
-    public int MaxConcurrentConnections { get; set; } = 1000;
-    public int ConnectionTimeoutSeconds { get; set; } = 30;
-    public int RequestTimeoutSeconds { get; set; } = 10;
-    public int ShutdownTimeoutSeconds { get; set; } = 30;
-    public bool EnableKeepAlive { get; set; } = false;
-    public string ServerName { get; set; } = "AgenticMemory/1.0";
-
-    /// <summary>
-    /// Maximum request body size in bytes (default: 10MB)
-    /// </summary>
-    public int MaxRequestSizeBytes { get; set; } = 10485760;
-
-    /// <summary>
-    /// Maximum HTTP header size in bytes (default: 8KB)
-    /// </summary>
-    public int MaxHeaderSizeBytes { get; set; } = 8192;
 }
 
 /// <summary>
@@ -43,26 +27,9 @@ public class ServerSettings
 public class StorageSettings
 {
     public string DatabasePath { get; set; } = "./Data/agentic-memory.db";
-
-    /// <summary>
-    /// Maximum memory content size in bytes (default: 512KB)
-    /// Content exceeding this limit will be truncated
-    /// </summary>
     public int MaxContentSizeBytes { get; set; } = 524288;
-
-    /// <summary>
-    /// Maximum title length in characters (default: 500)
-    /// </summary>
     public int MaxTitleLength { get; set; } = 500;
-
-    /// <summary>
-    /// Maximum summary length in characters (default: 2000)
-    /// </summary>
     public int MaxSummaryLength { get; set; } = 2000;
-
-    /// <summary>
-    /// Maximum number of tags per memory (default: 20)
-    /// </summary>
     public int MaxTagsPerMemory { get; set; } = 20;
 }
 

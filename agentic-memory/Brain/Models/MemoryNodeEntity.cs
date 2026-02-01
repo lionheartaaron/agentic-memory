@@ -175,53 +175,6 @@ public class MemoryNodeEntity : IEquatable<MemoryNodeEntity>
         Buffer.BlockCopy(embedding, 0, EmbeddingBytes, 0, EmbeddingBytes.Length);
     }
 
-    /// <summary>
-    /// Convert to the handler model for API responses
-    /// </summary>
-    public AgenticMemory.Http.Handlers.MemoryNode ToHandlerModel()
-    {
-        return new AgenticMemory.Http.Handlers.MemoryNode
-        {
-            Id = Id,
-            Title = Title,
-            Summary = Summary,
-            Content = Content,
-            Tags = Tags,
-            CreatedAt = CreatedAt,
-            LastAccessedAt = LastAccessedAt,
-            ReinforcementScore = GetCurrentStrength(),
-            LinkedNodeIds = LinkedNodeIds,
-            Embedding = GetEmbedding(),
-            ExpiresAt = ExpiresAt,
-            Importance = Importance,
-            IsPinned = IsPinned,
-            IsArchived = IsArchived
-        };
-    }
-
-    /// <summary>
-    /// Create from the handler create request
-    /// </summary>
-    public static MemoryNodeEntity FromCreateRequest(AgenticMemory.Http.Handlers.CreateMemoryRequest request)
-    {
-        var entity = new MemoryNodeEntity
-        {
-            Title = request.Title,
-            Summary = request.Summary,
-            Content = request.Content ?? string.Empty,
-            Tags = request.Tags ?? [],
-            ExpiresAt = request.ExpiresAt,
-            Importance = Math.Clamp(request.Importance ?? 0.5, 0.0, 1.0),
-            IsPinned = request.IsPinned ?? false
-        };
-
-        // Generate normalized content for search (including tags for searchability)
-        var tagsText = entity.Tags.Count > 0 ? " " + string.Join(" ", entity.Tags) : "";
-        entity.ContentNormalized = $"{entity.Title} {entity.Summary} {entity.Content}{tagsText}".ToLowerInvariant().Trim();
-
-        return entity;
-    }
-
     #region IEquatable<MemoryNodeEntity>
 
     /// <summary>

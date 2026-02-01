@@ -50,7 +50,7 @@ public partial class LocalEmbeddingService : IEmbeddingService
 
         try
         {
-            var sessionOptions = new SessionOptions
+            var sessionOptions = new Microsoft.ML.OnnxRuntime.SessionOptions
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 ExecutionMode = ExecutionMode.ORT_SEQUENTIAL

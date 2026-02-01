@@ -1,4 +1,5 @@
 using AgenticMemory.Configuration;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace AgenticMemory.Brain.Maintenance;
@@ -6,7 +7,7 @@ namespace AgenticMemory.Brain.Maintenance;
 /// <summary>
 /// Background service that periodically runs maintenance tasks like decay and consolidation
 /// </summary>
-public class MaintenanceBackgroundService : IAsyncDisposable
+public class MaintenanceBackgroundService : IHostedService, IAsyncDisposable
 {
     private readonly IMaintenanceService _maintenanceService;
     private readonly MaintenanceSettings _settings;
@@ -31,6 +32,23 @@ public class MaintenanceBackgroundService : IAsyncDisposable
     /// Whether the background service is currently running
     /// </summary>
     public bool IsRunning => _isRunning;
+
+    /// <summary>
+    /// Start the background maintenance tasks (IHostedService implementation)
+    /// </summary>
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        Start();
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Stop the background maintenance tasks (IHostedService implementation)
+    /// </summary>
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        return StopInternalAsync();
+    }
 
     /// <summary>
     /// Start the background maintenance tasks
@@ -74,7 +92,7 @@ public class MaintenanceBackgroundService : IAsyncDisposable
     /// <summary>
     /// Stop the background maintenance tasks
     /// </summary>
-    public async Task StopAsync()
+    public async Task StopInternalAsync()
     {
         if (!_isRunning)
             return;
@@ -195,7 +213,7 @@ public class MaintenanceBackgroundService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await StopAsync();
+        await StopInternalAsync();
         _cts?.Dispose();
     }
 }

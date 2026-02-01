@@ -73,11 +73,9 @@ flowchart LR
 | **Natural Decay** | Unused memories fade, mimicking human cognition |
 | **Auto-Consolidation** | Similar memories merge automatically to reduce clutter |
 | **Conflict Resolution** | Smart duplicate detection, superseding, and temporal history |
-| **Memory Graph** | Link related memories together for context traversal |
 | **Rich Tagging** | Organize memories with tags and linked relationships |
-| **Batch Operations** | Bulk create, update, delete, and search for efficiency |
-| **MCP Protocol** | Native support for Model Context Protocol |
-| **REST API** | Full HTTP API for custom integrations |
+| **MCP Protocol** | Native support via official ModelContextProtocol .NET SDK |
+| **REST API** | HTTP API for custom integrations |
 | **Zero Dependencies** | Embedded LiteDB database—no external services needed |
 | **Privacy First** | 100% local, offline-capable, your data stays yours |
 
@@ -88,11 +86,11 @@ flowchart LR
 | Component | Technology | Purpose |
 |-----------|------------|---------|
 | **Runtime** | .NET 10 | High-performance, cross-platform execution |
+| **Web Server** | ASP.NET Core Kestrel | High-performance, production-ready HTTP server |
 | **Database** | LiteDB 5.0 | Embedded NoSQL document store |
 | **Embeddings** | ONNX Runtime + ML.Tokenizers | Local vector generation |
 | **Model** | all-MiniLM-L6-v2 | Sentence transformer (384 dimensions) |
-| **Server** | Custom TCP/HTTP | Optimized, minimal-dependency HTTP server |
-| **Protocol** | MCP (Model Context Protocol) | AI agent integration standard |
+| **Protocol** | ModelContextProtocol (Official) | AI agent integration via official .NET MCP SDK |
 | **Testing** | xUnit v3 | Comprehensive test coverage |
 
 ---
@@ -259,10 +257,9 @@ Any agent supporting the Model Context Protocol can connect to:
 http://localhost:3377/mcp
 ```
 
-The server implements the full MCP specification including:
+The server uses the official [ModelContextProtocol .NET SDK](https://github.com/modelcontextprotocol/csharp-sdk) including:
 - `initialize` / `initialized` handshake
 - `tools/list` and `tools/call` for memory operations
-- `resources/list` and `resources/read` for memory access
 
 ---
 
@@ -278,14 +275,6 @@ The server implements the full MCP specification including:
 | `get_stats` | Server statistics | — |
 | `get_tag_history` | View memory history for a tag | `tag`, `include_archived` |
 
-### MCP Resources
-
-| URI | Description |
-|-----|-------------|
-| `memory://recent` | Last 10 accessed memories |
-| `memory://stats` | Repository statistics |
-| `memory://{id}` | Specific memory by ID |
-
 ---
 
 ## API Reference
@@ -294,31 +283,11 @@ The server implements the full MCP specification including:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/` | Web interface for browsing memories |
-| `GET` | `/search?q=query` | Search memories (HTML/JSON) |
 | `POST` | `/api/memory` | Create memory (with conflict resolution) |
 | `GET` | `/api/memory/{id}` | Get memory by ID |
 | `PUT` | `/api/memory/{id}` | Update memory |
 | `DELETE` | `/api/memory/{id}` | Delete memory |
 | `POST` | `/api/memory/search` | Semantic search (JSON) |
-
-### Batch Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/api/memory/batch` | Batch create memories |
-| `PUT` | `/api/memory/batch` | Batch update memories |
-| `DELETE` | `/api/memory/batch` | Batch delete memories |
-| `POST` | `/api/memory/search/batch` | Batch search queries |
-
-### Graph Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/memory/{id}/links` | Get linked memories |
-| `POST` | `/api/memory/{id}/link/{targetId}` | Create link between memories |
-| `DELETE` | `/api/memory/{id}/link/{targetId}` | Remove link |
-| `GET` | `/api/memory/{id}/graph` | Get memory subgraph |
 
 ### Admin Endpoints
 
@@ -326,17 +295,12 @@ The server implements the full MCP specification including:
 |--------|----------|-------------|
 | `GET` | `/api/admin/stats` | Server statistics |
 | `GET` | `/api/admin/health` | Health check |
-| `GET` | `/api/admin/maintenance/status` | Maintenance task status |
-| `POST` | `/api/admin/consolidate` | Trigger memory consolidation |
-| `POST` | `/api/admin/prune` | Trigger weak memory pruning |
-| `POST` | `/api/admin/reindex` | Rebuild search indexes |
-| `POST` | `/api/admin/compact` | Compact database |
 
 ### MCP Endpoint
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/mcp` | MCP JSON-RPC 2.0 endpoint |
+| `POST` | `/mcp` | MCP JSON-RPC 2.0 endpoint (official ModelContextProtocol SDK) |
 
 ### Example: Store a Memory
 
@@ -368,16 +332,8 @@ Edit `appsettings.json` to customize behavior. Here's a complete reference:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `Port` | `3377` | HTTP server port |
+| `Port` | `3377` | HTTP server port (Kestrel) |
 | `BindAddress` | `0.0.0.0` | Network interface to bind (use `127.0.0.1` for local only) |
-| `MaxConcurrentConnections` | `1000` | Maximum simultaneous connections |
-| `ConnectionTimeoutSeconds` | `30` | Idle connection timeout |
-| `RequestTimeoutSeconds` | `10` | Maximum request processing time |
-| `ShutdownTimeoutSeconds` | `30` | Graceful shutdown wait time |
-| `EnableKeepAlive` | `false` | HTTP keep-alive connections |
-| `ServerName` | `AgenticMemory/1.0` | Server header identifier |
-| `MaxRequestSizeBytes` | `10485760` | Maximum request body size (10MB) |
-| `MaxHeaderSizeBytes` | `8192` | Maximum HTTP header size (8KB) |
 
 ### Storage Settings
 
@@ -437,11 +393,7 @@ Edit `appsettings.json` to customize behavior. Here's a complete reference:
 {
   "Server": {
     "Port": 3377,
-    "BindAddress": "0.0.0.0",
-    "MaxConcurrentConnections": 1000,
-    "ConnectionTimeoutSeconds": 30,
-    "RequestTimeoutSeconds": 10,
-    "EnableKeepAlive": false
+    "BindAddress": "0.0.0.0"
   },
   "Storage": {
     "DatabasePath": "./data/agentic-memory.db",
@@ -489,11 +441,10 @@ agentic-memory/
 │   ├── Storage/             # LiteDB repository
 │   ├── Maintenance/         # Decay, consolidation, pruning
 │   └── Conflict/            # State conflict resolution
-├── Http/                     # Server layer
-│   ├── Handlers/            # REST API handlers
-│   ├── Mcp/                 # MCP protocol implementation
-│   ├── Middleware/          # Logging, timing, errors
-│   └── Optimizations/       # Performance enhancements
+├── Extensions/               # ASP.NET Core DI and routing extensions
+├── Tools/                    # MCP tools (official ModelContextProtocol SDK)
+├── Models/                   # API request/response models
+├── Helpers/                  # Console output utilities
 └── Configuration/            # App settings
 ```
 
