@@ -4,6 +4,7 @@ using AgenticMemory.Brain.Search;
 using AgenticMemory.Configuration;
 using AgenticMemory.Extensions;
 using AgenticMemory.Helpers;
+using AgenticMemory.Logging;
 using AgenticMemory.Tools;
 
 namespace AgenticMemory;
@@ -25,7 +26,8 @@ internal class Program
         var settings = LoadAndResolveSettings(builder.Configuration, appBasePath, args);
 
         ConfigureKestrel(builder, settings);
-        builder.Logging.AddConsole();
+        builder.Logging.ClearProviders();
+        builder.Logging.AddProvider(new SpectreConsoleLoggerProvider());
 
         EnsureDataDirectoryExists(settings);
 
@@ -34,8 +36,10 @@ internal class Program
 
         var app = builder.Build();
 
+        app.UseStaticFiles();
         app.MapMcp("/mcp");
         app.MapRestApiEndpoints();
+        app.MapFallbackToFile("index.html");
 
         PrintStartupInfo(app, settings);
 
@@ -49,6 +53,7 @@ internal class Program
 
         settings.Storage.DatabasePath = ResolvePath(settings.Storage.DatabasePath, appBasePath);
         settings.Embeddings.ModelsPath = ResolvePath(settings.Embeddings.ModelsPath, appBasePath);
+        settings.Generation.ModelsPath = ResolvePath(settings.Generation.ModelsPath, appBasePath);
 
         ApplyCommandLineOverrides(settings, args);
 
@@ -111,11 +116,15 @@ internal class Program
     private static void PrintStartupInfo(WebApplication app, AppSettings settings)
     {
         var listeningOn = $"http://{settings.Server.BindAddress}:{settings.Server.Port}";
+
         var embeddingService = app.Services.GetRequiredService<IEmbeddingService>();
         var searchEngine = app.Services.GetRequiredService<ISearchService>() as MemorySearchEngine;
         var embeddingsActive = embeddingService.IsAvailable && searchEngine?.SemanticSearchAvailable == true;
 
-        ConsoleHelpers.PrintStartupBanner(settings, listeningOn, embeddingsActive);
+        // Eagerly resolve generative model service — triggers auto-download if needed
+        var generativeService = app.Services.GetRequiredService<IGenerativeModelService>();
+
+        ConsoleHelpers.PrintStartupBanner(settings, listeningOn, embeddingsActive, generativeService.IsAvailable);
     }
 }
 

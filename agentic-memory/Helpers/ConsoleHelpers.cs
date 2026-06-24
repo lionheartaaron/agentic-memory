@@ -1,51 +1,75 @@
 using AgenticMemory.Configuration;
+using Spectre.Console;
 
 namespace AgenticMemory.Helpers;
 
-/// <summary>
-/// Helper methods for console output formatting.
-/// </summary>
 public static class ConsoleHelpers
 {
-    private const int BoxWidth = 96;
-
-    /// <summary>
-    /// Prints the startup banner to the console.
-    /// </summary>
-    public static void PrintStartupBanner(AppSettings settings, string listeningOn, bool embeddingsActive)
+    public static void PrintStartupBanner(
+        AppSettings settings,
+        string listeningOn,
+        bool embeddingsActive,
+        bool generativeAvailable)
     {
-        Console.WriteLine();
-        Console.WriteLine(TopBorder());
-        Console.WriteLine(Header("Agentic Memory Server (MCP SDK)"));
-        Console.WriteLine(Separator());
-        Console.WriteLine(Line($"Listening on: {listeningOn}"));
-        Console.WriteLine(Line($"Semantic Search: {Status(settings.Embeddings.Enabled, embeddingsActive)}"));
-        Console.WriteLine(Line($"Conflict Resolution: Enabled"));
-        Console.WriteLine(Line($"Background Maintenance: {Status(settings.Maintenance.Enabled, true)}"));
-        Console.WriteLine(Line($"MCP Protocol: Enabled (Official SDK)"));
-        Console.WriteLine(Line("Press Ctrl+C to stop"));
-        Console.WriteLine(Separator());
-        Console.WriteLine(Line("MCP Endpoints:"));
-        Console.WriteLine(Line(Endpoint("POST", "/mcp", "MCP JSON-RPC (Streamable HTTP)")));
-        Console.WriteLine(Line(Endpoint("GET", "/mcp/sse", "MCP SSE transport")));
-        Console.WriteLine(Separator());
-        Console.WriteLine(Line("REST API (backward compatible):"));
-        Console.WriteLine(Line(Endpoint("GET", "/api/admin/health", "Health check")));
-        Console.WriteLine(Line(Endpoint("GET", "/api/admin/stats", "Server statistics")));
-        Console.WriteLine(Line(Endpoint("POST", "/api/memory", "Create memory")));
-        Console.WriteLine(Line(Endpoint("GET", "/api/memory/{id}", "Get memory")));
-        Console.WriteLine(Line(Endpoint("PUT", "/api/memory/{id}", "Update memory")));
-        Console.WriteLine(Line(Endpoint("DELETE", "/api/memory/{id}", "Delete memory")));
-        Console.WriteLine(Line(Endpoint("POST", "/api/memory/search", "Search memories")));
-        Console.WriteLine(BottomBorder());
-        Console.WriteLine();
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(
+            new Rule(":brain: [bold blue]Agentic Memory Server[/] [grey dim](MCP SDK)[/]")
+                .RuleStyle("blue dim")
+                .LeftJustified());
+        AnsiConsole.WriteLine();
+
+        // Core status
+        AnsiConsole.MarkupLine($"  :globe_with_meridians:  [grey]Listening on[/]     [bold white]{Markup.Escape(listeningOn)}[/]");
+        AnsiConsole.MarkupLine($"  :floppy_disk:  [grey]Database[/]         [dim]{Markup.Escape(settings.Storage.DatabasePath)}[/]");
+        AnsiConsole.MarkupLine($"  :magnifying_glass_tilted_left:  [grey]Semantic search[/]  {ServiceStatus(settings.Embeddings.Enabled, embeddingsActive)}");
+        AnsiConsole.MarkupLine($"  :robot:  [grey]Generative model[/] {ServiceStatus(settings.Generation.Enabled, generativeAvailable)}");
+        AnsiConsole.MarkupLine($"  :hammer_and_wrench:  [grey]Maintenance[/]      {ServiceStatus(settings.Maintenance.Enabled, settings.Maintenance.Enabled)}");
+        AnsiConsole.MarkupLine("  :electric_plug:  [grey]MCP protocol[/]     :check_mark_button: [green]Enabled[/]");
+        AnsiConsole.MarkupLine("  :keyboard:  [grey]Stop server[/]      [dim]Ctrl+C[/]");
+        AnsiConsole.WriteLine();
+
+        // MCP endpoints
+        AnsiConsole.Write(new Rule("[grey]MCP Endpoints[/]").RuleStyle("grey dim").LeftJustified());
+        var mcpTable = new Table()
+            .NoBorder()
+            .HideHeaders()
+            .AddColumn(new TableColumn("").Width(8))
+            .AddColumn(new TableColumn("").Width(14))
+            .AddColumn(new TableColumn(""));
+        mcpTable.AddRow("[bold cyan]POST[/]", "[blue]/mcp[/]",     "[grey]MCP JSON-RPC (Streamable HTTP)[/]");
+        mcpTable.AddRow("[bold cyan]GET[/]",  "[blue]/mcp/sse[/]", "[grey]MCP SSE transport[/]");
+        AnsiConsole.Write(mcpTable);
+        AnsiConsole.WriteLine();
+
+        // REST endpoints
+        AnsiConsole.Write(new Rule("[grey]REST API[/]").RuleStyle("grey dim").LeftJustified());
+        var restTable = new Table()
+            .NoBorder()
+            .HideHeaders()
+            .AddColumn(new TableColumn("").Width(8))
+            .AddColumn(new TableColumn("").Width(28))
+            .AddColumn(new TableColumn(""));
+        restTable.AddRow("[bold green]GET[/]",    "[blue]/api/admin/health[/]",    "[grey]Health check[/]");
+        restTable.AddRow("[bold green]GET[/]",    "[blue]/api/admin/stats[/]",     "[grey]Statistics[/]");
+        restTable.AddRow("[bold yellow]POST[/]",  "[blue]/api/memory[/]",          "[grey]Create memory[/]");
+        restTable.AddRow("[bold green]GET[/]",    "[blue]/api/memory/{id}[/]",     "[grey]Get memory[/]");
+        restTable.AddRow("[bold cyan]PUT[/]",     "[blue]/api/memory/{id}[/]",     "[grey]Update memory[/]");
+        restTable.AddRow("[bold red]DELETE[/]",   "[blue]/api/memory/{id}[/]",     "[grey]Delete memory[/]");
+        restTable.AddRow("[bold yellow]POST[/]",  "[blue]/api/memory/search[/]",   "[grey]Search memories[/]");
+        restTable.AddRow("[bold green]GET[/]",    "[blue]/api/generate/status[/]", "[grey]Generative model status[/]");
+        restTable.AddRow("[bold yellow]POST[/]",  "[blue]/api/generate[/]",        "[grey]Blocking inference[/]");
+        restTable.AddRow("[bold yellow]POST[/]",  "[blue]/api/generate/stream[/]", "[grey]Streaming SSE inference[/]");
+        AnsiConsole.Write(restTable);
+        AnsiConsole.WriteLine();
+
+        AnsiConsole.Write(new Rule(":fire: [green]Ready[/]").RuleStyle("green dim"));
+        AnsiConsole.WriteLine();
     }
 
-    private static string TopBorder() => $"+{new string('-', BoxWidth - 2)}+";
-    private static string BottomBorder() => $"+{new string('-', BoxWidth - 2)}+";
-    private static string Separator() => $"+{new string('-', BoxWidth - 2)}+";
-    private static string Line(string text) => $"|  {text.PadRight(BoxWidth - 4)}|";
-    private static string Header(string text) => $"|{text.PadLeft((BoxWidth + text.Length) / 2).PadRight(BoxWidth - 2)}|";
-    private static string Status(bool enabled, bool active) => enabled ? (active ? "Enabled" : "Enabled (inactive)") : "Disabled";
-    private static string Endpoint(string method, string path, string description) => $"  {method,-6} {path,-34} {description}";
+    private static string ServiceStatus(bool enabled, bool active) => (enabled, active) switch
+    {
+        (false, _) => ":prohibited: [grey]Disabled[/]",
+        (true, true) => ":check_mark_button: [green]Enabled[/]",
+        (true, false) => ":warning: [yellow]Enabled (inactive)[/]",
+    };
 }

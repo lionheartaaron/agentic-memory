@@ -8,6 +8,7 @@ public class AppSettings
     public ServerSettings Server { get; set; } = new();
     public StorageSettings Storage { get; set; } = new();
     public EmbeddingsSettings Embeddings { get; set; } = new();
+    public GenerationSettings Generation { get; set; } = new();
     public MaintenanceSettings Maintenance { get; set; } = new();
     public ConflictSettings Conflict { get; set; } = new();
 }
@@ -40,7 +41,7 @@ public class StorageSettings
 public class EmbeddingsSettings
 {
     public bool Enabled { get; set; } = true;
-    public string ModelsPath { get; set; } = "./Models";
+    public string ModelsPath { get; set; } = "./Models/Embedding";
     public bool AutoDownload { get; set; } = true;
     public string ModelUrlOnnx { get; set; } = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx";
     public string ModelVocabUrlTxt { get; set; } = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt";
@@ -113,6 +114,62 @@ public class MaintenanceSettings
     /// Minutes to wait after startup before running first maintenance task
     /// </summary>
     public int InitialDelayMinutes { get; set; } = 5;
+}
+
+/// <summary>
+/// Settings for the local generative model (Phi-4-mini-instruct via OnnxRuntimeGenAI).
+/// </summary>
+public class GenerationSettings
+{
+    public bool Enabled { get; set; } = true;
+    public string ModelsPath { get; set; } = "./Models/Generative/Phi-4-mini-instruct";
+    public bool AutoDownload { get; set; } = true;
+    public string RepoBaseUrl { get; set; } =
+        "https://huggingface.co/microsoft/Phi-4-mini-instruct-onnx/resolve/a64b5309e58f6ac22cacdf9d143ab7455d8b9f5b/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4";
+    public List<ModelFileSpec> Files { get; set; } =
+    [
+        new() { FileName = "genai_config.json",      ExpectedBytes = 1520 },
+        new() { FileName = "config.json",             ExpectedBytes = 2500 },
+        new() { FileName = "configuration_phi3.py",   ExpectedBytes = 10900 },
+        new() { FileName = "tokenizer.json",          ExpectedBytes = 15500000 },
+        new() { FileName = "tokenizer_config.json",   ExpectedBytes = 2960 },
+        new() { FileName = "vocab.json",              ExpectedBytes = 3910000 },
+        new() { FileName = "merges.txt",              ExpectedBytes = 2420000 },
+        new() { FileName = "added_tokens.json",       ExpectedBytes = 249 },
+        new() { FileName = "special_tokens_map.json", ExpectedBytes = 587 },
+        new() { FileName = "model.onnx",              ExpectedBytes = 52100000 },
+        new() { FileName = "model.onnx.data",         ExpectedBytes = 4860000000 }
+    ];
+    public int MaxNewTokens { get; set; } = 512;
+    /// <summary>
+    /// Character count above which the middle of the input is truncated before
+    /// sending to the model. Head and tail lines are preserved; the rest is dropped.
+    /// </summary>
+    public int TruncateThreshold { get; set; } = 8_000;
+    public int TruncateHeadLines { get; set; } = 8;
+    public int TruncateTailLines { get; set; } = 8;
+    public float Temperature { get; set; } = 0.7f;
+
+    public string TruncateIfNeeded(string input)
+    {
+        if (input.Length <= TruncateThreshold) return input;
+
+        var lines = input.Split('\n');
+        var keep = TruncateHeadLines + TruncateTailLines;
+        if (lines.Length <= keep) return input;
+
+        var omitted = lines.Length - keep;
+        return string.Join('\n', lines.Take(TruncateHeadLines))
+            + $"\n\n[... {omitted} lines omitted for brevity ...]\n\n"
+            + string.Join('\n', lines.TakeLast(TruncateTailLines));
+    }
+    public float TopP { get; set; } = 0.9f;
+}
+
+public class ModelFileSpec
+{
+    public string FileName { get; set; } = "";
+    public long? ExpectedBytes { get; set; }
 }
 
 /// <summary>

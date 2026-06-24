@@ -38,3 +38,18 @@ public record SearchRequest(
     string Query,
     int? TopN = null,
     string[]? Tags = null);
+
+/// <summary>
+/// Request model for local generative inference.
+/// </summary>
+/// <param name="UserPrompt">The user message to send to the model.</param>
+/// <param name="SystemPrompt">Optional system prompt (defaults to a generic helpful assistant).</param>
+public record GenerateRequest(
+    string UserPrompt,
+    string? SystemPrompt = null);
+
+/// <summary>
+/// Request model for generating an AI description of a file.
+/// </summary>
+/// <param name="FilePath">Absolute or relative path to the source file.</param>
+public record FileSummaryRequest(string FilePath);
