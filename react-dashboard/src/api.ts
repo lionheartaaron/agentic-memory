@@ -3,10 +3,16 @@ import type {
   ScoredMemory,
   RepositoryStats,
   HealthResponse,
+  SystemStatus,
   CreateMemoryRequest,
   UpdateMemoryRequest,
   StoreResult,
   BrowseResponse,
+  Project,
+  CodeIndexFile,
+  ProjectActivateResponse,
+  ActiveProjectInfo,
+  WorkerStatus,
 } from './types'
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
@@ -22,6 +28,7 @@ async function req<T>(url: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => req<HealthResponse>('/api/admin/health'),
   stats: () => req<RepositoryStats>('/api/admin/stats'),
+  systemStatus: () => req<SystemStatus>('/api/admin/status'),
   generateStatus: () => req<{ available: boolean }>('/api/generate/status'),
 
   list: (includeArchived = false) =>
@@ -65,6 +72,17 @@ export const api = {
   browsePath: (path?: string) =>
     req<BrowseResponse>(`/api/files/browse${path ? `?path=${encodeURIComponent(path)}` : ''}`),
 
+  projects: {
+    list: () => req<Project[]>('/api/projects'),
+    get: (id: string) => req<Project>(`/api/projects/${id}`),
+    create: (name: string, rootPath: string) =>
+      req<Project>('/api/projects', {
+        method: 'POST',
+        body: JSON.stringify({ name, rootPath }),
+      }),
+    delete: (id: string) => req<void>(`/api/projects/${id}`, { method: 'DELETE' }),
+  },
+
   kv: {
     get: (key: string) =>
       req<{ value: string | null }>(`/api/kv/${encodeURIComponent(key)}`),
@@ -75,5 +93,37 @@ export const api = {
       }),
     delete: (key: string) =>
       req<void>(`/api/kv/${encodeURIComponent(key)}`, { method: 'DELETE' }),
+  },
+
+  codeIndex: {
+    getActive: () =>
+      req<ActiveProjectInfo | null>('/api/codeindex/active').catch(() => null),
+
+    activate: (projectId: string) =>
+      req<ProjectActivateResponse>(`/api/projects/${projectId}/activate`, { method: 'POST' }),
+
+    deactivate: () =>
+      req<void>('/api/projects/active', { method: 'DELETE' }),
+
+    workerStatus: () =>
+      req<WorkerStatus>('/api/codeindex/worker/status'),
+
+    listFiles: (projectId: string, search?: string) =>
+      req<CodeIndexFile[]>(
+        `/api/projects/${projectId}/files${search ? `?search=${encodeURIComponent(search)}` : ''}`
+      ),
+
+    reindex: (projectId: string) =>
+      req<{ queued: number; alreadyCurrent: number }>(`/api/projects/${projectId}/reindex`, {
+        method: 'POST',
+      }),
+
+    forceReindexAll: (projectId: string) =>
+      req<{ queued: number; alreadyCurrent: number }>(`/api/projects/${projectId}/reindex?force=true`, {
+        method: 'POST',
+      }),
+
+    getFile: (filePath: string) =>
+      req<CodeIndexFile>(`/api/codeindex/file?path=${encodeURIComponent(filePath)}`),
   },
 }

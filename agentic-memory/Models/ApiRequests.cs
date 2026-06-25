@@ -53,3 +53,101 @@ public record GenerateRequest(
 /// </summary>
 /// <param name="FilePath">Absolute or relative path to the source file.</param>
 public record FileSummaryRequest(string FilePath);
+
+/// <summary>
+/// Request model for creating a new project.
+/// </summary>
+/// <param name="Name">Display name for the project.</param>
+/// <param name="RootPath">Absolute path to the project root directory.</param>
+public record ProjectCreateRequest(string Name, string RootPath);
+
+// ── /api/admin/status response ────────────────────────────────────────────────
+
+public record SystemStatusResponse(
+    string Status,
+    string Timestamp,
+    ServerStatus Server,
+    GenerationStatus Generation,
+    EmbeddingsStatus Embeddings,
+    MaintenanceStatusInfo Maintenance,
+    CodeIndexStatus CodeIndex);
+
+public record ServerStatus(string ListeningUrl);
+
+public record GenerationStatus(
+    bool Enabled,
+    bool Available,
+    string? ModelName);
+
+public record EmbeddingsStatus(
+    bool Enabled,
+    bool Available,
+    string? ModelName,
+    int Dimensions);
+
+public record MaintenanceStatusInfo(bool Enabled);
+
+public record CodeIndexStatus(
+    bool Enabled,
+    IReadOnlyList<ProviderStatusEntry> Providers);
+
+public record ProviderStatusEntry(
+    string ProviderType,
+    string CompilerApi,
+    string[] DomainPatternFamilies,
+    bool Active);
+
+// ── Code Index responses ──────────────────────────────────────────────────────
+
+public record ProjectActivateResponse(
+    string ProjectId,
+    string Name,
+    string RootPath,
+    int QueuedFiles,
+    int AlreadyIndexed);
+
+public record CodeIndexFileResponse(
+    string Id,
+    string ProjectId,
+    string FilePath,
+    string FileName,
+    string RelativePath,
+    string Language,
+    string ProviderType,
+    string ExtractedContext,
+    string LlmSummary,
+    IReadOnlyList<AgenticMemory.CodeIndex.SymbolRecord> Symbols,
+    DateTime IndexedAt,
+    DateTime FileModifiedAt,
+    bool IsStale,
+    string? IngestionError,
+    float? Score = null);
+
+public record WorkerStatusResponse(
+    string? ActiveProjectId,
+    string? ActiveProjectName,
+    bool IsProcessing,
+    string? CurrentFile,
+    int QueueDepth,
+    int SummaryQueueDepth,
+    int TotalIndexableFiles,
+    int IndexedFiles,
+    int StaleFiles,
+    int ErrorFiles,
+    IReadOnlyList<RecentJobEntryDto> RecentJobs,
+    IReadOnlyList<RecentErrorEntryDto> RecentErrors);
+
+public record RecentJobEntryDto(
+    string RelativePath,
+    string Language,
+    int SymbolCount,
+    long DurationMs,
+    string IndexedAt,
+    bool WasNew);
+
+public record RecentErrorEntryDto(
+    string RelativePath,
+    string Error,
+    string OccurredAt);
+
+public record IngestFileRequest(string FilePath, string ProjectId, bool Force = false);

@@ -11,6 +11,7 @@ public class AppSettings
     public GenerationSettings Generation { get; set; } = new();
     public MaintenanceSettings Maintenance { get; set; } = new();
     public ConflictSettings Conflict { get; set; } = new();
+    public CodeIndexSettings CodeIndex { get; set; } = new();
 }
 
 /// <summary>
@@ -176,6 +177,68 @@ public class ModelFileSpec
 /// Conflict resolution settings for handling contradictory or duplicate memories.
 /// Uses content similarity to determine when memories should be superseded.
 /// </summary>
+/// <summary>
+/// Settings for the CodeIndex compiler-backed analysis module.
+/// Per code-understanding-methodology.md: the C# Roslyn provider is enabled by default
+/// (Roslyn runs in the same CLR, no external dependency). The TypeScript ClearScript provider
+/// requires typescript.js and is disabled until that file is configured.
+/// </summary>
+public class CodeIndexSettings
+{
+    /// <summary>Enable the CodeIndex module. When false, all requests fall back to the regex-based CodeContextExtractor.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Enable the C# Roslyn provider (runs native .NET, no extra setup needed).</summary>
+    public bool EnableCSharpRoslyn { get; set; } = true;
+
+    /// <summary>
+    /// Enable the TypeScript ClearScript/V8 provider. Requires TypeScriptCompilerPath to be set.
+    /// Obtain typescript.js from any project that uses TypeScript:
+    ///   node -e "console.log(require.resolve('typescript').replace('index.js','typescript.js'))"
+    /// </summary>
+    public bool EnableTypeScriptV8 { get; set; } = false;
+
+    /// <summary>
+    /// Absolute path to typescript.js. When AutoDownloadTypeScript is true this is set
+    /// automatically; override only if you want to supply your own copy.
+    /// </summary>
+    public string? TypeScriptCompilerPath { get; set; }
+
+    /// <summary>
+    /// Automatically download typescript.js from unpkg.com when it is not present.
+    /// Stored in TypeScriptModelsPath. Mirrors the AutoDownload pattern used for ONNX models.
+    /// </summary>
+    public bool AutoDownloadTypeScript { get; set; } = true;
+
+    /// <summary>Folder where typescript.js is cached after download.</summary>
+    public string TypeScriptModelsPath { get; set; } = "./Models/TypeScript";
+
+    /// <summary>
+    /// npm version of TypeScript to download (semver, no leading "v").
+    /// See https://unpkg.com/typescript/ for available versions.
+    /// </summary>
+    public string TypeScriptVersion { get; set; } = "5.5.4";
+
+    /// <summary>
+    /// Project roots to pre-register on startup. Each root is indexed with every provider that
+    /// can handle it, enabling whole-project cross-file queries from the first request.
+    /// </summary>
+    public List<string> ProjectRoots { get; set; } = [];
+
+    /// <summary>Enable background file watching and auto-ingestion for the active project.</summary>
+    public bool EnableFileWatcher { get; set; } = true;
+
+    /// <summary>File extensions to include in the index (dot-prefixed).</summary>
+    public List<string> IndexedExtensions { get; set; } = [".cs", ".ts", ".tsx"];
+
+    /// <summary>Path segments that disqualify a file from indexing (e.g. node_modules, bin, obj).</summary>
+    public List<string> ExcludePatterns { get; set; } =
+        ["node_modules", "bin", "obj", ".git", "dist", "out", ".next", "coverage"];
+
+    /// <summary>Safety cap on files indexed per project.</summary>
+    public int MaxFilesPerProject { get; set; } = 2000;
+}
+
 public class ConflictSettings
 {
     /// <summary>

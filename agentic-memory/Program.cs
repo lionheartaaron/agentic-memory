@@ -1,6 +1,7 @@
 ﻿using System.Text;
 using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Brain.Search;
+using AgenticMemory.CodeIndex;
 using AgenticMemory.Configuration;
 using AgenticMemory.Extensions;
 using AgenticMemory.Helpers;
@@ -42,6 +43,11 @@ internal class Program
         app.MapFallbackToFile("index.html");
 
         PrintStartupInfo(app, settings);
+        app.ReRegisterSavedProjects();
+
+        // Restore the persisted active project so the watcher can resume on startup
+        var activeProject = app.Services.GetService<AgenticMemory.CodeIndex.ActiveProjectService>();
+        activeProject?.Load();
 
         await app.RunAsync();
     }
@@ -124,7 +130,8 @@ internal class Program
         // Eagerly resolve generative model service — triggers auto-download if needed
         var generativeService = app.Services.GetRequiredService<IGenerativeModelService>();
 
-        ConsoleHelpers.PrintStartupBanner(settings, listeningOn, embeddingsActive, generativeService.IsAvailable);
+        var codeIndex = app.Services.GetService<CodeIndexService>();
+        ConsoleHelpers.PrintStartupBanner(settings, listeningOn, embeddingsActive, generativeService.IsAvailable, codeIndex);
     }
 }
 

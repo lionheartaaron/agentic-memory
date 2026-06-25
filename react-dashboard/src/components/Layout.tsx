@@ -1,24 +1,34 @@
 import { Outlet, NavLink } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { Brain, LayoutDashboard, Database, MessageSquare, FileCode } from 'lucide-react'
+import { Brain, LayoutDashboard, Database, MessageSquare, FolderGit2, Activity } from 'lucide-react'
 import { api } from '../api'
 
 const navItems = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
   { to: '/memories', label: 'Memories', icon: Database, end: false },
   { to: '/chat', label: 'Chat', icon: MessageSquare, end: false },
-  { to: '/file-summary', label: 'File Summary', icon: FileCode, end: false },
+  { to: '/projects', label: 'Projects', icon: FolderGit2, end: false },
+  { to: '/worker', label: 'Worker', icon: Activity, end: false },
 ]
 
 export default function Layout() {
-  const { data: health, isError } = useQuery({
-    queryKey: ['health'],
-    queryFn: api.health,
+  const { data: status, isError } = useQuery({
+    queryKey: ['status'],
+    queryFn: api.systemStatus,
     refetchInterval: 30_000,
     retry: false,
   })
 
-  const isOnline = !isError && health?.status === 'healthy'
+  const { data: workerStatus } = useQuery({
+    queryKey: ['worker-status'],
+    queryFn: api.codeIndex.workerStatus,
+    refetchInterval: (q) => q.state.data?.isProcessing ? 2_000 : 15_000,
+    retry: false,
+  })
+
+  const isOnline = !isError && status?.status === 'healthy'
+  const serverUrl = status?.server.listeningUrl ?? 'connecting…'
+  const workerActive = workerStatus?.isProcessing ?? false
 
   return (
     <div className="flex h-screen bg-zinc-950 text-zinc-100 overflow-hidden">
@@ -51,6 +61,9 @@ export default function Layout() {
             >
               <Icon className="w-4 h-4 flex-shrink-0" />
               {label}
+              {label === 'Worker' && workerActive && (
+                <span className="ml-auto w-2 h-2 rounded-full bg-green-400 animate-pulse flex-shrink-0" />
+              )}
             </NavLink>
           ))}
         </nav>
@@ -67,7 +80,7 @@ export default function Layout() {
               {isOnline ? 'Connected' : 'Disconnected'}
             </span>
           </div>
-          <div className="text-xs text-zinc-600 font-mono">localhost:3377</div>
+          <div className="text-xs text-zinc-600 font-mono">{serverUrl}</div>
         </div>
       </aside>
 

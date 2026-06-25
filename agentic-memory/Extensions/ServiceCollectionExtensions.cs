@@ -5,6 +5,9 @@ using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Brain.Maintenance;
 using AgenticMemory.Brain.Search;
 using AgenticMemory.Brain.Storage;
+using AgenticMemory.CodeIndex;
+using AgenticMemory.CodeIndex.CSharp;
+using AgenticMemory.CodeIndex.TypeScript;
 using AgenticMemory.Configuration;
 using AgenticMemory.Tools;
 using Spectre.Console;
@@ -30,6 +33,7 @@ public static class ServiceCollectionExtensions
         services.AddMaintenanceServices(settings);
         services.AddConflictAwareStorage();
         services.AddMcpTools();
+        services.AddCodeIndexServices(settings.CodeIndex);
 
         return services;
     }
@@ -280,5 +284,143 @@ public static class ServiceCollectionExtensions
     {
         services.AddSingleton<MemoryTools>();
         return services;
+    }
+
+    private static IServiceCollection AddCodeIndexServices(
+        this IServiceCollection services, CodeIndexSettings settings)
+    {
+        // Always register CodeIndexService so /api/file/context and /api/file/summary can inject
+        // it even when CodeIndex.Enabled = false. When disabled, no providers are added and every
+        // request falls through to the regex-based CodeContextExtractor fallback.
+        services.AddSingleton<CodeIndexService>(sp =>
+        {
+            var providers = new List<ICodeIntelligenceProvider>();
+
+            if (settings.Enabled)
+            {
+                if (settings.EnableCSharpRoslyn)
+                {
+                    var logger = sp.GetRequiredService<ILogger<CSharpRoslynProvider>>();
+                    providers.Add(new CSharpRoslynProvider(logger));
+                }
+
+                if (settings.EnableTypeScriptV8)
+                {
+                    var tsPath = ResolveTypeScriptPath(sp, settings);
+                    var logger = sp.GetRequiredService<ILogger<TypeScriptClearScriptProvider>>();
+                    providers.Add(new TypeScriptClearScriptProvider(tsPath, logger));
+                }
+            }
+
+            var svcLogger = sp.GetRequiredService<ILogger<CodeIndexService>>();
+            var service = new CodeIndexService(providers, svcLogger);
+
+            // Pre-register any configured project roots (whole-program index, per §3.3)
+            if (settings.Enabled && settings.ProjectRoots.Count > 0)
+            {
+                _ = Task.Run(async () =>
+                {
+                    foreach (var root in settings.ProjectRoots)
+                    {
+                        try { await service.RegisterProjectAsync(root); }
+                        catch (Exception ex)
+                        {
+                            svcLogger.LogWarning(ex, "Startup project registration failed for {Root}", root);
+                        }
+                    }
+                });
+            }
+
+            return service;
+        });
+
+        // ── Code Index Brain services ────────────────────────────────────────
+
+        services.AddSingleton<ICodeIndexRepository>(sp =>
+            new LiteDbCodeIndexRepository(sp.GetRequiredService<AppSettings>().Storage.DatabasePath));
+
+        services.AddSingleton<ActiveProjectService>();
+
+        services.AddSingleton<WorkerStatusTracker>();
+
+        services.AddSingleton<SummaryWorker>(sp => new SummaryWorker(
+            sp.GetRequiredService<ICodeIndexRepository>(),
+            sp.GetRequiredService<IGenerativeModelService>(),
+            sp.GetRequiredService<AppSettings>().Generation,
+            sp.GetRequiredService<WorkerStatusTracker>(),
+            sp.GetRequiredService<ILogger<SummaryWorker>>()));
+        services.AddSingleton<ISummaryQueue>(sp => sp.GetRequiredService<SummaryWorker>());
+        services.AddHostedService(sp => sp.GetRequiredService<SummaryWorker>());
+
+        services.AddSingleton<FileIngestionService>(sp => new FileIngestionService(
+            sp.GetRequiredService<CodeIndexService>(),
+            sp.GetRequiredService<ICodeIndexRepository>(),
+            sp.GetRequiredService<IEmbeddingService>(),
+            sp.GetRequiredService<ISummaryQueue>(),
+            sp.GetRequiredService<ILogger<FileIngestionService>>()));
+
+        services.AddSingleton<StalenessScanner>(sp => new StalenessScanner(
+            sp.GetRequiredService<ICodeIndexRepository>(),
+            sp.GetRequiredService<IIngestionQueue>(),
+            settings,
+            sp.GetRequiredService<ILogger<StalenessScanner>>()));
+
+        // FileIngestionWorker is the IIngestionQueue — register as singleton and surface both roles
+        services.AddSingleton<FileIngestionWorker>();
+        services.AddSingleton<IIngestionQueue>(sp => sp.GetRequiredService<FileIngestionWorker>());
+
+        if (settings.EnableFileWatcher)
+        {
+            services.AddHostedService(sp => sp.GetRequiredService<FileIngestionWorker>());
+
+            services.AddSingleton<ProjectFileWatcher>(sp => new ProjectFileWatcher(
+                sp.GetRequiredService<ActiveProjectService>(),
+                sp.GetRequiredService<StalenessScanner>(),
+                sp.GetRequiredService<IIngestionQueue>(),
+                sp.GetRequiredService<ICodeIndexRepository>(),
+                sp.GetRequiredService<WorkerStatusTracker>(),
+                sp.GetRequiredService<IKeyValueStore>(),
+                settings,
+                sp.GetRequiredService<ILogger<ProjectFileWatcher>>()));
+            services.AddHostedService(sp => sp.GetRequiredService<ProjectFileWatcher>());
+        }
+
+        return services;
+    }
+
+    private static string? ResolveTypeScriptPath(IServiceProvider sp, CodeIndexSettings settings)
+    {
+        // Explicit path wins — user supplied their own typescript.js
+        if (!string.IsNullOrEmpty(settings.TypeScriptCompilerPath) &&
+            File.Exists(settings.TypeScriptCompilerPath))
+            return settings.TypeScriptCompilerPath;
+
+        var destPath = Path.Combine(settings.TypeScriptModelsPath, "typescript.js");
+
+        if (File.Exists(destPath))
+            return destPath;
+
+        if (!settings.AutoDownloadTypeScript)
+        {
+            var logger = sp.GetRequiredService<ILogger<CodeIndexService>>();
+            logger.LogWarning(
+                "TypeScript provider enabled but typescript.js not found. " +
+                "Set CodeIndex.AutoDownloadTypeScript=true or provide CodeIndex.TypeScriptCompilerPath.");
+            return null;
+        }
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule(":scroll: [bold blue]Downloading TypeScript Compiler[/]").RuleStyle("blue dim").LeftJustified());
+        AnsiConsole.MarkupLine($"  [grey]typescript.js {settings.TypeScriptVersion} · unpkg.com · ~10 MB[/]");
+        AnsiConsole.WriteLine();
+
+        var dlLogger = sp.GetRequiredService<ILoggerFactory>()
+            .CreateLogger<TypeScriptCompilerDownloader>();
+        using var downloader = new TypeScriptCompilerDownloader(dlLogger);
+        var ok = downloader.EnsureAsync(destPath, settings.TypeScriptVersion)
+            .GetAwaiter().GetResult();
+
+        AnsiConsole.WriteLine();
+        return ok ? destPath : null;
     }
 }

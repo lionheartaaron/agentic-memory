@@ -96,13 +96,14 @@ export default function Chat() {
   const abortRef = useRef<AbortController | null>(null)
 
   const { data: status, isLoading: statusLoading } = useQuery({
-    queryKey: ['generate-status'],
-    queryFn: api.generateStatus,
+    queryKey: ['status'],
+    queryFn: api.systemStatus,
     refetchInterval: 10_000,
     retry: false,
   })
 
-  const modelAvailable = status?.available === true
+  const modelAvailable = status?.generation.available === true
+  const modelName = status?.generation.modelName ?? 'Local model'
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -224,7 +225,7 @@ export default function Chat() {
               )}
             </div>
             <div>
-              <h1 className="text-[15px] font-semibold text-zinc-100 leading-tight">Phi-4-mini</h1>
+              <h1 className="text-[15px] font-semibold text-zinc-100 leading-tight">{modelName}</h1>
               <div className="flex items-center gap-1.5 mt-0.5">
                 {statusLoading ? (
                   <span className="text-xs text-zinc-600">Checking…</span>
@@ -260,7 +261,7 @@ export default function Chat() {
               <Sparkles className="w-9 h-9 text-white" />
             </div>
             <div>
-              <div className="text-lg font-semibold text-zinc-200">Phi-4-mini-instruct</div>
+              <div className="text-lg font-semibold text-zinc-200">{modelName}</div>
               <div className="text-sm text-zinc-500 mt-1.5 leading-relaxed max-w-xs">
                 {modelAvailable
                   ? 'Local AI on your device. Ask me anything.'

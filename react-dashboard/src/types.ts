@@ -45,6 +45,37 @@ export interface HealthResponse {
   timestamp: string
 }
 
+export interface SystemStatus {
+  status: 'healthy' | string
+  timestamp: string
+  server: {
+    listeningUrl: string
+  }
+  generation: {
+    enabled: boolean
+    available: boolean
+    modelName: string | null
+  }
+  embeddings: {
+    enabled: boolean
+    available: boolean
+    modelName: string | null
+    dimensions: number
+  }
+  maintenance: {
+    enabled: boolean
+  }
+  codeIndex: {
+    enabled: boolean
+    providers: Array<{
+      providerType: string
+      compilerApi: string
+      domainPatternFamilies: string[]
+      active: boolean
+    }>
+  }
+}
+
 export interface CreateMemoryRequest {
   title: string
   summary: string
@@ -65,6 +96,13 @@ export interface StoreResult {
   action: string
 }
 
+export interface Project {
+  id: string
+  name: string
+  rootPath: string
+  createdAt: string
+}
+
 export interface FsItem {
   name: string
   fullPath: string
@@ -76,4 +114,76 @@ export interface BrowseResponse {
   path: string
   parent: string | null
   items: FsItem[]
+}
+
+// ── Code Index Brain ──────────────────────────────────────────────────────────
+
+export interface SymbolRecord {
+  name: string
+  kind: string
+  type: string | null
+  accessibility: string
+  line: number
+}
+
+export interface CodeIndexFile {
+  id: string
+  projectId: string
+  filePath: string
+  fileName: string
+  relativePath: string
+  language: string
+  providerType: string
+  extractedContext: string
+  llmSummary: string
+  symbols: SymbolRecord[]
+  indexedAt: string
+  fileModifiedAt: string
+  isStale: boolean
+  ingestionError: string | null
+  score?: number | null
+}
+
+export interface ProjectActivateResponse {
+  projectId: string
+  name: string
+  rootPath: string
+  queuedFiles: number
+  alreadyIndexed: number
+}
+
+export interface ActiveProjectInfo {
+  projectId: string
+  name: string
+  rootPath: string
+}
+
+export interface RecentJobEntry {
+  relativePath: string
+  language: string
+  symbolCount: number
+  durationMs: number
+  indexedAt: string
+  wasNew: boolean
+}
+
+export interface RecentErrorEntry {
+  relativePath: string
+  error: string
+  occurredAt: string
+}
+
+export interface WorkerStatus {
+  activeProjectId: string | null
+  activeProjectName: string | null
+  isProcessing: boolean
+  currentFile: string | null
+  queueDepth: number
+  summaryQueueDepth: number
+  totalIndexableFiles: number
+  indexedFiles: number
+  staleFiles: number
+  errorFiles: number
+  recentJobs: RecentJobEntry[]
+  recentErrors: RecentErrorEntry[]
 }
