@@ -36,7 +36,7 @@ namespace AgenticMemory.CodeIndex.TypeScript;
 /// detected on top of the compiler's symbol data. These are hand-rolled by necessity — no compiler
 /// API encodes "this is a Zustand store" or "this is a TanStack Query hook".
 /// </summary>
-public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider
+public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider, IBatchReferenceProvider
 {
     private readonly string? _typescriptJsPath;
     private readonly ConcurrentDictionary<string, ProjectIndex> _projects
@@ -80,6 +80,14 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider
             return;
         }
 
+        // Skip re-initialisation if already running — V8 engine + LanguageService stays alive
+        // for the app's lifetime; rebuilding it would throw away the whole compiled program.
+        if (_projects.ContainsKey(projectRoot))
+        {
+            _logger.LogDebug("TypeScript index already registered for {Root}", projectRoot);
+            return;
+        }
+
         var index = new ProjectIndex(projectRoot, _typescriptJsPath, _logger);
         try
         {
@@ -107,7 +115,7 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider
             return string.Empty;
         }
 
-        return await Task.Run(() => index.ExtractContext(filePath), ct);
+        return await index.ExtractContextAsync(filePath, ct);
     }
 
     // ── Symbol / reference / diagnostic queries ───────────────────────────────
@@ -116,7 +124,7 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider
     {
         var index = FindIndex(filePath);
         if (index is null) return [];
-        return await Task.Run(() => index.GetSymbols(filePath), ct);
+        return await index.GetSymbolsAsync(filePath, ct);
     }
 
     public async Task<IReadOnlyList<ReferenceInfo>> FindReferencesAsync(
@@ -124,7 +132,31 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider
     {
         var index = FindIndex(filePath);
         if (index is null) return [];
-        return await Task.Run(() => index.FindReferences(filePath, symbolName), ct);
+        return await index.FindReferencesAsync(filePath, symbolName, ct);
+    }
+
+    public async Task<IReadOnlyDictionary<string, IReadOnlyList<ReferenceInfo>>> FindAllReferencesAsync(
+        string filePath, IReadOnlyList<string> symbolNames, CancellationToken ct = default)
+    {
+        var index = FindIndex(filePath);
+        if (index is null) return new Dictionary<string, IReadOnlyList<ReferenceInfo>>();
+        return await index.FindAllReferencesAsync(symbolNames, ct);
+    }
+
+    public async Task<SemanticMetadata> ExtractSemanticMetadataAsync(
+        string filePath, CancellationToken ct = default)
+    {
+        var index = FindIndex(filePath);
+        if (index is null) return SemanticMetadata.Empty;
+        return await index.ExtractSemanticMetadataAsync(filePath, ct);
+    }
+
+    public async Task<IReadOnlyList<DomainFact>> ExtractDomainFactsAsync(
+        string filePath, CancellationToken ct = default)
+    {
+        var index = FindIndex(filePath);
+        if (index is null) return [];
+        return await index.ExtractDomainFactsAsync(filePath, ct);
     }
 
     public async Task<IReadOnlyList<DiagnosticInfo>> GetDiagnosticsAsync(
@@ -132,7 +164,7 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider
     {
         var index = FindIndex(filePath);
         if (index is null) return [];
-        return await Task.Run(() => index.GetDiagnostics(filePath), ct);
+        return await index.GetDiagnosticsAsync(filePath, ct);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -159,12 +191,16 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider
         private static readonly System.Text.Json.JsonSerializerOptions _caseInsensitive =
             new() { PropertyNameCaseInsensitive = true };
 
+        // V8ScriptEngine is not thread-safe — serialise all engine calls through this gate.
+        private readonly SemaphoreSlim _gate = new(1, 1);
+
         private readonly string _projectRoot;
         private readonly string _typescriptJsPath;
         private readonly ILogger _logger;
         private V8ScriptEngine? _engine;
         private ScriptFileCache _cache = new();
         private LanguageServiceHost? _host;
+        private int _programVersion; // bumped on every file invalidation; drives findAllReferences cache
 
         internal ProjectIndex(string projectRoot, string tsPath, ILogger logger)
         {
@@ -198,76 +234,314 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider
             }, ct);
         }
 
-        internal string ExtractContext(string filePath)
+        internal async Task<string> ExtractContextAsync(string filePath, CancellationToken ct)
         {
             if (_engine is null) return string.Empty;
+            await _gate.WaitAsync(ct);
             try
             {
-                // Invalidate the file so TS picks up the current disk content
-                _host?.InvalidateFile(filePath);
-
-                // TypeScript normalizes all paths to forward slashes internally; pass the same
-                // format or getSourceFile() returns undefined even when the file was registered.
-                var normalized = filePath.Replace('\\', '/');
-                var result = _engine.Evaluate($@"
-                    (function() {{
-                        var info = getFileInfo(""{normalized}"");
-                        if (!info) {{ Console.WriteLine('TS getFileInfo returned null for: {normalized}'); }}
-                        return info ? JSON.stringify(info) : null;
-                    }})()");
-
-                if (result is null or Undefined)
+                return await Task.Run(() =>
                 {
-                    _logger.LogWarning("TypeScript getFileInfo returned null for {File} — file may not be in the program", filePath);
-                    return string.Empty;
-                }
-                return FormatContextFromJson(result.ToString() ?? "", filePath);
+                    // Invalidate the file so TS picks up the current disk content
+                    _host?.InvalidateFile(filePath);
+                    _programVersion++; // tell findAllReferences its index is stale
+
+                    var normalized = filePath.Replace('\\', '/');
+                    var result = _engine.Evaluate($@"
+                        (function() {{
+                            var info = getFileInfo(""{normalized}"");
+                            if (!info) {{ Console.WriteLine('TS getFileInfo returned null for: {normalized}'); }}
+                            return info ? JSON.stringify(info) : null;
+                        }})()");
+
+                    if (result is null or Undefined)
+                    {
+                        _logger.LogWarning("TypeScript getFileInfo returned null for {File} — file may not be in the program", filePath);
+                        return string.Empty;
+                    }
+                    return FormatContextFromJson(result.ToString() ?? "", filePath);
+                }, ct);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogWarning(ex, "TypeScript context extraction failed for {File}", filePath);
                 return string.Empty;
             }
+            finally { _gate.Release(); }
         }
 
-        internal IReadOnlyList<SymbolInfo> GetSymbols(string filePath)
+        internal async Task<IReadOnlyList<SymbolInfo>> GetSymbolsAsync(string filePath, CancellationToken ct)
         {
             if (_engine is null) return [];
+            await _gate.WaitAsync(ct);
             try
             {
-                var normalized = filePath.Replace('\\', '/');
-                var json = _engine.Evaluate($@"JSON.stringify(getSymbols(""{normalized}""))");
-                if (json is null or Undefined) return [];
-                return System.Text.Json.JsonSerializer.Deserialize<List<SymbolInfo>>(json.ToString() ?? "[]", _caseInsensitive) ?? [];
+                return await Task.Run(() =>
+                {
+                    var normalized = filePath.Replace('\\', '/');
+                    var json = _engine.Evaluate($@"JSON.stringify(getSymbols(""{normalized}""))");
+                    if (json is null or Undefined) return (IReadOnlyList<SymbolInfo>)[];
+                    return System.Text.Json.JsonSerializer.Deserialize<List<SymbolInfo>>(json.ToString() ?? "[]", _caseInsensitive)
+                           ?? (IReadOnlyList<SymbolInfo>)[];
+                }, ct);
             }
             catch { return []; }
+            finally { _gate.Release(); }
         }
 
-        internal IReadOnlyList<ReferenceInfo> FindReferences(string filePath, string symbolName)
+        internal async Task<IReadOnlyList<ReferenceInfo>> FindReferencesAsync(string filePath, string symbolName, CancellationToken ct)
         {
             if (_engine is null) return [];
+            await _gate.WaitAsync(ct);
             try
             {
-                var normalized = filePath.Replace('\\', '/');
-                var escapedName = symbolName.Replace("\"", "\\\"");
-                var json = _engine.Evaluate($@"JSON.stringify(findReferences(""{normalized}"", ""{escapedName}""))");
-                if (json is null or Undefined) return [];
-                return System.Text.Json.JsonSerializer.Deserialize<List<ReferenceInfo>>(json.ToString() ?? "[]", _caseInsensitive) ?? [];
+                return await Task.Run(() =>
+                {
+                    var normalized  = filePath.Replace('\\', '/');
+                    var escapedName = symbolName.Replace("\"", "\\\"");
+                    var json = _engine.Evaluate($@"JSON.stringify(findReferences(""{normalized}"", ""{escapedName}""))");
+                    if (json is null or Undefined) return (IReadOnlyList<ReferenceInfo>)[];
+                    return System.Text.Json.JsonSerializer.Deserialize<List<ReferenceInfo>>(json.ToString() ?? "[]", _caseInsensitive)
+                           ?? (IReadOnlyList<ReferenceInfo>)[];
+                }, ct);
             }
             catch { return []; }
+            finally { _gate.Release(); }
         }
 
-        internal IReadOnlyList<DiagnosticInfo> GetDiagnostics(string filePath)
+        /// <summary>
+        /// Batch reference lookup via the pre-built JS inverted index.
+        /// The JS findAllReferences function caches the index keyed by _programVersion so
+        /// it rebuilds at most once per file-invalidation cycle rather than once per symbol.
+        /// </summary>
+        internal async Task<IReadOnlyDictionary<string, IReadOnlyList<ReferenceInfo>>> FindAllReferencesAsync(
+            IReadOnlyList<string> symbolNames, CancellationToken ct)
         {
-            if (_engine is null) return [];
+            if (_engine is null || symbolNames.Count == 0)
+                return new Dictionary<string, IReadOnlyList<ReferenceInfo>>();
+
+            await _gate.WaitAsync(ct);
             try
             {
-                var normalized = filePath.Replace('\\', '/');
-                var json = _engine.Evaluate($@"JSON.stringify(getDiagnostics(""{normalized}""))");
-                if (json is null or Undefined) return [];
-                return System.Text.Json.JsonSerializer.Deserialize<List<DiagnosticInfo>>(json.ToString() ?? "[]", _caseInsensitive) ?? [];
+                return await Task.Run(() =>
+                {
+                    // Pass symbolNames as a JS array literal and the version as an int.
+                    // Identifier names cannot contain quotes or backslashes so no escaping needed.
+                    var namesJson = System.Text.Json.JsonSerializer.Serialize(symbolNames);
+                    var json = _engine!.Evaluate($"findAllReferences({namesJson}, {_programVersion})");
+                    if (json is null or Undefined)
+                        return (IReadOnlyDictionary<string, IReadOnlyList<ReferenceInfo>>)
+                            new Dictionary<string, IReadOnlyList<ReferenceInfo>>();
+
+                    var raw = System.Text.Json.JsonSerializer.Deserialize<
+                        Dictionary<string, List<ReferenceInfo>>>(json.ToString() ?? "{}", _caseInsensitive)
+                        ?? new Dictionary<string, List<ReferenceInfo>>();
+
+                    return (IReadOnlyDictionary<string, IReadOnlyList<ReferenceInfo>>)
+                        raw.ToDictionary(
+                            kv => kv.Key,
+                            kv => (IReadOnlyList<ReferenceInfo>)kv.Value,
+                            StringComparer.Ordinal);
+                }, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "TypeScript FindAllReferences failed for {Count} symbols", symbolNames.Count);
+                return new Dictionary<string, IReadOnlyList<ReferenceInfo>>();
+            }
+            finally { _gate.Release(); }
+        }
+
+        internal async Task<IReadOnlyList<DiagnosticInfo>> GetDiagnosticsAsync(string filePath, CancellationToken ct)
+        {
+            if (_engine is null) return [];
+            await _gate.WaitAsync(ct);
+            try
+            {
+                return await Task.Run(() =>
+                {
+                    var normalized = filePath.Replace('\\', '/');
+                    var json = _engine.Evaluate($@"JSON.stringify(getDiagnostics(""{normalized}""))");
+                    if (json is null or Undefined) return (IReadOnlyList<DiagnosticInfo>)[];
+                    return System.Text.Json.JsonSerializer.Deserialize<List<DiagnosticInfo>>(json.ToString() ?? "[]", _caseInsensitive)
+                           ?? (IReadOnlyList<DiagnosticInfo>)[];
+                }, ct);
             }
             catch { return []; }
+            finally { _gate.Release(); }
+        }
+
+        /// <summary>
+        /// Extracts SemanticMetadata from the bridge's getFileInfo result.
+        /// Reuses the same data that ExtractContextAsync produces so there is no extra
+        /// compiler work — the LanguageService caches the program internally.
+        /// </summary>
+        internal async Task<SemanticMetadata> ExtractSemanticMetadataAsync(string filePath, CancellationToken ct)
+        {
+            if (_engine is null) return SemanticMetadata.Empty;
+            await _gate.WaitAsync(ct);
+            try
+            {
+                return await Task.Run(() =>
+                {
+                    var normalized = filePath.Replace('\\', '/');
+                    var result = _engine!.Evaluate($@"
+                        (function() {{
+                            var info = getFileInfo(""{normalized}"");
+                            return info ? JSON.stringify(info) : null;
+                        }})()");
+
+                    if (result is null or Undefined) return SemanticMetadata.Empty;
+                    return ParseSemanticMetadata(result.ToString() ?? "", filePath);
+                }, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "TypeScript semantic metadata failed for {File}", filePath);
+                return SemanticMetadata.Empty;
+            }
+            finally { _gate.Release(); }
+        }
+
+        /// <summary>
+        /// Promotes the bridge's getFileInfo domainHints (already crossing the V8->C# boundary)
+        /// into structured DomainFacts. Pure plumbing — no new compiler work.
+        /// </summary>
+        internal async Task<IReadOnlyList<DomainFact>> ExtractDomainFactsAsync(string filePath, CancellationToken ct)
+        {
+            if (_engine is null) return [];
+            await _gate.WaitAsync(ct);
+            try
+            {
+                return await Task.Run(() =>
+                {
+                    var normalized = filePath.Replace('\\', '/');
+                    var result = _engine!.Evaluate($@"
+                        (function() {{
+                            var info = getFileInfo(""{normalized}"");
+                            return info ? JSON.stringify(info) : null;
+                        }})()");
+
+                    if (result is null or Undefined) return (IReadOnlyList<DomainFact>)[];
+                    return MapDomainFacts(result.ToString() ?? "");
+                }, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "TypeScript domain facts failed for {File}", filePath);
+                return [];
+            }
+            finally { _gate.Release(); }
+        }
+
+        private static IReadOnlyList<DomainFact> MapDomainFacts(string json)
+        {
+            var facts = new List<DomainFact>();
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                if (!doc.RootElement.TryGetProperty("domainHints", out var hints) ||
+                    hints.ValueKind != System.Text.Json.JsonValueKind.Array)
+                    return facts;
+
+                static string? Str(System.Text.Json.JsonElement e, string k) =>
+                    e.TryGetProperty(k, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String
+                        ? v.GetString() : null;
+
+                foreach (var h in hints.EnumerateArray())
+                {
+                    switch (Str(h, "kind"))
+                    {
+                        case "endpoint":
+                            facts.Add(new DomainFact { Kind = "fetch-endpoint", Method = Str(h, "method"), Route = Str(h, "url") });
+                            break;
+                        case "query":
+                            facts.Add(new DomainFact { Kind = "tanstack-query", Name = Str(h, "key"), TypeRef = Str(h, "fn") });
+                            break;
+                        case "mutation":
+                            var mf = new DomainFact { Kind = "tanstack-mutation", TypeRef = Str(h, "fn"), Route = Str(h, "navigatesTo") };
+                            if (h.TryGetProperty("invalidates", out var inv) &&
+                                inv.ValueKind == System.Text.Json.JsonValueKind.Array)
+                                foreach (var i in inv.EnumerateArray())
+                                    if (i.ValueKind == System.Text.Json.JsonValueKind.String) mf.Items.Add(i.GetString()!);
+                            facts.Add(mf);
+                            break;
+                        case "navigate-to":
+                        case "link-to":
+                            facts.Add(new DomainFact { Kind = "navigation-edge", Route = Str(h, "path") });
+                            break;
+                    }
+                }
+            }
+            catch { /* best effort — malformed hint payloads never fail ingestion */ }
+            return facts;
+        }
+
+        private static SemanticMetadata ParseSemanticMetadata(string json, string filePath)
+        {
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                var root = doc.RootElement;
+
+                // Domain tags — file class + framework signal from domain hints
+                var domainTags = new List<string> { DetectFileClass(root, filePath) };
+                if (root.TryGetProperty("domainHints", out var dh))
+                {
+                    bool hasQuery = false, hasMutation = false;
+                    int endpoints = 0;
+                    foreach (var h in dh.EnumerateArray())
+                    {
+                        if (!h.TryGetProperty("kind", out var k)) continue;
+                        var kind = k.GetString();
+                        if (kind == "query")    hasQuery    = true;
+                        if (kind == "mutation") hasMutation = true;
+                        if (kind == "endpoint") endpoints++;
+                    }
+                    if (hasQuery || hasMutation) domainTags.Add("tanstack-query");
+                    if (endpoints >= 2) domainTags.Add("api-client");
+                }
+
+                // Imports — local module paths + type import names
+                var imports = new List<string>();
+                if (root.TryGetProperty("localImports", out var localImports))
+                    foreach (var prop in localImports.EnumerateObject())
+                        imports.Add(prop.Name);
+                if (root.TryGetProperty("typeImports", out var typeImports))
+                    foreach (var el in typeImports.EnumerateArray())
+                    {
+                        var s = el.GetString();
+                        if (s != null) imports.Add(s);
+                    }
+
+                // TypeHierarchy — not surfaced by the current bridge; empty is honest
+                var typeHierarchy = new List<string>();
+
+                // Diagnostic summary from TS compiler (severity 1 = error, 0 = warning)
+                var diagnosticSummary = "";
+                if (root.TryGetProperty("diagnostics", out var diags))
+                {
+                    int errors = 0, warnings = 0;
+                    foreach (var d in diags.EnumerateArray())
+                    {
+                        if (!d.TryGetProperty("severity", out var sev)) continue;
+                        var code = sev.GetInt32();
+                        if (code == 1) errors++;
+                        else if (code == 0) warnings++;
+                    }
+                    var parts = new List<string>();
+                    if (errors   > 0) parts.Add($"{errors} error{(errors   > 1 ? "s" : "")}");
+                    if (warnings > 0) parts.Add($"{warnings} warning{(warnings > 1 ? "s" : "")}");
+                    if (parts.Count > 0) diagnosticSummary = string.Join(", ", parts);
+                }
+
+                return new SemanticMetadata(
+                    domainTags.Distinct().ToList(),
+                    imports.Distinct().ToList(),
+                    typeHierarchy,
+                    diagnosticSummary);
+            }
+            catch { return SemanticMetadata.Empty; }
         }
 
         /// <summary>
@@ -520,11 +794,20 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider
 
         public async ValueTask DisposeAsync()
         {
-            await Task.Run(() =>
+            await _gate.WaitAsync();
+            try
             {
-                _engine?.Dispose();
-                _engine = null;
-            });
+                await Task.Run(() =>
+                {
+                    _engine?.Dispose();
+                    _engine = null;
+                });
+            }
+            finally
+            {
+                _gate.Release();
+                _gate.Dispose();
+            }
         }
     }
 }

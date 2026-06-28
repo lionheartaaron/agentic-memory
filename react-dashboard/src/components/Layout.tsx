@@ -1,13 +1,13 @@
 import { Outlet, NavLink } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { Brain, LayoutDashboard, Database, MessageSquare, FolderGit2, Activity } from 'lucide-react'
+import { Brain, LayoutDashboard, Database, MessageSquare, FolderGit2, Activity, Settings2 } from 'lucide-react'
 import { api } from '../api'
 
 const navItems = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
   { to: '/memories', label: 'Memories', icon: Database, end: false },
   { to: '/chat', label: 'Chat', icon: MessageSquare, end: false },
-  { to: '/projects', label: 'Projects', icon: FolderGit2, end: false },
+  { to: '/projects', label: 'Workspaces', icon: FolderGit2, end: false },
   { to: '/worker', label: 'Worker', icon: Activity, end: false },
 ]
 
@@ -68,19 +68,34 @@ export default function Layout() {
           ))}
         </nav>
 
-        {/* Status */}
+        {/* Status + Settings */}
         <div className="p-4 border-t border-zinc-800 space-y-2">
-          <div className="flex items-center gap-2">
-            <div
-              className={`w-2 h-2 rounded-full flex-shrink-0 ${
-                isOnline ? 'bg-green-400' : 'bg-red-400'
-              }`}
-            />
-            <span className="text-xs text-zinc-400">
-              {isOnline ? 'Connected' : 'Disconnected'}
-            </span>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <div
+                className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                  isOnline ? 'bg-green-400' : 'bg-red-400'
+                }`}
+              />
+              <span className="text-xs text-zinc-400 truncate">
+                {isOnline ? 'Connected' : 'Disconnected'}
+              </span>
+            </div>
+            <NavLink
+              to="/settings"
+              className={({ isActive }) =>
+                `p-1.5 rounded-lg transition-colors flex-shrink-0 ${
+                  isActive
+                    ? 'bg-indigo-500/15 text-indigo-400'
+                    : 'text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800'
+                }`
+              }
+              title="Settings"
+            >
+              <Settings2 className="w-3.5 h-3.5" />
+            </NavLink>
           </div>
-          <div className="text-xs text-zinc-600 font-mono">{serverUrl}</div>
+          <div className="text-xs text-zinc-600 font-mono truncate">{serverUrl}</div>
         </div>
       </aside>
 

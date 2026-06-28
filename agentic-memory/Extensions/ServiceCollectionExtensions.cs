@@ -9,6 +9,7 @@ using AgenticMemory.CodeIndex;
 using AgenticMemory.CodeIndex.CSharp;
 using AgenticMemory.CodeIndex.TypeScript;
 using AgenticMemory.Configuration;
+using AgenticMemory.Persistence;
 using AgenticMemory.Tools;
 using Spectre.Console;
 
@@ -25,6 +26,7 @@ public static class ServiceCollectionExtensions
     public static IServiceCollection AddAgenticMemoryServices(this IServiceCollection services, AppSettings settings)
     {
         services.AddConfiguration(settings);
+        services.AddSingleton(new SharedLiteDatabase(settings.Storage.DatabasePath));
         services.AddMemoryRepository(settings);
         services.AddKeyValueStore(settings);
         services.AddEmbeddingService();
@@ -53,17 +55,14 @@ public static class ServiceCollectionExtensions
     private static IServiceCollection AddMemoryRepository(this IServiceCollection services, AppSettings settings)
     {
         services.AddSingleton<IMemoryRepository>(sp =>
-        {
-            var storageSettings = sp.GetRequiredService<AppSettings>().Storage;
-            return new LiteDbMemoryRepository(storageSettings.DatabasePath);
-        });
-
+            new LiteDbMemoryRepository(sp.GetRequiredService<SharedLiteDatabase>()));
         return services;
     }
 
     private static IServiceCollection AddKeyValueStore(this IServiceCollection services, AppSettings settings)
     {
-        services.AddSingleton<IKeyValueStore>(new LiteDbKeyValueStore(settings.Storage.DatabasePath));
+        services.AddSingleton<IKeyValueStore>(sp =>
+            new LiteDbKeyValueStore(sp.GetRequiredService<SharedLiteDatabase>()));
         return services;
     }
 
@@ -283,6 +282,7 @@ public static class ServiceCollectionExtensions
     private static IServiceCollection AddMcpTools(this IServiceCollection services)
     {
         services.AddSingleton<MemoryTools>();
+        services.AddSingleton<AgenticMemory.Tools.CodeIndexTools>();
         return services;
     }
 
@@ -337,7 +337,7 @@ public static class ServiceCollectionExtensions
         // ── Code Index Brain services ────────────────────────────────────────
 
         services.AddSingleton<ICodeIndexRepository>(sp =>
-            new LiteDbCodeIndexRepository(sp.GetRequiredService<AppSettings>().Storage.DatabasePath));
+            new LiteDbCodeIndexRepository(sp.GetRequiredService<SharedLiteDatabase>()));
 
         services.AddSingleton<ActiveProjectService>();
 
@@ -347,21 +347,32 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<ICodeIndexRepository>(),
             sp.GetRequiredService<IGenerativeModelService>(),
             sp.GetRequiredService<AppSettings>().Generation,
+            sp.GetRequiredService<IEmbeddingService>(),
             sp.GetRequiredService<WorkerStatusTracker>(),
             sp.GetRequiredService<ILogger<SummaryWorker>>()));
         services.AddSingleton<ISummaryQueue>(sp => sp.GetRequiredService<SummaryWorker>());
         services.AddHostedService(sp => sp.GetRequiredService<SummaryWorker>());
+
+        // ReferenceIndexWorker — singleton + hosted + IReferenceQueue surface (same pattern as SummaryWorker)
+        services.AddSingleton<ReferenceIndexWorker>();
+        services.AddSingleton<IReferenceQueue>(sp => sp.GetRequiredService<ReferenceIndexWorker>());
+        services.AddHostedService(sp => sp.GetRequiredService<ReferenceIndexWorker>());
 
         services.AddSingleton<FileIngestionService>(sp => new FileIngestionService(
             sp.GetRequiredService<CodeIndexService>(),
             sp.GetRequiredService<ICodeIndexRepository>(),
             sp.GetRequiredService<IEmbeddingService>(),
             sp.GetRequiredService<ISummaryQueue>(),
+            sp.GetRequiredService<IReferenceQueue>(),
             sp.GetRequiredService<ILogger<FileIngestionService>>()));
+
+        services.AddSingleton<WorkspaceDiscoveryService>();
 
         services.AddSingleton<StalenessScanner>(sp => new StalenessScanner(
             sp.GetRequiredService<ICodeIndexRepository>(),
             sp.GetRequiredService<IIngestionQueue>(),
+            sp.GetRequiredService<ISummaryQueue>(),
+            sp.GetRequiredService<IReferenceQueue>(),
             settings,
             sp.GetRequiredService<ILogger<StalenessScanner>>()));
 

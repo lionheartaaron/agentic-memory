@@ -23,6 +23,10 @@ public sealed class ProjectFileWatcher : BackgroundService
     private readonly Dictionary<string, DateTime> _debounceMap = new();
     private static readonly TimeSpan DebounceWindow = TimeSpan.FromSeconds(2);
 
+    // Written under _watcherLock before the watcher starts; read on FSW callback threads.
+    private volatile IReadOnlyList<SubProjectRecord> _activeSubProjects =
+        Array.Empty<SubProjectRecord>();
+
     public ProjectFileWatcher(
         ActiveProjectService activeProject,
         StalenessScanner scanner,
@@ -47,12 +51,12 @@ public sealed class ProjectFileWatcher : BackgroundService
     {
         _activeProject.ActiveProjectChanged += OnActiveProjectChanged;
 
-        // Resume the project that was active before restart
+        // Resume the workspace that was active before restart
         if (!string.IsNullOrEmpty(_activeProject.ActiveProjectId))
         {
-            var root = GetProjectRoot(_activeProject.ActiveProjectId);
-            if (root != null)
-                await ActivateAsync(_activeProject.ActiveProjectId, root, stoppingToken);
+            var workspace = GetWorkspace(_activeProject.ActiveProjectId);
+            if (workspace != null)
+                await ActivateAsync(workspace, stoppingToken);
         }
 
         await Task.Delay(Timeout.Infinite, stoppingToken)
@@ -73,44 +77,45 @@ public sealed class ProjectFileWatcher : BackgroundService
             return;
         }
 
-        var root = GetProjectRoot(projectId);
-        if (root == null)
+        var workspace = GetWorkspace(projectId);
+        if (workspace == null)
         {
-            _logger.LogWarning("Active project {Id} not found in project store", projectId);
+            _logger.LogWarning("Active workspace {Id} not found in store", projectId);
             return;
         }
 
-        _ = Task.Run(() => ActivateAsync(projectId, root, CancellationToken.None));
+        _ = Task.Run(() => ActivateAsync(workspace, CancellationToken.None));
     }
 
-    private async Task ActivateAsync(string projectId, string root, CancellationToken ct)
+    private async Task ActivateAsync(WorkspaceRecord workspace, CancellationToken ct)
     {
-        var name = GetProjectName(projectId) ?? projectId;
-        _statusTracker.SetActive(projectId, name);
-
-        _logger.LogInformation("Activating project {Name} at {Root}", name, root);
+        _statusTracker.SetActive(workspace.Id, workspace.Name);
+        _logger.LogInformation("Activating workspace {Name} at {Root}", workspace.Name, workspace.RootPath);
 
         try
         {
-            var (queued, alreadyCurrent) = await _scanner.ScanAsync(projectId, root, ct);
+            var (queued, alreadyCurrent) = await _scanner.ScanWorkspaceAsync(
+                workspace.Id, workspace.RootPath, workspace.SubProjects, ct);
             var total = queued + alreadyCurrent;
             _statusTracker.SetTotalIndexable(total);
             _logger.LogInformation("Scan done: {T} total, {Q} queued, {C} current", total, queued, alreadyCurrent);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _logger.LogError(ex, "Staleness scan failed for {Root}", root);
+            _logger.LogError(ex, "Staleness scan failed for {Root}", workspace.RootPath);
         }
 
-        StartWatcher(projectId, root);
+        StartWatcher(workspace.Id, workspace.RootPath, workspace.SubProjects);
     }
 
-    private void StartWatcher(string projectId, string root)
+    private void StartWatcher(string workspaceId, string root, IReadOnlyList<SubProjectRecord> subProjects)
     {
         lock (_watcherLock)
         {
             StopWatcherUnsafe();
             if (!Directory.Exists(root)) return;
+
+            _activeSubProjects = subProjects;
 
             var watcher = new FileSystemWatcher(root)
             {
@@ -119,17 +124,21 @@ public sealed class ProjectFileWatcher : BackgroundService
                 EnableRaisingEvents = true,
             };
 
-            watcher.Changed += (_, e) => OnFileEvent(e.FullPath, projectId, root);
-            watcher.Created += (_, e) => OnFileEvent(e.FullPath, projectId, root);
+            watcher.Changed += (_, e) => OnFileEvent(e.FullPath, workspaceId, root);
+            watcher.Created += (_, e) => OnFileEvent(e.FullPath, workspaceId, root);
             watcher.Deleted += (_, e) => OnFileDeleted(e.FullPath);
-            watcher.Renamed += (_, e) => { OnFileDeleted(e.OldFullPath); OnFileEvent(e.FullPath, projectId, root); };
+            watcher.Renamed += (_, e) =>
+            {
+                OnFileDeleted(e.OldFullPath);
+                OnFileEvent(e.FullPath, workspaceId, root);
+            };
 
             _fsWatcher = watcher;
             _logger.LogInformation("FileSystemWatcher started for {Root}", root);
         }
     }
 
-    private void OnFileEvent(string filePath, string projectId, string projectRoot)
+    private void OnFileEvent(string filePath, string workspaceId, string workspaceRoot)
     {
         if (!_settings.IndexedExtensions.Contains(
                 Path.GetExtension(filePath), StringComparer.OrdinalIgnoreCase)) return;
@@ -141,9 +150,21 @@ public sealed class ProjectFileWatcher : BackgroundService
             _debounceMap[filePath] = now;
         }
 
-        if (projectId != _activeProject.ActiveProjectId) return;
+        if (workspaceId != _activeProject.ActiveProjectId) return;
 
-        _queue.TryEnqueue(new IngestionJob(filePath, projectId, projectRoot, Force: true));
+        // Longest-prefix match: file in react-dashboard/src/ → TypeScript sub-project
+        var owner = _activeSubProjects
+            .Where(sp => filePath.StartsWith(sp.RootPath, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(sp => sp.RootPath.Length)
+            .FirstOrDefault();
+
+        _queue.TryEnqueue(new IngestionJob(
+            filePath,
+            ProjectId:      workspaceId,
+            ProjectRoot:    workspaceRoot,
+            Force:          true,
+            SubProjectId:   owner?.Id,
+            SubProjectRoot: owner?.RootPath ?? workspaceRoot));
     }
 
     private void OnFileDeleted(string filePath)
@@ -168,24 +189,37 @@ public sealed class ProjectFileWatcher : BackgroundService
         _fsWatcher = null;
     }
 
-    private string? GetProjectRoot(string projectId) => LookupProject(projectId, "RootPath");
-    private string? GetProjectName(string projectId) => LookupProject(projectId, "Name");
-
-    private string? LookupProject(string projectId, string field)
+    private WorkspaceRecord? GetWorkspace(string workspaceId)
     {
-        var json = _kv.Get("projects");
+        // Try the new workspaces key first, fall back to legacy projects key for migration period
+        var json = _kv.Get("workspaces") ?? _kv.Get("projects");
         if (string.IsNullOrEmpty(json)) return null;
         try
         {
-            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var workspaces = System.Text.Json.JsonSerializer.Deserialize<List<WorkspaceRecord>>(json);
+            return workspaces?.Find(w => w.Id == workspaceId);
+        }
+        catch { }
+
+        // Legacy fallback: reconstruct a minimal WorkspaceRecord from the old projects format
+        try
+        {
+            var legacyJson = _kv.Get("projects");
+            if (string.IsNullOrEmpty(legacyJson)) return null;
+            using var doc = System.Text.Json.JsonDocument.Parse(legacyJson);
             foreach (var el in doc.RootElement.EnumerateArray())
             {
-                if (el.TryGetProperty("Id", out var id) && id.GetString() == projectId &&
-                    el.TryGetProperty(field, out var val))
-                    return val.GetString();
+                if (el.TryGetProperty("Id", out var id) && id.GetString() == workspaceId)
+                {
+                    var name = el.TryGetProperty("Name", out var n) ? n.GetString() ?? workspaceId : workspaceId;
+                    var root = el.TryGetProperty("RootPath", out var r) ? r.GetString() ?? "" : "";
+                    var created = el.TryGetProperty("CreatedAt", out var c) ? c.GetString() ?? "" : "";
+                    return new WorkspaceRecord(workspaceId, name, root, created, []);
+                }
             }
         }
         catch { }
+
         return null;
     }
 }

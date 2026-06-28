@@ -1,5 +1,14 @@
 namespace AgenticMemory.CodeIndex;
 
+public record SemanticMetadata(
+    List<string> DomainTags,
+    List<string> Imports,
+    List<string> TypeHierarchy,
+    string DiagnosticSummary)
+{
+    public static SemanticMetadata Empty => new([], [], [], "");
+}
+
 /// <summary>
 /// Per §1 of code-understanding-methodology.md: every provider (a) routes symbol/type/reference
 /// queries through the real compiler API for its language, and (b) declares an explicit list of
@@ -45,4 +54,20 @@ public interface ICodeIntelligenceProvider : IAsyncDisposable
 
     /// <summary>Returns semantic (not syntax) diagnostics for the file from the real compiler.</summary>
     Task<IReadOnlyList<DiagnosticInfo>> GetDiagnosticsAsync(string filePath, CancellationToken ct = default);
+
+    /// <summary>
+    /// Extracts structured semantic metadata: domain tags, import namespaces, type hierarchy entries,
+    /// and a condensed diagnostic summary. Providers that cannot supply a field return empty defaults.
+    /// </summary>
+    Task<SemanticMetadata> ExtractSemanticMetadataAsync(string filePath, CancellationToken ct = default)
+        => Task.FromResult(SemanticMetadata.Empty);
+
+    /// <summary>
+    /// Promotes the framework-convention data the provider already detects (HTTP routes, DI edges,
+    /// EF entities, TanStack query/mutation cache graph, navigation/fetch endpoints) into a flat,
+    /// queryable list. Producers MUST resolve fields through the real compiler API (§5 — no syntactic
+    /// guesses persisted). Providers with no domain layer return an empty list.
+    /// </summary>
+    Task<IReadOnlyList<DomainFact>> ExtractDomainFactsAsync(string filePath, CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<DomainFact>>([]);
 }

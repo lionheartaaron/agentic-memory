@@ -1,6 +1,7 @@
 using System.Text;
 using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Brain.Models;
+using AgenticMemory.Persistence;
 using LiteDB;
 
 namespace AgenticMemory.Brain.Storage;
@@ -13,37 +14,13 @@ public class LiteDbMemoryRepository : IMemoryRepository
     private const string CollectionName = "memories";
     private const double WeakMemoryThreshold = 0.3;
 
-    private readonly LiteDatabase _database;
+    private readonly SharedLiteDatabase _sharedDb;
     private readonly ILiteCollection<MemoryNodeEntity> _collection;
-    private bool _disposed;
 
-    public LiteDbMemoryRepository(string databasePath)
+    public LiteDbMemoryRepository(SharedLiteDatabase sharedDb)
     {
-        // Ensure directory exists
-        var directory = Path.GetDirectoryName(databasePath);
-        if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
-
-        // Use shared connection mode for multi-threaded access
-        var connectionString = new ConnectionString
-        {
-            Filename = databasePath,
-            Connection = ConnectionType.Shared
-        };
-
-        // Create a dedicated BsonMapper instance to avoid race conditions with BsonMapper.Global
-        // when multiple database instances are created in parallel (e.g., during testing)
-        var mapper = new BsonMapper();
-        
-        // Explicitly register the entity type to ensure all properties are mapped
-        mapper.Entity<MemoryNodeEntity>()
-            .Id(x => x.Id);
-
-        _database = new LiteDatabase(connectionString, mapper);
-        _collection = _database.GetCollection<MemoryNodeEntity>(CollectionName);
-
+        _sharedDb   = sharedDb;
+        _collection = sharedDb.Database.GetCollection<MemoryNodeEntity>(CollectionName);
         EnsureIndexes();
     }
 
@@ -385,7 +362,7 @@ public class LiteDbMemoryRepository : IMemoryRepository
     public Task CompactAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        _database.Rebuild();
+        _sharedDb.Database.Rebuild();
         return Task.CompletedTask;
     }
 
@@ -393,26 +370,11 @@ public class LiteDbMemoryRepository : IMemoryRepository
     {
         try
         {
-            var dbPath = _database.GetCollection("$dump").FindAll().FirstOrDefault()?["filename"]?.AsString;
-            if (!string.IsNullOrEmpty(dbPath) && File.Exists(dbPath))
-            {
-                return new FileInfo(dbPath).Length;
-            }
+            var path = _sharedDb.DatabasePath;
+            return File.Exists(path) ? new FileInfo(path).Length : 0;
         }
-        catch
-        {
-            // Ignore errors getting file size
-        }
-        return 0;
+        catch { return 0; }
     }
 
-    public void Dispose()
-    {
-        if (!_disposed)
-        {
-            _database.Dispose();
-            _disposed = true;
-        }
-        GC.SuppressFinalize(this);
-    }
+    public void Dispose() { /* lifetime managed by SharedLiteDatabase singleton */ }
 }

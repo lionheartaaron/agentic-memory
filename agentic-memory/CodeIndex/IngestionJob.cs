@@ -2,9 +2,11 @@ namespace AgenticMemory.CodeIndex;
 
 public record IngestionJob(
     string FilePath,
-    string ProjectId,
-    string? ProjectRoot = null,
-    bool Force = false);
+    string ProjectId,        // WorkspaceId
+    string? ProjectRoot,     // Workspace root — kept as provider registration context
+    bool Force,
+    string? SubProjectId   = null,
+    string? SubProjectRoot = null);
 
 public interface IIngestionQueue
 {

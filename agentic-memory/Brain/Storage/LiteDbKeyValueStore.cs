@@ -1,29 +1,18 @@
 using AgenticMemory.Brain.Interfaces;
+using AgenticMemory.Persistence;
 using LiteDB;
 
 namespace AgenticMemory.Brain.Storage;
 
-public class LiteDbKeyValueStore : IKeyValueStore, IDisposable
+public class LiteDbKeyValueStore : IKeyValueStore
 {
     private const string CollectionName = "kv";
 
-    private readonly LiteDatabase _db;
     private readonly ILiteCollection<KvEntry> _col;
-    private bool _disposed;
 
-    public LiteDbKeyValueStore(string databasePath)
+    public LiteDbKeyValueStore(SharedLiteDatabase sharedDb)
     {
-        var dir = Path.GetDirectoryName(databasePath);
-        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-            Directory.CreateDirectory(dir);
-
-        _db = new LiteDatabase(new ConnectionString
-        {
-            Filename   = databasePath,
-            Connection = ConnectionType.Shared,
-        }, new BsonMapper());
-
-        _col = _db.GetCollection<KvEntry>(CollectionName);
+        _col = sharedDb.Database.GetCollection<KvEntry>(CollectionName);
     }
 
     public string? Get(string key) => _col.FindById(key)?.Value;
@@ -32,13 +21,6 @@ public class LiteDbKeyValueStore : IKeyValueStore, IDisposable
         _col.Upsert(new KvEntry { Id = key, Value = value, UpdatedAt = DateTime.UtcNow });
 
     public void Delete(string key) => _col.Delete(key);
-
-    public void Dispose()
-    {
-        if (_disposed) return;
-        _disposed = true;
-        _db.Dispose();
-    }
 }
 
 internal sealed class KvEntry

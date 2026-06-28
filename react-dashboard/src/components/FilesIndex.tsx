@@ -1,13 +1,15 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import {
   Search, RefreshCw, ChevronDown, ChevronRight,
   Loader2, AlertCircle, Database, Code2, MoreHorizontal,
   Trash2, Sparkles, FileText, Clock, Calendar, Cpu, X,
+  GitBranch, Zap, FlaskConical, ShieldCheck,
 } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
-import type { CodeIndexFile, SymbolRecord } from '../types'
+import { RichSymbolDetail, CodePeek, Chip, StatusBadges, type PeekTarget } from './intelligenceUi'
+import type { CodeIndexFile, SymbolRecord, SymbolReference } from '../types'
 
 function useDebounce<T>(value: T, ms: number): T {
   const [debounced, setDebounced] = useState(value)
@@ -55,44 +57,66 @@ function timeAgo(iso: string) {
   return `${Math.floor(diff / 86_400_000)}d ago`
 }
 
-function SymbolsTable({ symbols }: { symbols: SymbolRecord[] }) {
-  if (!symbols.length) return <p className="text-xs text-zinc-500 italic">No symbols extracted.</p>
+function FileSymbolRow({
+  s, reference, fileId, onPeek, onNavigateToFile,
+}: {
+  s: SymbolRecord
+  reference?: SymbolReference
+  fileId: string
+  onPeek: (t: PeekTarget) => void
+  onNavigateToFile?: (fileId: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const refs = reference?.fanIn ?? 0
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-xs">
-        <thead>
-          <tr className="border-b border-zinc-700/60">
-            <th className="text-left py-1.5 pr-4 text-zinc-500 font-medium">Name</th>
-            <th className="text-left py-1.5 pr-4 text-zinc-500 font-medium">Kind</th>
-            <th className="text-left py-1.5 pr-4 text-zinc-500 font-medium">Type</th>
-            <th className="text-left py-1.5 pr-4 text-zinc-500 font-medium">Access</th>
-            <th className="text-right py-1.5 text-zinc-500 font-medium">Line</th>
-          </tr>
-        </thead>
-        <tbody>
-          {symbols.map((s, i) => (
-            <tr key={i} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
-              <td className="py-1.5 pr-4 font-mono text-zinc-200 font-medium">{s.name}</td>
-              <td className="py-1.5 pr-4 text-zinc-400">{s.kind}</td>
-              <td className="py-1.5 pr-4 text-zinc-500 font-mono truncate max-w-[200px]" title={s.type ?? ''}>
-                {s.type ?? '—'}
-              </td>
-              <td className="py-1.5 pr-4">
-                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
-                  s.accessibility === 'public'
-                    ? 'bg-green-500/10 text-green-400'
-                    : s.accessibility === 'private'
-                    ? 'bg-zinc-700/60 text-zinc-500'
-                    : 'bg-amber-500/10 text-amber-400'
-                }`}>
-                  {s.accessibility}
-                </span>
-              </td>
-              <td className="py-1.5 text-right text-zinc-500 font-mono">{s.line}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="border border-zinc-800 rounded-lg overflow-hidden">
+      <button onClick={() => setOpen(o => !o)} className="w-full flex items-center gap-2 px-2.5 py-1.5 hover:bg-zinc-800/40 transition-colors text-left">
+        {open ? <ChevronDown className="w-3 h-3 text-zinc-400 flex-shrink-0" /> : <ChevronRight className="w-3 h-3 text-zinc-600 flex-shrink-0" />}
+        <span className="font-mono text-xs text-zinc-200 truncate flex-1 min-w-0">{s.name}</span>
+        <StatusBadges s={s} reference={reference} />
+        <span className="text-[10px] text-zinc-500 flex-shrink-0">{s.kind}</span>
+        {refs > 0 && <span className="text-[10px] text-indigo-400 tabular-nums flex-shrink-0">↙{refs}</span>}
+        <span className="text-[10px] text-zinc-600 font-mono flex-shrink-0">:{s.line}</span>
+      </button>
+      {open && (
+        <div className="border-t border-zinc-800 p-3 bg-zinc-950/30">
+          <RichSymbolDetail
+            record={s}
+            reference={reference}
+            fileId={fileId}
+            onPeek={onPeek}
+            onNavigateToFile={onNavigateToFile}
+          />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function FileSymbolList({
+  symbols, definedSymbols, fileId, onPeek, onNavigateToFile,
+}: {
+  symbols: SymbolRecord[]
+  definedSymbols?: SymbolReference[]
+  fileId: string
+  onPeek: (t: PeekTarget) => void
+  onNavigateToFile?: (fileId: string) => void
+}) {
+  if (!symbols.length) return <p className="text-xs text-zinc-500 italic">No symbols extracted.</p>
+  const refByName = new Map<string, SymbolReference>()
+  for (const r of definedSymbols ?? []) refByName.set(r.name, r)
+  return (
+    <div className="space-y-1 max-h-[28rem] overflow-y-auto pr-1">
+      {symbols.map((s, i) => (
+        <FileSymbolRow
+          key={i}
+          s={s}
+          reference={refByName.get(s.name)}
+          fileId={fileId}
+          onPeek={onPeek}
+          onNavigateToFile={onNavigateToFile}
+        />
+      ))}
     </div>
   )
 }
@@ -111,15 +135,40 @@ function ScoreBadge({ score }: { score: number }) {
   )
 }
 
-function FileRow({ file, expanded, onToggle }: {
+function FileRow({
+  file,
+  expanded,
+  onToggle,
+  projectId,
+  rowRef,
+  onPeek,
+  onNavigateToFile,
+}: {
   file: CodeIndexFile
   expanded: boolean
   onToggle: () => void
+  projectId: string
+  rowRef?: React.Ref<HTMLDivElement>
+  onPeek: (t: PeekTarget) => void
+  onNavigateToFile?: (fileId: string) => void
 }) {
+  const profileQuery = useQuery({
+    queryKey: ['intelligence-file', projectId, file.id],
+    queryFn: () => api.intelligence.getFileProfile(projectId, file.id),
+    enabled: expanded,
+    staleTime: 60_000,
+  })
+
+  const fanIn  = file.fanIn  ?? 0
+  const fanOut = file.fanOut ?? 0
+
   return (
-    <div className={`border rounded-lg overflow-hidden transition-colors ${
-      expanded ? 'border-zinc-700' : 'border-zinc-800'
-    }`}>
+    <div
+      ref={rowRef}
+      className={`border rounded-lg overflow-hidden transition-colors ${
+        expanded ? 'border-zinc-700' : 'border-zinc-800'
+      }`}
+    >
       {/* Collapsed header */}
       <button
         onClick={onToggle}
@@ -137,9 +186,22 @@ function FileRow({ file, expanded, onToggle }: {
         </span>
 
         <div className="flex items-center gap-2 flex-shrink-0">
+          {file.isEntrypoint && <Chip tone="green" title="entrypoint"><Zap className="w-2.5 h-2.5" />entry</Chip>}
+          {file.isTestFile && <Chip tone="sky" title={file.testFramework ?? 'test file'}><FlaskConical className="w-2.5 h-2.5" />test</Chip>}
+          {(file.orphanSymbolCount ?? 0) > 0 && <Chip tone="orange" title="public symbols with no references anywhere">{file.orphanSymbolCount} orphan</Chip>}
           {file.score != null && <ScoreBadge score={file.score} />}
           {langBadge(file.language)}
           <span className="text-xs text-zinc-500 tabular-nums">{file.symbols.length} sym</span>
+          {fanIn > 0 && (
+            <span className="text-[10px] text-indigo-400 tabular-nums flex-shrink-0" title={`${fanIn} files depend on this`}>
+              ↙{fanIn}
+            </span>
+          )}
+          {fanOut > 0 && (
+            <span className="text-[10px] text-zinc-500 tabular-nums flex-shrink-0" title={`This file depends on ${fanOut} files`}>
+              ↗{fanOut}
+            </span>
+          )}
           <span className="text-xs text-zinc-600">{timeAgo(file.indexedAt)}</span>
           {file.isStale && (
             <span className="w-2 h-2 rounded-full bg-amber-400 flex-shrink-0" title="Stale — queued for re-index" />
@@ -161,6 +223,14 @@ function FileRow({ file, expanded, onToggle }: {
             <div className="mx-4 mt-4 flex items-start gap-2 rounded-lg border border-red-800/50 bg-red-950/30 px-3 py-2.5">
               <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
               <p className="text-xs text-red-400 font-mono">{file.ingestionError}</p>
+            </div>
+          )}
+
+          {/* Diagnostic summary */}
+          {file.diagnosticSummary && (
+            <div className="mx-4 mt-4 flex items-start gap-2 rounded-lg border border-amber-800/50 bg-amber-950/20 px-3 py-2.5">
+              <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+              <p className="text-xs text-amber-300 font-mono">{file.diagnosticSummary}</p>
             </div>
           )}
 
@@ -193,6 +263,34 @@ function FileRow({ file, expanded, onToggle }: {
               <Cpu className="w-3 h-3" />
               <span className="text-zinc-400">{file.providerType || '—'}</span>
             </div>
+            {(file.domainTags ?? []).length > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {(file.domainTags ?? []).map(t => (
+                  <span key={t} className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700">
+                    {t}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Insights strip */}
+          <div className="px-4 py-2.5 flex flex-wrap items-center gap-1.5 border-b border-zinc-800">
+            {file.architecturalRole && <Chip tone="violet" title="architectural role">{file.architecturalRole}</Chip>}
+            {file.isEntrypoint && <Chip tone="green"><Zap className="w-2.5 h-2.5" />entrypoint</Chip>}
+            {file.isTestFile && <Chip tone="sky"><FlaskConical className="w-2.5 h-2.5" />{file.testFramework ?? 'test'}</Chip>}
+            {file.hasValidation && <Chip tone="green"><ShieldCheck className="w-2.5 h-2.5" />validated DTOs</Chip>}
+            {file.hasUnusedPublicSymbols && <Chip tone="orange"><Trash2 className="w-2.5 h-2.5" />{file.orphanSymbolCount ?? 0} orphan symbol(s)</Chip>}
+            <span className="ml-auto flex items-center gap-1.5">
+              <span className="text-[10px] text-indigo-400 tabular-nums" title="files depending on this">↙{fanIn} in</span>
+              <span className="text-[10px] text-emerald-400 tabular-nums" title="files this depends on">↗{fanOut} out</span>
+            </span>
+            <button
+              onClick={() => onPeek({ fileId: file.id, title: file.relativePath })}
+              className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-indigo-400 hover:text-indigo-300 bg-indigo-500/10 hover:bg-indigo-500/20 border border-indigo-500/25 rounded-lg transition-colors"
+            >
+              <Code2 className="w-3 h-3" /> View file
+            </button>
           </div>
 
           {/* Context + Symbols */}
@@ -213,20 +311,104 @@ function FileRow({ file, expanded, onToggle }: {
                   <span className="ml-auto text-zinc-600 font-normal">{file.symbols.length}</span>
                 )}
               </h4>
-              <SymbolsTable symbols={file.symbols} />
+              <FileSymbolList
+                symbols={file.symbols}
+                definedSymbols={profileQuery.data?.definedSymbols}
+                fileId={file.id}
+                onPeek={onPeek}
+                onNavigateToFile={onNavigateToFile}
+              />
             </div>
           </div>
+
+          {/* Dependencies section */}
+          {(fanIn > 0 || fanOut > 0 || profileQuery.data) && (
+            <div className="border-t border-zinc-800 p-4 space-y-3">
+              <h4 className="text-xs font-medium text-zinc-400 flex items-center gap-1.5">
+                <GitBranch className="w-3.5 h-3.5 text-violet-400" />
+                Dependencies
+                {profileQuery.isLoading && (
+                  <Loader2 className="w-3 h-3 animate-spin text-zinc-600 ml-1" />
+                )}
+              </h4>
+
+              {profileQuery.data && (
+                <div className="grid grid-cols-2 gap-4">
+                  {/* Used by */}
+                  <div className="space-y-1">
+                    <p className="text-[10px] text-zinc-500 uppercase tracking-wide">
+                      Used by {profileQuery.data.definedSymbols.flatMap(s => s.usedBy).length > 0
+                        ? `${new Set(profileQuery.data.definedSymbols.flatMap(s => s.usedBy.map(u => u.fileId))).size} files`
+                        : '0 files'}
+                    </p>
+                    {Array.from(
+                      new Map(
+                        profileQuery.data.definedSymbols
+                          .flatMap(s => s.usedBy)
+                          .map(u => [u.fileId, u])
+                      ).values()
+                    ).slice(0, 8).map(site => (
+                      <div key={site.fileId} className="flex items-center gap-2 text-xs">
+                        <span className="flex-1 font-mono text-zinc-400 truncate">{site.relativePath}</span>
+                        {onNavigateToFile && (
+                          <button
+                            onClick={() => onNavigateToFile(site.fileId)}
+                            className="text-indigo-400 hover:text-indigo-300 flex-shrink-0 text-[10px]"
+                          >
+                            → Go to
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Depends on */}
+                  <div className="space-y-1">
+                    <p className="text-[10px] text-zinc-500 uppercase tracking-wide">
+                      Depends on {profileQuery.data.dependsOn.length} files
+                    </p>
+                    {profileQuery.data.dependsOn.slice(0, 8).map(dep => (
+                      <div key={dep.id} className="flex items-center gap-2 text-xs">
+                        <span className="flex-1 font-mono text-zinc-400 truncate">{dep.relativePath}</span>
+                        {onNavigateToFile && (
+                          <button
+                            onClick={() => onNavigateToFile(dep.id)}
+                            className="text-indigo-400 hover:text-indigo-300 flex-shrink-0 text-[10px]"
+                          >
+                            → Go to
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
   )
 }
 
-export function FilesIndex({ projectId }: { projectId: string }) {
+export function FilesIndex({
+  projectId,
+  subProjectId,
+  onNavigateToFile,
+}: {
+  projectId: string
+  subProjectId?: string
+  onNavigateToFile?: (fileId: string) => void
+}) {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const expandFileId = searchParams.get('expandFile')
+
   const [search, setSearch] = useState('')
-  const [expanded, setExpanded] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<string | null>(expandFileId)
+  const [peek, setPeek] = useState<PeekTarget | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  const expandedRef = useRef<HTMLDivElement>(null)
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const debouncedSearch = useDebounce(search, 300)
@@ -240,10 +422,29 @@ export function FilesIndex({ projectId }: { projectId: string }) {
   const semanticAvailable = status?.embeddings?.available ?? false
 
   const { data: files, isLoading, error } = useQuery({
-    queryKey: ['codeindex-files', projectId, debouncedSearch],
-    queryFn: () => api.codeIndex.listFiles(projectId, debouncedSearch || undefined),
+    queryKey: ['codeindex-files', projectId, subProjectId, debouncedSearch],
+    queryFn: () => api.codeIndex.listFiles(projectId, debouncedSearch || undefined, subProjectId),
     staleTime: 15_000,
   })
+
+  // React to a "go to file" request whenever the expandFile param changes — NOT just on mount.
+  // (When already on the Files tab the component stays mounted, so a mount-only effect never fires.)
+  // Wait until the target row is actually in the loaded list before expanding + scrolling, then drop
+  // the param so a manual collapse sticks. Other params (tab/sub) are preserved.
+  useEffect(() => {
+    if (!expandFileId) return
+    if (!files?.some(f => f.id === expandFileId)) return
+    setExpanded(expandFileId)
+    const frame = requestAnimationFrame(() => {
+      expandedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      setSearchParams(prev => {
+        const next = new URLSearchParams(prev)
+        next.delete('expandFile')
+        return next
+      }, { replace: true })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [expandFileId, files, setSearchParams])
 
   const reindexMutation = useMutation({
     mutationFn: () => api.codeIndex.reindex(projectId),
@@ -378,10 +579,16 @@ export function FilesIndex({ projectId }: { projectId: string }) {
               file={f}
               expanded={expanded === f.id}
               onToggle={() => toggle(f.id)}
+              projectId={projectId}
+              rowRef={f.id === expandFileId ? expandedRef : undefined}
+              onPeek={setPeek}
+              onNavigateToFile={onNavigateToFile}
             />
           ))}
         </div>
       )}
+
+      {peek && <CodePeek projectId={projectId} target={peek} onClose={() => setPeek(null)} />}
     </div>
   )
 }

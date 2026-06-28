@@ -43,7 +43,8 @@ internal class Program
         app.MapFallbackToFile("index.html");
 
         PrintStartupInfo(app, settings);
-        app.ReRegisterSavedProjects();
+        app.MigrateProjectsToWorkspaces();
+        app.ReRegisterSavedWorkspaces();
 
         // Restore the persisted active project so the watcher can resume on startup
         var activeProject = app.Services.GetService<AgenticMemory.CodeIndex.ActiveProjectService>();
@@ -116,7 +117,8 @@ internal class Program
                 };
             })
             .WithHttpTransport()
-            .WithTools<MemoryTools>();
+            .WithTools<MemoryTools>()
+            .WithTools<AgenticMemory.Tools.CodeIndexTools>();
     }
 
     private static void PrintStartupInfo(WebApplication app, AppSettings settings)

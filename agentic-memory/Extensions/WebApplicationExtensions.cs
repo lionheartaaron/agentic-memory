@@ -24,8 +24,10 @@ public static class WebApplicationExtensions
         app.MapKeyValueEndpoints();
         app.MapFileBrowserEndpoints();
         app.MapFileContextEndpoints();
+        app.MapWorkspaceEndpoints();
         app.MapProjectEndpoints();
         app.MapCodeIndexEndpoints();
+        app.MapIntelligenceEndpoints();
 
         return app;
     }
@@ -106,6 +108,96 @@ public static class WebApplicationExtensions
             return Results.Ok(stats);
         });
 
+        // ── Maintenance ───────────────────────────────────────────────────────
+
+        app.MapGet("/api/admin/maintenance-stats", async (
+            IMemoryRepository memRepo,
+            ICodeIndexRepository codeRepo,
+            IKeyValueStore kv,
+            CancellationToken ct) =>
+        {
+            var memStats = await memRepo.GetStatsAsync(ct);
+            var workspaces = LoadWorkspaces(kv);
+            var codeTotal = 0;
+            foreach (var ws in workspaces)
+                codeTotal += await codeRepo.CountAsync(ws.Id, ct);
+            return Results.Ok(new
+            {
+                memories      = memStats.TotalNodes,
+                codeIndexFiles= codeTotal,
+                workspaces    = workspaces.Count,
+                dbSizeBytes   = memStats.DatabaseSizeBytes,
+            });
+        });
+
+        app.MapDelete("/api/admin/code-index", async (
+            ICodeIndexRepository codeRepo,
+            ActiveProjectService activeProject,
+            WorkerStatusTracker tracker,
+            IIngestionQueue ingestionQueue,
+            IReferenceQueue referenceQueue,
+            CancellationToken ct) =>
+        {
+            await codeRepo.DeleteAllAsync(ct);
+            await codeRepo.DeleteAllSymbolReferencesAsync(ct);
+            await codeRepo.DeleteAllDomainFactsAsync(ct);
+            await codeRepo.DeleteAllProjectManifestsAsync(ct);
+            await codeRepo.DeleteAllSymbolEmbeddingsAsync(ct);
+            activeProject.SetActive(null);
+            ingestionQueue.Clear();
+            referenceQueue.Clear();
+            tracker.Reset();
+            return Results.NoContent();
+        });
+
+        app.MapDelete("/api/admin/memories", async (
+            IMemoryRepository memRepo,
+            CancellationToken ct) =>
+        {
+            var all = await memRepo.GetAllAsync(ct);
+            foreach (var m in all)
+                await memRepo.DeleteAsync(m.Id, ct);
+            return Results.NoContent();
+        });
+
+        app.MapDelete("/api/admin/workspaces", (IKeyValueStore kv) =>
+        {
+            kv.Delete(WorkspacesStoreKey);
+            return Results.NoContent();
+        });
+
+        app.MapPost("/api/admin/full-reset", async (
+            IMemoryRepository memRepo,
+            ICodeIndexRepository codeRepo,
+            ActiveProjectService activeProject,
+            WorkerStatusTracker tracker,
+            IIngestionQueue ingestionQueue,
+            IReferenceQueue referenceQueue,
+            IKeyValueStore kv,
+            CancellationToken ct) =>
+        {
+            // Clear code index
+            await codeRepo.DeleteAllAsync(ct);
+            await codeRepo.DeleteAllSymbolReferencesAsync(ct);
+            await codeRepo.DeleteAllDomainFactsAsync(ct);
+            await codeRepo.DeleteAllProjectManifestsAsync(ct);
+            await codeRepo.DeleteAllSymbolEmbeddingsAsync(ct);
+            activeProject.SetActive(null);
+            ingestionQueue.Clear();
+            referenceQueue.Clear();
+            tracker.Reset();
+
+            // Clear memories
+            var all = await memRepo.GetAllAsync(ct);
+            foreach (var m in all)
+                await memRepo.DeleteAsync(m.Id, ct);
+
+            // Clear workspaces
+            kv.Delete(WorkspacesStoreKey);
+
+            return Results.NoContent();
+        });
+
         app.MapGet("/api/admin/status", (
             AppSettings settings,
             IEmbeddingService embeddingService,
@@ -163,7 +255,7 @@ public static class WebApplicationExtensions
         app.MapGet("/api/generate/status", (IGenerativeModelService svc) =>
             Results.Ok(new { available = svc.IsAvailable }));
 
-        app.MapPost("/api/generate", (GenerateRequest request, IGenerativeModelService svc, AppSettings settings) =>
+        app.MapPost("/api/generate", async (GenerateRequest request, IGenerativeModelService svc, AppSettings settings) =>
         {
             if (!svc.IsAvailable)
                 return Results.Problem(
@@ -175,9 +267,10 @@ public static class WebApplicationExtensions
 
             var userPrompt = settings.Generation.TruncateIfNeeded(request.UserPrompt);
 
-            var result = svc.Generate(
+            // Offload the multi-second blocking call off the Kestrel thread-pool thread.
+            var result = await Task.Run(() => svc.Generate(
                 request.SystemPrompt ?? "You are a helpful assistant.",
-                userPrompt);
+                userPrompt));
 
             return Results.Ok(new { result });
         });
@@ -397,7 +490,8 @@ public static class WebApplicationExtensions
                     ? $"Describe this file:\n\n{context}"
                     : $"Hint: {fileClassHint}\n\nDescribe this file:\n\n{context}");
 
-            var summary = svc.Generate(systemPrompt, userPrompt);
+            // Offload the multi-second blocking call off the Kestrel thread-pool thread.
+            var summary = await Task.Run(() => svc.Generate(systemPrompt, userPrompt));
 
             // Hard word-count enforcement (per summary-and-file-context-improvement.md §5)
             summary = EnforceWordLimit(summary, maxWords: 65);
@@ -419,65 +513,107 @@ public static class WebApplicationExtensions
     }
 
     /// <summary>
-    /// Re-registers all projects previously saved via POST /api/projects with the CodeIndexService.
-    /// Must be called after app.Build() so the KV store and CodeIndexService are available.
-    /// Runs as a fire-and-forget background task so it does not delay startup.
+    /// One-time startup migration — converts the old "projects" KV key to the new "workspaces" format.
+    /// Old LiteDB CodeIndexRecords are valid with SubProjectId="" and need no touching.
     /// </summary>
-    public static void ReRegisterSavedProjects(this WebApplication app)
+    public static void MigrateProjectsToWorkspaces(this WebApplication app)
+    {
+        var kv = app.Services.GetRequiredService<IKeyValueStore>();
+
+        if (kv.Get(WorkspacesStoreKey) is not null) return; // already migrated
+
+        var projectsJson = kv.Get(ProjectsStoreKey);
+        if (projectsJson is null) return;
+
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(projectsJson);
+            var migrated = new List<WorkspaceRecord>();
+
+            foreach (var el in doc.RootElement.EnumerateArray())
+            {
+                var id       = el.GetProperty("Id").GetString()!;
+                var name     = el.GetProperty("Name").GetString()!;
+                var rootPath = el.GetProperty("RootPath").GetString()!;
+                var created  = el.TryGetProperty("CreatedAt", out var ca)
+                    ? ca.GetString()!
+                    : DateTime.UtcNow.ToString("O");
+
+                migrated.Add(new WorkspaceRecord(id, name, rootPath, created, []));
+            }
+
+            SaveWorkspaces(kv, migrated);
+            AnsiConsole.MarkupLine(
+                "  [blue dim]inf[/] [grey dim]Migration[/] Migrated [white]{0}[/] project(s) → workspaces",
+                migrated.Count);
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine(
+                "  [yellow]wrn[/] [grey dim]Migration[/] Could not migrate: {0}", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Re-registers all workspaces previously saved via POST /api/workspaces with CodeIndexService.
+    /// Must be called after app.Build(). Runs as fire-and-forget so it does not delay startup.
+    /// </summary>
+    public static void ReRegisterSavedWorkspaces(this WebApplication app)
     {
         var kv    = app.Services.GetRequiredService<IKeyValueStore>();
         var index = app.Services.GetService<CodeIndexService>();
         if (index is null) return;
 
-        var json = kv.Get(ProjectsStoreKey);
-        if (string.IsNullOrEmpty(json)) return;
+        var workspaces = LoadWorkspaces(kv);
+        if (workspaces.Count == 0) return;
 
-        List<string> roots = [];
-        try
-        {
-            using var doc = System.Text.Json.JsonDocument.Parse(json);
-            foreach (var el in doc.RootElement.EnumerateArray())
-            {
-                if (el.TryGetProperty("RootPath", out var rp))
-                {
-                    var path = rp.GetString();
-                    if (!string.IsNullOrEmpty(path) && Directory.Exists(path))
-                        roots.Add(path);
-                }
-            }
-        }
-        catch { return; }
+        AnsiConsole.MarkupLine(
+            "  [blue dim]inf[/] [grey dim]Workspaces[/] Re-registering [white]{0}[/] workspace(s)...",
+            workspaces.Count);
 
-        if (roots.Count == 0) return;
-
-        AnsiConsole.MarkupLine($"  [blue dim]inf[/] [grey dim]Projects[/] Re-registering [white]{roots.Count}[/] saved project(s) with CodeIndex (background)...");
         _ = Task.Run(async () =>
         {
-            foreach (var root in roots)
-                await index.RegisterProjectAsync(root);
+            foreach (var ws in workspaces)
+            {
+                if (ws.SubProjects.Count == 0)
+                    await index.RegisterProjectAsync(ws.RootPath);
+                else
+                    foreach (var sub in ws.SubProjects)
+                        await index.RegisterSubProjectAsync(sub, CancellationToken.None);
+            }
         });
     }
 
-    private const string ProjectsStoreKey = "projects";
+    private const string WorkspacesStoreKey = "workspaces";
+    private const string ProjectsStoreKey   = "projects";
 
+    private static List<WorkspaceRecord> LoadWorkspaces(IKeyValueStore kv)
+    {
+        var json = kv.Get(WorkspacesStoreKey);
+        return string.IsNullOrEmpty(json)
+            ? []
+            : System.Text.Json.JsonSerializer.Deserialize<List<WorkspaceRecord>>(json) ?? [];
+    }
+
+    private static void SaveWorkspaces(IKeyValueStore kv, List<WorkspaceRecord> ws) =>
+        kv.Set(WorkspacesStoreKey, System.Text.Json.JsonSerializer.Serialize(ws));
+
+    // Legacy — kept for backward compat during migration period
     private sealed record ProjectRecord(string Id, string Name, string RootPath, string CreatedAt);
 
     private static List<ProjectRecord> LoadProjects(IKeyValueStore kv)
     {
-        var json = kv.Get(ProjectsStoreKey);
-        return string.IsNullOrEmpty(json)
-            ? []
-            : System.Text.Json.JsonSerializer.Deserialize<List<ProjectRecord>>(json) ?? [];
+        // Transparently delegates to workspaces
+        return LoadWorkspaces(kv)
+            .Select(w => new ProjectRecord(w.Id, w.Name, w.RootPath, w.CreatedAt))
+            .ToList();
     }
-
-    private static void SaveProjects(IKeyValueStore kv, List<ProjectRecord> projects) =>
-        kv.Set(ProjectsStoreKey, System.Text.Json.JsonSerializer.Serialize(projects));
 
     private static void MapCodeIndexEndpoints(this WebApplication app)
     {
         // ── Active project ────────────────────────────────────────────────────
 
-        app.MapPost("/api/projects/{id}/activate", (
+        app.MapPost("/api/projects/{id}/activate", async (
             string id,
             IKeyValueStore kv,
             ActiveProjectService activeProject,
@@ -488,7 +624,7 @@ public static class WebApplicationExtensions
 
             activeProject.SetActive(id);
 
-            var (indexed, _, _) = repo.GetProjectStatsAsync(id).GetAwaiter().GetResult();
+            var (indexed, _, _) = await repo.GetProjectStatsAsync(id);
             return Results.Ok(new ProjectActivateResponse(
                 ProjectId: project.Id,
                 Name: project.Name,
@@ -518,14 +654,21 @@ public static class WebApplicationExtensions
 
         app.MapGet("/api/codeindex/worker/status", (
             WorkerStatusTracker tracker,
-            ICodeIndexRepository repo) =>
+            ICodeIndexRepository repo,
+            ActiveProjectService activeProject,
+            IKeyValueStore kv) =>
         {
-            var snap = tracker.GetSnapshot(repo);
+            WorkspaceRecord? workspace = null;
+            if (activeProject.ActiveProjectId is { } id)
+                workspace = LoadWorkspaces(kv).Find(w => w.Id == id);
+
+            var snap = tracker.GetSnapshot(repo, workspace);
             return Results.Ok(new WorkerStatusResponse(
                 ActiveProjectId: snap.ActiveProjectId,
                 ActiveProjectName: snap.ActiveProjectName,
                 IsProcessing: snap.IsProcessing,
                 CurrentFile: snap.CurrentFile,
+                CurrentSummaryFile: snap.CurrentSummaryFile,
                 QueueDepth: snap.QueueDepth,
                 SummaryQueueDepth: snap.SummaryQueueDepth,
                 TotalIndexableFiles: snap.TotalIndexableFiles,
@@ -540,7 +683,21 @@ public static class WebApplicationExtensions
                 RecentErrors: snap.RecentErrors
                     .Select(e => new RecentErrorEntryDto(
                         e.RelativePath, e.Error, e.OccurredAt.ToString("O")))
-                    .ToList()));
+                    .ToList(),
+                SubProjectStatuses: snap.SubProjectStatuses
+                    .Select(s => new SubProjectStatusDto(
+                        s.SubProjectId, s.Name, s.Language,
+                        s.IndexedFiles, s.StaleFiles, s.ErrorFiles))
+                    .ToList(),
+                QueuedIngestions: snap.QueuedIngestions
+                    .Select(q => new QueuedFileDto(q.RelativePath, q.FilePath))
+                    .ToList(),
+                QueuedSummaries: snap.QueuedSummaries
+                    .Select(q => new QueuedFileDto(q.RelativePath, q.FilePath))
+                    .ToList(),
+                CurrentReferenceFile: snap.CurrentReferenceFile,
+                ReferenceQueueDepth:  snap.ReferenceQueueDepth,
+                TotalSymbolReferences: snap.TotalSymbolReferences));
         });
 
         // ── File index queries ────────────────────────────────────────────────
@@ -548,13 +705,16 @@ public static class WebApplicationExtensions
         app.MapGet("/api/projects/{id}/files", async (
             string id,
             string? search,
+            string? subProjectId,
             ICodeIndexRepository repo,
             IEmbeddingService embedding,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(search))
             {
-                var all = await repo.GetByProjectAsync(id, ct);
+                var all = string.IsNullOrEmpty(subProjectId)
+                    ? await repo.GetByProjectAsync(id, ct)
+                    : await repo.GetBySubProjectAsync(subProjectId, ct);
                 return Results.Ok(all.Select(r => new CodeIndexFileResponse(
                     r.Id, r.ProjectId, r.FilePath, r.FileName, r.RelativePath,
                     r.Language, r.ProviderType, r.ExtractedContext, r.LlmSummary,
@@ -564,61 +724,15 @@ public static class WebApplicationExtensions
             // Run semantic and lexical lanes in parallel
             var semanticTask = embedding.IsAvailable
                 ? embedding.GetEmbeddingAsync(search, ct)
-                    .ContinueWith(t => repo.SearchByEmbeddingAsync(t.Result, id, 50, ct), ct)
+                    .ContinueWith(t => repo.SearchByEmbeddingAsync(t.Result, id, subProjectId, 50, ct), ct)
                     .Unwrap()
                 : Task.FromResult<IReadOnlyList<(CodeIndexRecord Record, float Score)>>([]);
 
-            var lexicalTask = repo.SearchLexicalAsync(search, id, ct);
+            var lexicalTask = repo.SearchLexicalAsync(search, id, subProjectId, ct);
 
             await Task.WhenAll(semanticTask, lexicalTask);
 
-            var semanticRanked = semanticTask.Result
-                .Select((x, i) => (x.Record.Id, SemanticRank: i + 1, x.Score))
-                .ToList();
-
-            var lexicalRanked = lexicalTask.Result
-                .Select((r, i) => (r.Id, LexicalRank: i + 1))
-                .ToList();
-
-            // Reciprocal Rank Fusion (k=60)
-            const int K = 60;
-            var allIds = semanticRanked.Select(x => x.Id)
-                .Union(lexicalRanked.Select(x => x.Id))
-                .Distinct()
-                .ToList();
-
-            var semDict = semanticRanked.ToDictionary(x => x.Id, x => (x.SemanticRank, x.Score));
-            var lexDict = lexicalRanked.ToDictionary(x => x.Id, x => x.LexicalRank);
-
-            var merged = allIds
-                .Select(rid =>
-                {
-                    var semScore = semDict.TryGetValue(rid, out var s) ? 1f / (K + s.SemanticRank) : 0f;
-                    var lexScore = lexDict.TryGetValue(rid, out var lr) ? 1f / (K + lr) : 0f;
-                    return (Id: rid, Rrf: semScore + lexScore);
-                })
-                .OrderByDescending(x => x.Rrf)
-                .Take(50)
-                .ToList();
-
-            var recordMap = (await repo.GetByIdsAsync(merged.Select(x => x.Id).ToList(), ct))
-                .ToDictionary(r => r.Id);
-
-            var hits = merged.Where(x => recordMap.ContainsKey(x.Id)).ToList();
-            var total = hits.Count;
-
-            return Results.Ok(hits
-                .Select((x, rankIdx) =>
-                {
-                    var r = recordMap[x.Id];
-                    // Rank-normalized score: rank #1 = 1.0, last = 1/total; always positive and meaningful
-                    var displayScore = total > 1 ? (float)(total - rankIdx) / total : 1f;
-                    return new CodeIndexFileResponse(
-                        r.Id, r.ProjectId, r.FilePath, r.FileName, r.RelativePath,
-                        r.Language, r.ProviderType, r.ExtractedContext, r.LlmSummary,
-                        r.Symbols, r.IndexedAt, r.FileModifiedAt, r.IsStale, r.IngestionError,
-                        displayScore);
-                }));
+            return Results.Ok(MergeAndScore(semanticTask.Result, lexicalTask.Result, search));
         });
 
         app.MapGet("/api/codeindex/file", async (
@@ -654,7 +768,12 @@ public static class WebApplicationExtensions
                 activeProject.SetActive(id);
 
             if (force == true)
-                await repo.MarkProjectStaleAsync(id, ct);
+            {
+                await repo.DeleteByProjectAsync(id, ct);
+                await repo.DeleteDomainFactsForProjectAsync(id, ct);
+                await repo.DeleteProjectManifestsForProjectAsync(id, ct);
+                await repo.DeleteSymbolEmbeddingsForProjectAsync(id, ct);
+            }
 
             var (queued, current) = await scanner.ScanAsync(id, project.RootPath, ct);
             tracker.SetTotalIndexable(queued + current);
@@ -677,21 +796,16 @@ public static class WebApplicationExtensions
         });
     }
 
-    private static void MapProjectEndpoints(this WebApplication app)
+    // ── Workspace endpoints ───────────────────────────────────────────────────
+
+    private static void MapWorkspaceEndpoints(this WebApplication app)
     {
-        app.MapGet("/api/projects", (IKeyValueStore kv) =>
-            Results.Ok(LoadProjects(kv)));
-
-        app.MapGet("/api/projects/{id}", (string id, IKeyValueStore kv) =>
-        {
-            var project = LoadProjects(kv).Find(p => p.Id == id);
-            return project is null ? Results.NotFound() : Results.Ok(project);
-        });
-
-        app.MapPost("/api/projects", async (
+        app.MapPost("/api/workspaces", async (
             ProjectCreateRequest request,
             IKeyValueStore kv,
             CodeIndexService codeIndex,
+            WorkspaceDiscoveryService discovery,
+            AppSettings settings,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(request.Name))
@@ -701,31 +815,675 @@ public static class WebApplicationExtensions
             if (!Directory.Exists(request.RootPath))
                 return Results.BadRequest(new { error = "RootPath does not exist." });
 
-            var projects = LoadProjects(kv);
-            var project = new ProjectRecord(
-                Id: Guid.NewGuid().ToString(),
-                Name: request.Name.Trim(),
-                RootPath: request.RootPath.Trim(),
-                CreatedAt: DateTime.UtcNow.ToString("O"));
+            var id = Guid.NewGuid().ToString();
+            var subProjects = await discovery.DiscoverAsync(request.RootPath.Trim(), ct);
+            var subProjectsWithOwner = subProjects
+                .Select(sp => sp with { WorkspaceId = id })
+                .ToList();
 
-            projects.Add(project);
-            SaveProjects(kv, projects);
+            var workspace = new WorkspaceRecord(
+                Id:          id,
+                Name:        request.Name.Trim(),
+                RootPath:    request.RootPath.Trim(),
+                CreatedAt:   DateTime.UtcNow.ToString("O"),
+                SubProjects: subProjectsWithOwner);
 
-            // Register with code index so TypeScript/C# providers build their per-project index.
-            // CancellationToken.None: registration outlives the HTTP request.
-            AnsiConsole.MarkupLine($"  [blue dim]inf[/] [grey dim]Projects[/] Registering [white]{Markup.Escape(project.Name)}[/] at [dim]{Markup.Escape(project.RootPath)}[/] with CodeIndex...");
-            _ = codeIndex.RegisterProjectAsync(project.RootPath, CancellationToken.None);
+            var workspaces = LoadWorkspaces(kv);
+            workspaces.Add(workspace);
+            SaveWorkspaces(kv, workspaces);
 
-            return Results.Created($"/api/projects/{project.Id}", project);
+            AnsiConsole.MarkupLine(
+                "  [blue dim]inf[/] [grey dim]Workspaces[/] Created [white]{0}[/] with [white]{1}[/] sub-project(s)",
+                Markup.Escape(workspace.Name), workspace.SubProjects.Count);
+
+            _ = Task.Run(async () =>
+            {
+                foreach (var sub in subProjectsWithOwner)
+                    await codeIndex.RegisterSubProjectAsync(sub, CancellationToken.None);
+            });
+
+            return Results.Created($"/api/workspaces/{id}",
+                ToWorkspaceDto(workspace, settings, codeIndex));
+        });
+
+        app.MapGet("/api/workspaces", (IKeyValueStore kv, AppSettings settings, CodeIndexService codeIndex) =>
+            Results.Ok(LoadWorkspaces(kv).Select(ws => ToWorkspaceDto(ws, settings, codeIndex))));
+
+        app.MapGet("/api/workspaces/{id}", (
+            string id, IKeyValueStore kv, AppSettings settings, CodeIndexService codeIndex) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            return ws is null
+                ? Results.NotFound()
+                : Results.Ok(ToWorkspaceDto(ws, settings, codeIndex));
+        });
+
+        app.MapDelete("/api/workspaces/{id}", (string id, IKeyValueStore kv) =>
+        {
+            var workspaces = LoadWorkspaces(kv);
+            var idx = workspaces.FindIndex(w => w.Id == id);
+            if (idx < 0) return Results.NotFound();
+            workspaces.RemoveAt(idx);
+            SaveWorkspaces(kv, workspaces);
+            return Results.NoContent();
+        });
+
+        app.MapPost("/api/workspaces/{id}/discover", async (
+            string id,
+            IKeyValueStore kv,
+            WorkspaceDiscoveryService discovery,
+            AppSettings settings,
+            CodeIndexService codeIndex,
+            CancellationToken ct) =>
+        {
+            var workspaces = LoadWorkspaces(kv);
+            var ws = workspaces.Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var (merged, removed) = await discovery.DiscoverAndMergeAsync(
+                ws.RootPath, ws.SubProjects, ct);
+
+            var updated = ws with
+            {
+                SubProjects = merged.Select(sp => sp with { WorkspaceId = id }).ToList()
+            };
+
+            var idx = workspaces.FindIndex(w => w.Id == id);
+            workspaces[idx] = updated;
+            SaveWorkspaces(kv, workspaces);
+
+            _ = Task.Run(async () =>
+            {
+                foreach (var sub in updated.SubProjects)
+                    await codeIndex.RegisterSubProjectAsync(sub, CancellationToken.None);
+            });
+
+            return Results.Ok(new
+            {
+                workspace = ToWorkspaceDto(updated, settings, codeIndex),
+                added  = merged.Count - ws.SubProjects.Count(s => merged.Any(m => m.Id == s.Id)),
+                removed = removed.Count
+            });
+        });
+
+        app.MapGet("/api/workspaces/{id}/sub-projects", (
+            string id, IKeyValueStore kv, AppSettings settings, CodeIndexService codeIndex) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+            return Results.Ok(ws.SubProjects.Select(sp => ToSubProjectDto(sp, settings, codeIndex)));
+        });
+
+        app.MapPost("/api/workspaces/{id}/activate", async (
+            string id,
+            IKeyValueStore kv,
+            ActiveProjectService activeProject,
+            ICodeIndexRepository repo) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+            activeProject.SetActive(id);
+            var (indexed, _, _) = await repo.GetProjectStatsAsync(id);
+            return Results.Ok(new ProjectActivateResponse(
+                ProjectId: ws.Id,
+                Name: ws.Name,
+                RootPath: ws.RootPath,
+                QueuedFiles: 0,
+                AlreadyIndexed: indexed));
+        });
+
+        app.MapGet("/api/workspaces/{id}/files", async (
+            string id,
+            string? search,
+            string? subProjectId,
+            IKeyValueStore kv,
+            ICodeIndexRepository repo,
+            IEmbeddingService embedding,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            if (string.IsNullOrWhiteSpace(search))
+            {
+                var all = string.IsNullOrEmpty(subProjectId)
+                    ? await repo.GetByProjectAsync(id, ct)
+                    : await repo.GetBySubProjectAsync(subProjectId, ct);
+                return Results.Ok(all.Select(r => ToFileResponse(r)));
+            }
+
+            var semanticTask = embedding.IsAvailable
+                ? embedding.GetEmbeddingAsync(search, ct)
+                    .ContinueWith(t => repo.SearchByEmbeddingAsync(t.Result, id, subProjectId, 50, ct), ct)
+                    .Unwrap()
+                : Task.FromResult<IReadOnlyList<(CodeIndexRecord Record, float Score)>>([]);
+
+            var lexicalTask = repo.SearchLexicalAsync(search, id, subProjectId, ct);
+            await Task.WhenAll(semanticTask, lexicalTask);
+
+            return Results.Ok(MergeAndScore(semanticTask.Result, lexicalTask.Result, search));
+        });
+
+        app.MapPost("/api/workspaces/{id}/reindex", async (
+            string id,
+            bool? force,
+            IKeyValueStore kv,
+            ActiveProjectService activeProject,
+            StalenessScanner scanner,
+            ICodeIndexRepository repo,
+            WorkerStatusTracker tracker,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            if (activeProject.ActiveProjectId != id) activeProject.SetActive(id);
+            if (force == true)
+            {
+                await repo.DeleteByProjectAsync(id, ct);
+                await repo.DeleteDomainFactsForProjectAsync(id, ct);
+                await repo.DeleteProjectManifestsForProjectAsync(id, ct);
+                await repo.DeleteSymbolEmbeddingsForProjectAsync(id, ct);
+            }
+
+            var (queued, current) = await scanner.ScanWorkspaceAsync(
+                id, ws.RootPath, ws.SubProjects, ct);
+            tracker.SetTotalIndexable(queued + current);
+
+            return Results.Ok(new { queued, alreadyCurrent = current });
+        });
+
+        app.MapPost("/api/workspaces/{id}/sub-projects/{spId}/reindex", async (
+            string id, string spId,
+            bool? force,
+            IKeyValueStore kv,
+            ActiveProjectService activeProject,
+            StalenessScanner scanner,
+            ICodeIndexRepository repo,
+            WorkerStatusTracker tracker,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+            var sub = ws.SubProjects.Find(s => s.Id == spId);
+            if (sub is null) return Results.NotFound(new { error = "Sub-project not found." });
+
+            if (activeProject.ActiveProjectId != id) activeProject.SetActive(id);
+            if (force == true) await repo.MarkSubProjectStaleAsync(spId, ct);
+
+            var (queued, current) = await scanner.ScanSubProjectByIdAsync(
+                id, spId, ws.SubProjects, ct);
+            tracker.SetTotalIndexable(queued + current);
+
+            return Results.Ok(new { subProjectId = spId, queued, alreadyCurrent = current });
+        });
+
+        app.MapGet("/api/workspaces/{id}/stale-files", async (
+            string id,
+            IKeyValueStore kv,
+            ICodeIndexRepository repo,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+            var records = await repo.GetStaleFilesAsync(id, ct);
+            return Results.Ok(records.Select(r => ToFileResponse(r)));
+        });
+
+        app.MapGet("/api/workspaces/{id}/error-files", async (
+            string id,
+            IKeyValueStore kv,
+            ICodeIndexRepository repo,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+            var records = await repo.GetErrorFilesAsync(id, ct);
+            return Results.Ok(records.Select(r => ToFileResponse(r)));
+        });
+    }
+
+    private static object ToWorkspaceDto(
+        WorkspaceRecord ws, AppSettings settings, CodeIndexService codeIndex) => new
+    {
+        ws.Id, ws.Name, ws.RootPath, ws.CreatedAt,
+        SubProjects = ws.SubProjects.Select(sp => ToSubProjectDto(sp, settings, codeIndex))
+    };
+
+    private static object ToSubProjectDto(
+        SubProjectRecord sp, AppSettings settings, CodeIndexService codeIndex) => new
+    {
+        sp.Id, sp.WorkspaceId, sp.Name, sp.RootPath,
+        Type = sp.Type.ToString(), sp.ManifestPath, sp.Language, sp.Namespace,
+        IsProviderAvailable = ComputeProviderAvailable(sp, settings, codeIndex)
+    };
+
+    private static bool ComputeProviderAvailable(
+        SubProjectRecord sp, AppSettings settings, CodeIndexService codeIndex) =>
+        sp.Type switch
+        {
+            SubProjectType.CSharpProject
+                => settings.CodeIndex.EnableCSharpRoslyn,
+            SubProjectType.TypeScript or SubProjectType.Node
+                => codeIndex.Providers.Any(p =>
+                    p.ProviderType.StartsWith("typescript") &&
+                    IsProviderActive(p, settings.CodeIndex)),
+            _ => false
+        };
+
+    private static CodeIndexFileResponse ToFileResponse(CodeIndexRecord r, float? score = null) =>
+        new(r.Id, r.ProjectId, r.FilePath, r.FileName, r.RelativePath,
+            r.Language, r.ProviderType, r.ExtractedContext, r.LlmSummary,
+            r.Symbols, r.IndexedAt, r.FileModifiedAt, r.IsStale, r.IngestionError,
+            Score:             score,
+            FanIn:             r.FanIn,
+            FanOut:            r.FanOut,
+            DependsOnFileIds:  r.DependsOnFileIds,
+            UsedByFileIds:     r.UsedByFileIds,
+            DomainTags:        r.DomainTags.Count    > 0 ? r.DomainTags    : null,
+            Imports:           r.Imports.Count       > 0 ? r.Imports       : null,
+            TypeHierarchy:     r.TypeHierarchy.Count > 0 ? r.TypeHierarchy : null,
+            DiagnosticSummary: string.IsNullOrEmpty(r.DiagnosticSummary) ? null : r.DiagnosticSummary,
+            IsTestFile:            r.IsTestFile,
+            TestFramework:         r.TestFramework,
+            TestSubjectFileIds:    r.TestSubjectFileIds.Count > 0 ? r.TestSubjectFileIds : null,
+            HasUnusedPublicSymbols:r.HasUnusedPublicSymbols,
+            OrphanSymbolCount:     r.OrphanSymbolCount,
+            HasValidation:         r.HasValidation,
+            ArchitecturalRole:     r.ArchitecturalRole,
+            IsEntrypoint:          r.IsEntrypoint);
+
+    private static IEnumerable<CodeIndexFileResponse> MergeAndScore(
+        IReadOnlyList<(CodeIndexRecord Record, float Score)> semantic,
+        IReadOnlyList<CodeIndexRecord> lexical,
+        string? query)
+    {
+        var semDict = semantic.ToDictionary(x => x.Record.Id, x => x.Score);
+        var lexDict = lexical.Select((r, i) => (r.Id, Rank: i + 1))
+            .ToDictionary(x => x.Id, x => x.Rank);
+
+        // All records are available from the two lanes — no extra DB round-trip needed.
+        var recordMap = new Dictionary<string, CodeIndexRecord>();
+        foreach (var (rec, _) in semantic) recordMap[rec.Id] = rec;
+        foreach (var rec in lexical) recordMap[rec.Id] = rec;
+
+        var scored = recordMap.Keys
+            .Select(id =>
+            {
+                var r = recordMap[id];
+                var structural = !string.IsNullOrEmpty(query) ? SearchScorer.Structural(query, r) : 0f;
+                var semantic_s = semDict.TryGetValue(id, out var cos) ? SearchScorer.Semantic(cos) : 0f;
+                var lexical_s  = lexDict.TryGetValue(id, out var rank) ? SearchScorer.Lexical(rank) : 0f;
+                return (Record: r, Score: SearchScorer.Combine(structural, semantic_s, lexical_s));
+            })
+            .OrderByDescending(x => x.Score)
+            .Take(50)
+            .ToList();
+
+        var total = scored.Count;
+        return scored.Select((x, i) =>
+        {
+            var displayScore = total > 1 ? (float)(total - i) / total : 1f;
+            return ToFileResponse(x.Record, displayScore);
+        });
+    }
+
+    // ── Intelligence / symbol-graph endpoints ─────────────────────────────────
+
+    private static void MapIntelligenceEndpoints(this WebApplication app)
+    {
+        // GET /api/workspaces/{id}/intelligence/symbols
+        app.MapGet("/api/workspaces/{id}/intelligence/symbols", async (
+            string id,
+            string? q,
+            string? kind,
+            bool? publicOnly,
+            int? minFanIn,
+            string? subProjectId,
+            IKeyValueStore kv,
+            ICodeIndexRepository repo,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var kinds = string.IsNullOrWhiteSpace(kind)
+                ? null
+                : kind.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            var symbols = await repo.SearchSymbolsAsync(
+                q ?? "", id, subProjectId,
+                publicOnly ?? false, kinds, minFanIn ?? 0, ct);
+
+            var dtos = symbols.Select(ToSymbolReferenceDto).ToList();
+            return Results.Ok(new SymbolSearchResponse(dtos.Count, dtos));
+        });
+
+        // GET /api/workspaces/{id}/intelligence/file/{fileId}
+        app.MapGet("/api/workspaces/{id}/intelligence/file/{fileId}", async (
+            string id,
+            string fileId,
+            IKeyValueStore kv,
+            ICodeIndexRepository repo,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var records = await repo.GetByIdsAsync([fileId], ct);
+            var record  = records.FirstOrDefault();
+            if (record is null) return Results.NotFound(new { error = "File not indexed." });
+
+            var symRefs = await repo.GetDefinedInFileAsync(fileId, ct);
+
+            // Resolve DependsOn stubs
+            var dependsOnIds = record.DependsOnFileIds.Distinct().ToList();
+            var dependsOnRecords = dependsOnIds.Count > 0
+                ? await repo.GetByIdsAsync(dependsOnIds, ct)
+                : (IReadOnlyList<AgenticMemory.CodeIndex.CodeIndexRecord>)[];
+
+            return Results.Ok(new IntelligenceFileProfileDto(
+                File:           ToFileResponse(record),
+                DefinedSymbols: symRefs.Select(ToSymbolReferenceDto).ToList(),
+                DependsOn:      dependsOnRecords.Select(r => new DependencyNodeDto(
+                    r.Id, r.RelativePath, r.FanIn, r.FanOut, r.Symbols.Count, r.Language)).ToList()));
+        });
+
+        // GET /api/workspaces/{id}/intelligence/hotspots?topN=20
+        app.MapGet("/api/workspaces/{id}/intelligence/hotspots", async (
+            string id,
+            int? topN,
+            IKeyValueStore kv,
+            ICodeIndexRepository repo,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var all = await repo.GetByProjectAsync(id, ct);
+            var hotspots = all
+                .OrderByDescending(r => r.FanIn)
+                .Take(topN ?? 20)
+                .Select(r => new DependencyNodeDto(r.Id, r.RelativePath, r.FanIn, r.FanOut, r.Symbols.Count, r.Language))
+                .ToList();
+
+            return Results.Ok(hotspots);
+        });
+
+        // GET /api/workspaces/{id}/intelligence/entrypoints
+        app.MapGet("/api/workspaces/{id}/intelligence/entrypoints", async (
+            string id,
+            IKeyValueStore kv,
+            ICodeIndexRepository repo,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var all = await repo.GetByProjectAsync(id, ct);
+            var entrypoints = all
+                .Where(r => r.FanIn == 0)
+                .OrderByDescending(r => r.FanOut)
+                .Select(r => new DependencyNodeDto(r.Id, r.RelativePath, r.FanIn, r.FanOut, r.Symbols.Count, r.Language))
+                .ToList();
+
+            return Results.Ok(entrypoints);
+        });
+
+        // GET /api/workspaces/{id}/intelligence/graph
+        app.MapGet("/api/workspaces/{id}/intelligence/graph", async (
+            string id,
+            string? subProjectId,
+            IKeyValueStore kv,
+            ICodeIndexRepository repo,
+            CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var allFiles = string.IsNullOrEmpty(subProjectId)
+                ? await repo.GetByProjectAsync(id, ct)
+                : await repo.GetBySubProjectAsync(subProjectId, ct);
+
+            var allSymRefs = await repo.SearchSymbolsAsync("", id, subProjectId, ct: ct);
+
+            // Build deduplicated edges: one per (from → to) file pair, viaSymbols aggregated
+            var edgeMap = new Dictionary<(string From, string To), List<string>>();
+            foreach (var sym in allSymRefs)
+            {
+                foreach (var site in sym.UsedBy)
+                {
+                    var key = (From: site.FileId, To: sym.DefinedInFileId);
+                    if (key.From == key.To) continue;
+                    if (!edgeMap.TryGetValue(key, out var names))
+                        edgeMap[key] = names = [];
+                    if (!names.Contains(sym.SymbolName))
+                        names.Add(sym.SymbolName);
+                }
+            }
+
+            var nodes = allFiles
+                .Select(r => new DependencyNodeDto(r.Id, r.RelativePath, r.FanIn, r.FanOut, r.Symbols.Count, r.Language))
+                .ToList();
+
+            var edges = edgeMap
+                .Select(kvp => new DependencyEdgeDto(kvp.Key.From, kvp.Key.To, kvp.Value))
+                .ToList();
+
+            return Results.Ok(new DependencyGraphDto(nodes, edges));
+        });
+
+        // GET /api/workspaces/{id}/intelligence/file/{fileId}/content?startLine=&endLine=
+        // On-demand line slice (no stored byte offsets) — always current, with a staleness flag.
+        app.MapGet("/api/workspaces/{id}/intelligence/file/{fileId}/content", async (
+            string id, string fileId, int? startLine, int? endLine,
+            IKeyValueStore kv, ICodeIndexRepository repo, CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var record = (await repo.GetByIdsAsync([fileId], ct)).FirstOrDefault();
+            if (record is null) return Results.NotFound(new { error = "File not indexed." });
+            var content = await ReadLineSliceAsync(record, startLine, endLine, ct);
+            return content is null ? Results.NotFound(new { error = "File no longer on disk." }) : Results.Ok(content);
+        });
+
+        // GET /api/workspaces/{id}/intelligence/file/{fileId}/symbol/{name}
+        // "Read symbol X without grep": resolves the symbol's stored Line/EndLine and returns that slice.
+        app.MapGet("/api/workspaces/{id}/intelligence/file/{fileId}/symbol/{name}", async (
+            string id, string fileId, string name,
+            IKeyValueStore kv, ICodeIndexRepository repo, CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var record = (await repo.GetByIdsAsync([fileId], ct)).FirstOrDefault();
+            if (record is null) return Results.NotFound(new { error = "File not indexed." });
+            var sym = record.Symbols.FirstOrDefault(s => s.Name == name);
+            if (sym is null) return Results.NotFound(new { error = "Symbol not found in file." });
+
+            var endLine = sym.EndLine > 0 ? sym.EndLine : sym.Line;
+            var content = await ReadLineSliceAsync(record, sym.Line, endLine, ct);
+            return content is null ? Results.NotFound(new { error = "File no longer on disk." }) : Results.Ok(content);
+        });
+
+        // GET /api/workspaces/{id}/intelligence/domain-facts?kind=&subProjectId=
+        app.MapGet("/api/workspaces/{id}/intelligence/domain-facts", async (
+            string id, string? kind, string? subProjectId,
+            IKeyValueStore kv, ICodeIndexRepository repo, CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var facts   = await repo.GetDomainFactsByProjectAsync(id, kind, subProjectId, ct);
+            var fileIds = facts.Select(f => f.FileId).Distinct().ToList();
+            var recs    = fileIds.Count > 0 ? await repo.GetByIdsAsync(fileIds, ct) : [];
+            var pathById = recs.ToDictionary(r => r.Id, r => r.RelativePath, StringComparer.Ordinal);
+
+            var dtos = facts.Select(f => new DomainFactDto(
+                f.Kind, f.Line, f.Method, f.Route, f.Name, f.TypeRef, f.OwnerType, f.Items,
+                f.FileId, pathById.GetValueOrDefault(f.FileId, ""))).ToList();
+            return Results.Ok(dtos);
+        });
+
+        // GET /api/workspaces/{id}/intelligence/manifests
+        app.MapGet("/api/workspaces/{id}/intelligence/manifests", async (
+            string id, IKeyValueStore kv, ICodeIndexRepository repo, CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var manifests = await repo.GetProjectManifestsAsync(id, ct);
+            var dtos = manifests.Select(m => new ProjectManifestDto(
+                m.ManifestType, m.ManifestPath, m.TargetFrameworks, m.OutputKind, m.LangVersion, m.Nullable,
+                m.ImplicitUsings,
+                m.Packages.Select(p => new PackageDependencyDto(p.Name, p.Version, p.IsDev)).ToList(),
+                m.ProjectReferences, m.Scripts)).ToList();
+            return Results.Ok(dtos);
+        });
+
+        // GET /api/workspaces/{id}/intelligence/semantic?q=&topN=&subProjectId=
+        app.MapGet("/api/workspaces/{id}/intelligence/semantic", async (
+            string id, string? q, int? topN, string? subProjectId,
+            IKeyValueStore kv, ICodeIndexRepository repo,
+            AgenticMemory.Brain.Interfaces.IEmbeddingService embedding, CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+            if (string.IsNullOrWhiteSpace(q)) return Results.Ok(new List<SemanticSymbolHitDto>());
+            if (!embedding.IsAvailable) return Results.Problem("Embedding model unavailable.");
+
+            var vec  = await embedding.GetEmbeddingAsync(q, ct);
+            var hits = await repo.SearchSymbolEmbeddingsAsync(vec, id, subProjectId, topN ?? 20, ct);
+            var dtos = hits.Select(h => new SemanticSymbolHitDto(
+                h.Record.Id, h.Record.SymbolName, h.Record.ContainingType, h.Record.Kind,
+                h.Record.FileId, h.Record.RelativePath, h.Record.Line, h.Record.EndLine, h.Score)).ToList();
+            return Results.Ok(dtos);
+        });
+
+        // GET /api/workspaces/{id}/intelligence/overview
+        app.MapGet("/api/workspaces/{id}/intelligence/overview", async (
+            string id, string? subProjectId, IKeyValueStore kv, ICodeIndexRepository repo, CancellationToken ct) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            if (ws is null) return Results.NotFound(new { error = "Workspace not found." });
+
+            var files = string.IsNullOrEmpty(subProjectId)
+                ? await repo.GetByProjectAsync(id, ct)
+                : await repo.GetBySubProjectAsync(subProjectId, ct);
+            var syms      = await repo.SearchSymbolsAsync("", id, subProjectId, ct: ct);
+            var facts     = await repo.GetDomainFactsByProjectAsync(id, null, subProjectId, ct);
+            var manifests = await repo.GetProjectManifestsAsync(id, ct);
+
+            int Count(string k) => facts.Count(f => f.Kind == k);
+            return Results.Ok(new IntelligenceOverviewDto(
+                Files:           files.Count,
+                Symbols:         syms.Count,
+                Endpoints:       Count("http-endpoint") + Count("fetch-endpoint"),
+                DiEdges:         Count("di-injection"),
+                EfEntities:      Count("ef-entity"),
+                MediatrMessages: Count("mediatr-message"),
+                TypeRelations:   Count("type-relation"),
+                ConfigKeys:      Count("config-key"),
+                SecuritySinks:   Count("security-sink"),
+                OrphanSymbols:   syms.Count(s => s.IsOrphan),
+                TestFiles:       files.Count(f => f.IsTestFile),
+                Packages:        manifests.Sum(m => m.Packages.Count)));
+        });
+    }
+
+    // On-demand line-range read of an indexed file (no stored byte offsets — see report §"GetContent").
+    private static async Task<FileContentResponse?> ReadLineSliceAsync(
+        CodeIndexRecord record, int? startLine, int? endLine, CancellationToken ct)
+    {
+        if (!File.Exists(record.FilePath)) return null;
+
+        string[] lines;
+        try { lines = await File.ReadAllLinesAsync(record.FilePath, ct); }
+        catch { return null; }
+
+        var total = lines.Length;
+        var s = Math.Max(1, startLine ?? 1);
+        var e = Math.Min(total, endLine ?? total);
+        if (e < s) e = s;
+
+        var slice = total == 0 ? "" : string.Join('\n', lines.Skip(s - 1).Take(e - s + 1));
+        var stale = record.IsStale ||
+                    File.GetLastWriteTimeUtc(record.FilePath) > record.FileModifiedAt.AddSeconds(1);
+        return new FileContentResponse(record.Id, record.RelativePath, s, e, total, stale, slice);
+    }
+
+    private static SymbolReferenceDto ToSymbolReferenceDto(AgenticMemory.CodeIndex.SymbolReferenceRecord r) =>
+        new(r.Id, r.SymbolName, r.SymbolKind, r.Accessibility,
+            r.DefinedInFileId, r.DefinedInRelativePath, r.DefinedAtLine,
+            r.UsedBy.Count,
+            r.UsedBy.Select(u => new SymbolUsageSiteDto(u.FileId, u.RelativePath, u.Line, u.Context, u.Role, u.EnclosingName)).ToList(),
+            r.IsOrphan,
+            r.TestedByFileIds.Count > 0 ? r.TestedByFileIds : null);
+
+    // ── Legacy /api/projects/* aliases (backward compatible) ─────────────────
+
+    private static void MapProjectEndpoints(this WebApplication app)
+    {
+        app.MapGet("/api/projects", (IKeyValueStore kv, AppSettings settings, CodeIndexService codeIndex) =>
+            Results.Ok(LoadWorkspaces(kv).Select(ws => ToWorkspaceDto(ws, settings, codeIndex))));
+
+        app.MapGet("/api/projects/{id}", (
+            string id, IKeyValueStore kv, AppSettings settings, CodeIndexService codeIndex) =>
+        {
+            var ws = LoadWorkspaces(kv).Find(w => w.Id == id);
+            return ws is null ? Results.NotFound() : Results.Ok(ToWorkspaceDto(ws, settings, codeIndex));
+        });
+
+        app.MapPost("/api/projects", async (
+            ProjectCreateRequest request,
+            IKeyValueStore kv,
+            CodeIndexService codeIndex,
+            WorkspaceDiscoveryService discovery,
+            AppSettings settings,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(request.Name))
+                return Results.BadRequest(new { error = "Name is required." });
+            if (string.IsNullOrWhiteSpace(request.RootPath))
+                return Results.BadRequest(new { error = "RootPath is required." });
+            if (!Directory.Exists(request.RootPath))
+                return Results.BadRequest(new { error = "RootPath does not exist." });
+
+            var id = Guid.NewGuid().ToString();
+            var subProjects = await discovery.DiscoverAsync(request.RootPath.Trim(), ct);
+            var subProjectsWithOwner = subProjects
+                .Select(sp => sp with { WorkspaceId = id })
+                .ToList();
+
+            var workspace = new WorkspaceRecord(
+                Id:          id,
+                Name:        request.Name.Trim(),
+                RootPath:    request.RootPath.Trim(),
+                CreatedAt:   DateTime.UtcNow.ToString("O"),
+                SubProjects: subProjectsWithOwner);
+
+            var workspaces = LoadWorkspaces(kv);
+            workspaces.Add(workspace);
+            SaveWorkspaces(kv, workspaces);
+
+            _ = Task.Run(async () =>
+            {
+                foreach (var sub in subProjectsWithOwner)
+                    await codeIndex.RegisterSubProjectAsync(sub, CancellationToken.None);
+            });
+
+            return Results.Created($"/api/projects/{id}",
+                ToWorkspaceDto(workspace, settings, codeIndex));
         });
 
         app.MapDelete("/api/projects/{id}", (string id, IKeyValueStore kv) =>
         {
-            var projects = LoadProjects(kv);
-            var idx = projects.FindIndex(p => p.Id == id);
+            var workspaces = LoadWorkspaces(kv);
+            var idx = workspaces.FindIndex(w => w.Id == id);
             if (idx < 0) return Results.NotFound();
-            projects.RemoveAt(idx);
-            SaveProjects(kv, projects);
+            workspaces.RemoveAt(idx);
+            SaveWorkspaces(kv, workspaces);
             return Results.NoContent();
         });
     }

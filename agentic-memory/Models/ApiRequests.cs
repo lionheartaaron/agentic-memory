@@ -121,13 +121,43 @@ public record CodeIndexFileResponse(
     DateTime FileModifiedAt,
     bool IsStale,
     string? IngestionError,
-    float? Score = null);
+    float? Score = null,
+    // Symbol reference graph fields (zero/empty for records pre-dating the upgrade)
+    int FanIn  = 0,
+    int FanOut = 0,
+    IReadOnlyList<string>? DependsOnFileIds = null,
+    IReadOnlyList<string>? UsedByFileIds    = null,
+    // Phase 4 semantic fields
+    IReadOnlyList<string>? DomainTags    = null,
+    IReadOnlyList<string>? Imports       = null,
+    IReadOnlyList<string>? TypeHierarchy = null,
+    string? DiagnosticSummary            = null,
+    // P1/P2/P6 file-level rollups (zero/empty for records pre-dating the upgrade)
+    bool   IsTestFile           = false,
+    string? TestFramework       = null,
+    IReadOnlyList<string>? TestSubjectFileIds = null,
+    bool   HasUnusedPublicSymbols = false,
+    int    OrphanSymbolCount    = 0,
+    bool   HasValidation        = false,
+    string? ArchitecturalRole   = null,
+    bool   IsEntrypoint         = false);
+
+public record SubProjectStatusDto(
+    string SubProjectId,
+    string Name,
+    string Language,
+    int IndexedFiles,
+    int StaleFiles,
+    int ErrorFiles);
+
+public record QueuedFileDto(string RelativePath, string FilePath);
 
 public record WorkerStatusResponse(
     string? ActiveProjectId,
     string? ActiveProjectName,
     bool IsProcessing,
     string? CurrentFile,
+    string? CurrentSummaryFile,
     int QueueDepth,
     int SummaryQueueDepth,
     int TotalIndexableFiles,
@@ -135,7 +165,125 @@ public record WorkerStatusResponse(
     int StaleFiles,
     int ErrorFiles,
     IReadOnlyList<RecentJobEntryDto> RecentJobs,
-    IReadOnlyList<RecentErrorEntryDto> RecentErrors);
+    IReadOnlyList<RecentErrorEntryDto> RecentErrors,
+    IReadOnlyList<SubProjectStatusDto> SubProjectStatuses,
+    IReadOnlyList<QueuedFileDto> QueuedIngestions,
+    IReadOnlyList<QueuedFileDto> QueuedSummaries,
+    // Reference analysis worker
+    string? CurrentReferenceFile  = null,
+    int ReferenceQueueDepth       = 0,
+    int TotalSymbolReferences     = 0);
+
+// ── Intelligence API responses ────────────────────────────────────────────────
+
+public record SymbolUsageSiteDto(
+    string FileId,
+    string RelativePath,
+    int    Line,
+    string Context,
+    string Role = "ref",                 // P2: call/new/read/write/typeref/implements/override
+    string? EnclosingName = null);        // P5: the calling symbol
+
+public record SymbolReferenceDto(
+    string Id,
+    string Name,
+    string Kind,
+    string Accessibility,
+    string DefinedInFileId,
+    string DefinedInRelativePath,
+    int    DefinedAtLine,
+    int    FanIn,
+    IReadOnlyList<SymbolUsageSiteDto> UsedBy,
+    bool   IsOrphan = false,
+    IReadOnlyList<string>? TestedByFileIds = null);
+
+public record SymbolSearchResponse(
+    int Total,
+    IReadOnlyList<SymbolReferenceDto> Symbols);
+
+public record DependencyNodeDto(
+    string Id,
+    string RelativePath,
+    int    FanIn,
+    int    FanOut,
+    int    SymbolCount,
+    string Language);
+
+public record DependencyEdgeDto(
+    string From,
+    string To,
+    IReadOnlyList<string> ViaSymbols);
+
+public record DependencyGraphDto(
+    IReadOnlyList<DependencyNodeDto> Nodes,
+    IReadOnlyList<DependencyEdgeDto> Edges);
+
+public record IntelligenceFileProfileDto(
+    CodeIndexFileResponse File,
+    IReadOnlyList<SymbolReferenceDto> DefinedSymbols,
+    IReadOnlyList<DependencyNodeDto>  DependsOn);
+
+// ── P0–P6 surfacing DTOs ────────────────────────────────────────────────────────
+
+public record FileContentResponse(
+    string FileId,
+    string RelativePath,
+    int    StartLine,
+    int    EndLine,
+    int    TotalLines,
+    bool   Stale,
+    string Content);
+
+public record DomainFactDto(
+    string Kind,
+    int    Line,
+    string? Method,
+    string? Route,
+    string? Name,
+    string? TypeRef,
+    string? OwnerType,
+    IReadOnlyList<string> Items,
+    string FileId,
+    string RelativePath);
+
+public record PackageDependencyDto(string Name, string Version, bool IsDev);
+
+public record ProjectManifestDto(
+    string ManifestType,
+    string ManifestPath,
+    IReadOnlyList<string> TargetFrameworks,
+    string? OutputKind,
+    string? LangVersion,
+    string? Nullable,
+    bool   ImplicitUsings,
+    IReadOnlyList<PackageDependencyDto> Packages,
+    IReadOnlyList<string> ProjectReferences,
+    IReadOnlyDictionary<string, string> Scripts);
+
+public record SemanticSymbolHitDto(
+    string  Id,
+    string  SymbolName,
+    string? ContainingType,
+    string  Kind,
+    string  FileId,
+    string  RelativePath,
+    int     Line,
+    int     EndLine,
+    float   Score);
+
+public record IntelligenceOverviewDto(
+    int Files,
+    int Symbols,
+    int Endpoints,
+    int DiEdges,
+    int EfEntities,
+    int MediatrMessages,
+    int TypeRelations,
+    int ConfigKeys,
+    int SecuritySinks,
+    int OrphanSymbols,
+    int TestFiles,
+    int Packages);
 
 public record RecentJobEntryDto(
     string RelativePath,

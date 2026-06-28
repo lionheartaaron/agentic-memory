@@ -4,6 +4,7 @@ using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Brain.Search;
 using AgenticMemory.Brain.Storage;
 using AgenticMemory.Configuration;
+using AgenticMemory.Persistence;
 using Microsoft.Extensions.Logging;
 
 namespace AgenticMemoryTests.Shared;
@@ -20,6 +21,7 @@ public class TestFixture : IAsyncDisposable
 
     public string TestDbPath { get; }
     public string TestModelsPath { get; }
+    public SharedLiteDatabase? SharedDb { get; private set; }
     public IMemoryRepository Repository { get; private set; } = null!;
     public IEmbeddingService? EmbeddingService { get; private set; }
     public ISearchService SearchService { get; private set; } = null!;
@@ -56,8 +58,9 @@ public class TestFixture : IAsyncDisposable
         if (File.Exists(TestDbPath))
             File.Delete(TestDbPath);
 
-        // Initialize repository
-        Repository = new LiteDbMemoryRepository(TestDbPath);
+        // Initialize repository via shared DB singleton (Direct mode)
+        SharedDb   = new SharedLiteDatabase(TestDbPath);
+        Repository = new LiteDbMemoryRepository(SharedDb);
 
         // Initialize embedding service
         var embeddingsSettings = new EmbeddingsSettings
@@ -155,6 +158,9 @@ public class TestFixture : IAsyncDisposable
         catch (ApplicationException) { }
 
         try { Repository?.Dispose(); }
+        catch (ApplicationException) { }
+
+        try { SharedDb?.Dispose(); }
         catch (ApplicationException) { }
 
         try { LoggerFactory?.Dispose(); }

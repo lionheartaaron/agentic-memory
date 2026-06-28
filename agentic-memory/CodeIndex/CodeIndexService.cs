@@ -77,6 +77,46 @@ public sealed class CodeIndexService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Registers a sub-project with only the providers relevant to its language/type.
+    /// Roslyn receives the .csproj path; TypeScript provider receives the package.json directory.
+    /// </summary>
+    public async Task RegisterSubProjectAsync(SubProjectRecord sub, CancellationToken ct = default)
+    {
+        var targetProviders = sub.Type switch
+        {
+            SubProjectType.CSharpProject
+                => _providers.Where(p => p.ProviderType.StartsWith("dotnet")),
+            SubProjectType.TypeScript or SubProjectType.Node
+                => _providers.Where(p => p.ProviderType.StartsWith("typescript")),
+            SubProjectType.Python
+                => _providers.Where(p => p.ProviderType.StartsWith("python")),
+            _ => _providers
+        };
+
+        _logger.LogInformation("Registering sub-project {Name} ({Type})", sub.Name, sub.Type);
+
+        foreach (var provider in targetProviders)
+        {
+            try
+            {
+                // Roslyn: pass the .csproj path for project-scoped whole-program analysis.
+                // TypeScript: pass the directory containing package.json.
+                var target = provider.ProviderType.StartsWith("dotnet")
+                    ? sub.ManifestPath
+                    : sub.RootPath;
+
+                await provider.RegisterProjectAsync(target, ct);
+                _logger.LogInformation("  {Provider} → {Target}", provider.ProviderType, target);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Provider {Type} failed on sub-project {Name}",
+                    provider.ProviderType, sub.Name);
+            }
+        }
+    }
+
     public async Task<IReadOnlyList<SymbolInfo>> GetSymbolsAsync(string filePath, CancellationToken ct = default)
     {
         var provider = GetProvider(filePath);
@@ -89,6 +129,29 @@ public sealed class CodeIndexService : IDisposable
         var provider = GetProvider(filePath);
         if (provider is null) return [];
         return await provider.FindReferencesAsync(filePath, symbolName, ct);
+    }
+
+    /// <summary>
+    /// Finds references for all named symbols in a single compiler pass.
+    /// Any provider implementing IBatchReferenceProvider (Roslyn via pre-built inverted
+    /// index, TypeScript via JS buildReferenceIndex) takes the fast O(symbols) path.
+    /// Falls back to per-symbol FindReferencesAsync for providers without batch support.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<string, IReadOnlyList<ReferenceInfo>>> FindAllReferencesAsync(
+        string filePath, IReadOnlyList<string> symbolNames, CancellationToken ct = default)
+    {
+        if (GetProvider(filePath) is IBatchReferenceProvider batch)
+            return await batch.FindAllReferencesAsync(filePath, symbolNames, ct);
+
+        // Fallback: delegate to per-symbol FindReferencesAsync
+        var result = new Dictionary<string, IReadOnlyList<ReferenceInfo>>(StringComparer.Ordinal);
+        foreach (var name in symbolNames)
+        {
+            ct.ThrowIfCancellationRequested();
+            var refs = await FindReferencesAsync(filePath, name, ct);
+            if (refs.Count > 0) result[name] = refs;
+        }
+        return result;
     }
 
     public async Task<IReadOnlyList<DiagnosticInfo>> GetDiagnosticsAsync(string filePath, CancellationToken ct = default)

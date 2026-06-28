@@ -1,5 +1,6 @@
 using AgenticMemory.Brain.Conflict;
 using AgenticMemory.Brain.Interfaces;
+using AgenticMemory.Brain.Models;
 
 namespace AgenticMemoryTests.MemoryServiceTests;
 

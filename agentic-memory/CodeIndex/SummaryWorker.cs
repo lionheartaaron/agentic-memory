@@ -1,23 +1,22 @@
-using System.Threading.Channels;
 using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Configuration;
 
 namespace AgenticMemory.CodeIndex;
 
 /// <summary>
-/// Generates LLM summaries for indexed files on a low-priority background thread.
-/// Summaries are display-only; they are not used for embedding.
+/// Generates LLM summaries for indexed files on a dedicated low-priority thread.
+/// Summaries are display-only and used to improve embedding quality.
 /// </summary>
-public sealed class SummaryWorker : BackgroundService, ISummaryQueue
+public sealed class SummaryWorker : DedicatedWorker<SummaryJob>, ISummaryQueue
 {
-    private readonly Channel<SummaryJob> _channel;
-    private readonly ICodeIndexRepository _repository;
+    private readonly ICodeIndexRepository    _repository;
     private readonly IGenerativeModelService _generative;
-    private readonly GenerationSettings _generationSettings;
-    private readonly WorkerStatusTracker _statusTracker;
-    private readonly ILogger<SummaryWorker> _logger;
+    private readonly GenerationSettings      _generationSettings;
+    private readonly IEmbeddingService       _embedding;
+    private readonly WorkerStatusTracker     _statusTracker;
+    private readonly ILogger<SummaryWorker>  _logger;
 
-    private int _depth;
+    protected override string WorkerName => "SummaryWorker";
 
     private const string SummarySystemPrompt =
         "You are a code indexing assistant. Your output becomes an embedding vector used for semantic search. " +
@@ -32,91 +31,86 @@ public sealed class SummaryWorker : BackgroundService, ISummaryQueue
         "- Do not write 'component rendering', 'event handling', or 'state management' as standalone concepts.";
 
     public SummaryWorker(
-        ICodeIndexRepository repository,
+        ICodeIndexRepository    repository,
         IGenerativeModelService generative,
-        GenerationSettings generationSettings,
-        WorkerStatusTracker statusTracker,
-        ILogger<SummaryWorker> logger)
+        GenerationSettings      generationSettings,
+        IEmbeddingService       embedding,
+        WorkerStatusTracker     statusTracker,
+        ILogger<SummaryWorker>  logger)
     {
-        _repository = repository;
-        _generative = generative;
+        _repository         = repository;
+        _generative         = generative;
         _generationSettings = generationSettings;
-        _statusTracker = statusTracker;
-        _logger = logger;
-
-        _channel = Channel.CreateBounded<SummaryJob>(new BoundedChannelOptions(1000)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest,
-            SingleWriter = false,
-            SingleReader = true,
-        });
+        _embedding          = embedding;
+        _statusTracker      = statusTracker;
+        _logger             = logger;
     }
+
+    // ── ISummaryQueue ─────────────────────────────────────────────────────────
 
     public bool TryEnqueue(SummaryJob job)
     {
-        if (!_channel.Writer.TryWrite(job)) return false;
-        _statusTracker.SetSummaryQueueDepth(Interlocked.Increment(ref _depth));
+        if (!TryWrite(job)) return false;
+        _statusTracker.SetSummaryQueueDepth(QueueDepth);
+        var display = job.RelativePath ?? Path.GetFileName(job.FilePath);
+        _statusTracker.TrackSummaryEnqueue(new QueuedSummaryEntry(job.FilePath, display));
         return true;
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var thread = new Thread(() =>
-        {
-            try { RunAsync(stoppingToken).GetAwaiter().GetResult(); }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogError(ex, "SummaryWorker crashed");
-            }
-            finally { tcs.SetResult(); }
-        })
-        {
-            IsBackground = true,
-            Priority = ThreadPriority.BelowNormal,
-            Name = "SummaryWorker",
-        };
-        thread.Start();
-        return tcs.Task;
-    }
+    // ── Worker hooks ──────────────────────────────────────────────────────────
 
-    private async Task RunAsync(CancellationToken ct)
-    {
+    protected override void OnWorkerStarted() =>
         _logger.LogInformation("SummaryWorker started");
 
-        await foreach (var job in _channel.Reader.ReadAllAsync(ct))
+    protected override void OnWorkerStopped() =>
+        _logger.LogInformation("SummaryWorker stopped");
+
+    protected override void OnAfterJob(SummaryJob job)
+    {
+        _statusTracker.SetSummaryQueueDepth(QueueDepth);
+        _statusTracker.TrackSummaryDequeue(job.FilePath);
+        _statusTracker.SetSummaryProcessing(false);
+    }
+
+    protected override void OnJobError(SummaryJob job, Exception ex) =>
+        _logger.LogWarning(ex, "Summary generation failed: {File}", Path.GetFileName(job.FilePath));
+
+    // ── Core job execution (runs on dedicated thread) ─────────────────────────
+
+    protected override void Execute(SummaryJob job, CancellationToken ct)
+    {
+        if (!_generative.IsAvailable) return;
+
+        var display = job.RelativePath ?? Path.GetFileName(job.FilePath);
+        _statusTracker.SetSummaryProcessing(true, display);
+
+        var snap = _repository.GetByPathAsync(job.FilePath, ct).GetAwaiter().GetResult();
+        if (snap is null || !string.IsNullOrWhiteSpace(snap.LlmSummary)) return;
+        if (string.IsNullOrWhiteSpace(snap.ExtractedContext)) return;
+
+        var prompt  = _generationSettings.TruncateIfNeeded($"Describe this file:\n\n{snap.ExtractedContext}");
+        var summary = EnforceWordLimit(_generative.Generate(SummarySystemPrompt, prompt), 65);
+
+        // Reload to avoid clobbering fields changed during generation
+        var fresh = _repository.GetByPathAsync(job.FilePath, ct).GetAwaiter().GetResult();
+        if (fresh is null || !string.IsNullOrWhiteSpace(fresh.LlmSummary)) return;
+        fresh.LlmSummary = summary;
+
+        if (_embedding.IsAvailable)
         {
-            _statusTracker.SetSummaryQueueDepth(Math.Max(0, Interlocked.Decrement(ref _depth)));
-
-            if (!_generative.IsAvailable) continue;
-
             try
             {
-                // Load to get ExtractedContext for generation
-                var snap = await _repository.GetByPathAsync(job.FilePath, ct);
-                if (snap is null || !string.IsNullOrWhiteSpace(snap.LlmSummary)) continue;
-                if (string.IsNullOrWhiteSpace(snap.ExtractedContext)) continue;
-
-                var prompt = _generationSettings.TruncateIfNeeded($"Describe this file:\n\n{snap.ExtractedContext}");
-                var summary = EnforceWordLimit(_generative.Generate(SummarySystemPrompt, prompt), 65);
-
-                // Reload the freshest record before writing to avoid overwriting IsStale
-                // or other fields that may have changed during generation
-                var fresh = await _repository.GetByPathAsync(job.FilePath, ct);
-                if (fresh is null || !string.IsNullOrWhiteSpace(fresh.LlmSummary)) continue;
-                fresh.LlmSummary = summary;
-                await _repository.UpsertAsync(fresh, ct);
-
-                _logger.LogDebug("Summary generated: {File}", Path.GetFileName(job.FilePath));
+                var embedText = FileIngestionService.BuildEmbedText(fresh);
+                fresh.Embedding = _embedding.GetEmbeddingAsync(embedText, ct).GetAwaiter().GetResult();
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Summary generation failed: {File}", Path.GetFileName(job.FilePath));
+                _logger.LogWarning(ex, "Re-embed after summary failed: {File}", Path.GetFileName(job.FilePath));
             }
         }
 
-        _logger.LogInformation("SummaryWorker stopped");
+        _repository.UpsertAsync(fresh, ct).GetAwaiter().GetResult();
+        _logger.LogDebug("Summary + re-embed done: {File}", Path.GetFileName(job.FilePath));
     }
 
     private static string EnforceWordLimit(string text, int maxWords)

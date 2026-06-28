@@ -2,6 +2,7 @@ using AgenticMemory.Brain.Models;
 
 namespace AgenticMemory.Brain.Interfaces;
 
+
 /// <summary>
 /// Core storage interface for memory nodes with CRUD, search, stats, and maintenance methods
 /// </summary>
@@ -63,15 +64,3 @@ public interface IMemoryRepository : IDisposable
     Task CompactAsync(CancellationToken cancellationToken = default);
 }
 
-/// <summary>
-/// Statistics about the memory repository
-/// </summary>
-public record RepositoryStats
-{
-    public int TotalNodes { get; init; }
-    public double AverageStrength { get; init; }
-    public int WeakMemoriesCount { get; init; }
-    public DateTime? OldestMemory { get; init; }
-    public DateTime? NewestMemory { get; init; }
-    public long DatabaseSizeBytes { get; init; }
-}

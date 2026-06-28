@@ -324,6 +324,145 @@ function getFileInfo(fileName) {
 }
 
 // ── getSymbols ────────────────────────────────────────────────────────────────
+// Covers: class, interface, function, enum, type alias, AND export const/let/var
+// (arrow components, hooks, api functions).  Accessibility is 'exported' for
+// anything with the export modifier (what ReferenceIndexWorker filters on), and
+// 'public' otherwise — matching the contract expected by the C# side.
+//
+// Kind names are normalised to short friendly names ('Function', 'Variable',
+// 'Class', …) so they align with the C# Roslyn provider's naming and the
+// SymbolsIndex kind filter in the dashboard.
+var _KIND_MAP = {
+    ClassDeclaration:     'Class',
+    InterfaceDeclaration: 'Interface',
+    FunctionDeclaration:  'Function',
+    EnumDeclaration:      'Enum',
+    TypeAliasDeclaration: 'TypeAlias',
+    VariableDeclaration:  'Variable',
+};
+function toFriendlyKind(syntaxKindName) {
+    return _KIND_MAP[syntaxKindName] || syntaxKindName;
+}
+
+// ── P1 Tier 0 helpers: structured symbol shape (camelCase keys map onto the C# SymbolInfo) ────
+
+// Modifier keyword texts (static/abstract/async/readonly/export/...). Decorators (kind 'Decorator')
+// are skipped because their SyntaxKind name does not end in 'Keyword'.
+function tsModifiers(node) {
+    var out = [];
+    if (node && node.modifiers) {
+        for (var i = 0; i < node.modifiers.length; i++) {
+            var kn = ts.SyntaxKind[node.modifiers[i].kind];
+            if (kn && kn.length > 7 && kn.lastIndexOf('Keyword') === kn.length - 7)
+                out.push(kn.slice(0, -7).toLowerCase());
+        }
+    }
+    return out;
+}
+
+function endLineOf(node, sf) {
+    return sf.getLineAndCharacterOfPosition(node.getEnd()).line + 1;
+}
+
+// P5: name of a declaration node for caller attribution (null if the node is not a named decl).
+function tsDeclName(node, sf) {
+    if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) ||
+        ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) ||
+        ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) {
+        return node.name ? node.name.getText(sf) : null;
+    }
+    if (ts.isConstructorDeclaration(node)) return 'constructor';
+    // const foo = () => {} / const foo = function() {}
+    if ((ts.isArrowFunction(node) || ts.isFunctionExpression(node)) &&
+        node.parent && ts.isVariableDeclaration(node.parent) && node.parent.name) {
+        return node.parent.name.getText(sf);
+    }
+    return null;
+}
+
+// P2: usage-kind label for a reference identifier (mirrors C# ProjectIndex.ClassifyRole).
+function tsRefRole(node) {
+    var p = node.parent;
+    if (!p) return 'read';
+    if (ts.isCallExpression(p) && p.expression === node) return 'call';
+    if (ts.isPropertyAccessExpression(p) && p.name === node && p.parent && ts.isCallExpression(p.parent)) return 'call';
+    if (ts.isNewExpression(p) && p.expression === node) return 'new';
+    if (ts.isTypeReferenceNode && ts.isTypeReferenceNode(p)) return 'typeref';
+    if (ts.isHeritageClause && p.parent && ts.isHeritageClause(p.parent)) return 'implements';
+    if (ts.isBinaryExpression(p) && p.left === node &&
+        p.operatorToken && p.operatorToken.kind === ts.SyntaxKind.EqualsToken) return 'write';
+    return 'read';
+}
+
+// P2: JSDoc summary + @deprecated tag for a declaration (node.jsDoc is present on documented nodes).
+function tsDoc(node) {
+    var summary = null, deprecated = false;
+    if (node.jsDoc && node.jsDoc.length) {
+        var last = node.jsDoc[node.jsDoc.length - 1];
+        if (last && typeof last.comment === 'string') summary = last.comment;
+    }
+    if (ts.getJSDocTags) {
+        var tags = ts.getJSDocTags(node) || [];
+        for (var i = 0; i < tags.length; i++) {
+            if (tags[i].tagName && tags[i].tagName.text === 'deprecated') deprecated = true;
+        }
+    }
+    return { summary: summary, deprecated: deprecated };
+}
+
+// Parameters from a function-like declaration's syntactic parameter list. Declared type
+// annotations are used directly; un-annotated params fall back to the checker's inferred type.
+function tsParams(fnNode, sf, tc) {
+    if (!fnNode || !fnNode.parameters) return [];
+    var out = [];
+    for (var i = 0; i < fnNode.parameters.length; i++) {
+        var p = fnNode.parameters[i];
+        var pType;
+        if (p.type) {
+            pType = p.type.getText(sf);
+        } else {
+            try { pType = tc.typeToString(tc.getTypeAtLocation(p)); } catch (e) { pType = 'any'; }
+        }
+        out.push({
+            name: p.name ? p.name.getText(sf) : ('arg' + i),
+            type: pType,
+            ordinal: i,
+            isOptional: !!p.questionToken || !!p.initializer,
+            defaultValue: p.initializer ? p.initializer.getText(sf) : null,
+            refKind: 'none',
+            isParams: !!p.dotDotDotToken,
+            nullableAnnotation: 'none',
+            attributes: []
+        });
+    }
+    return out;
+}
+
+// P4: declared generic type parameters with constraint text.
+function tsTypeParams(node, sf) {
+    if (!node.typeParameters) return [];
+    var out = [];
+    for (var i = 0; i < node.typeParameters.length; i++) {
+        var tp = node.typeParameters[i];
+        var constraints = [];
+        if (tp.constraint) constraints.push(tp.constraint.getText(sf));
+        out.push({ name: tp.name ? tp.name.getText(sf) : ('T' + i), constraints: constraints, variance: null });
+    }
+    return out;
+}
+
+function tsEnumMembers(enumNode, sf) {
+    if (!enumNode || !enumNode.members) return [];
+    return enumNode.members.map(function(m) {
+        var isNumeric = m.initializer && ts.isNumericLiteral(m.initializer);
+        return {
+            name: m.name ? m.name.getText(sf) : '',
+            value: isNumeric ? Number(m.initializer.text) : null,
+            explicitExpression: (m.initializer && !isNumeric) ? m.initializer.getText(sf) : null
+        };
+    });
+}
+
 function getSymbols(fileName) {
     var program = langService.getProgram();
     if (!program) return [];
@@ -333,47 +472,249 @@ function getSymbols(fileName) {
     var results = [];
 
     ts.forEachChild(sf, function(node) {
-        if (!node.name) return;
+        // Check modifiers directly — getCombinedModifierFlags can return 0 for exported
+        // nodes in some TypeScript 5.x builds running inside ClearScript/V8.
+        var modifiers = tsModifiers(node);
+        var isExported = modifiers.indexOf('export') >= 0;
+        var accessibility = isExported ? 'exported' : 'public';
+        var doc = tsDoc(node);
+
+        // VariableStatement: export const Foo = () => {} / export const api = { ... }
+        if (ts.isVariableStatement(node)) {
+            node.declarationList.declarations.forEach(function(decl) {
+                if (!decl.name || !ts.isIdentifier(decl.name)) return;
+                var sym = tc.getSymbolAtLocation(decl.name);
+                if (!sym) return;
+                var type = tc.typeToString(tc.getTypeOfSymbolAtLocation(sym, decl));
+                var fn = (decl.initializer &&
+                    (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer)))
+                    ? decl.initializer : null;
+                results.push({
+                    name: decl.name.text,
+                    kind: fn ? 'Function' : 'Variable',
+                    type: type,
+                    accessibility: accessibility,
+                    line: sf.getLineAndCharacterOfPosition(decl.name.getStart()).line + 1,
+                    endLine: endLineOf(decl, sf),
+                    modifiers: modifiers,
+                    isStatic: modifiers.indexOf('static') >= 0,
+                    isAbstract: modifiers.indexOf('abstract') >= 0,
+                    isAsync: fn ? !!(fn.modifiers && tsModifiers(fn).indexOf('async') >= 0) : false,
+                    parameters: fn ? tsParams(fn, sf, tc) : [],
+                    typeParameters: fn ? tsTypeParams(fn, sf) : [],
+                    docSummary: doc.summary,
+                    isDeprecated: doc.deprecated
+                });
+            });
+            return;
+        }
+
+        if (!node.name || !ts.isIdentifier(node.name)) return;
         var sym = tc.getSymbolAtLocation(node.name);
         if (!sym) return;
         var type = tc.typeToString(tc.getTypeOfSymbolAtLocation(sym, node));
-        var flags = ts.getCombinedModifierFlags(node);
-        var access = (flags & 4) ? 'private' : (flags & 16) ? 'protected' : 'public';
+        var isFn = ts.isFunctionDeclaration(node);
         results.push({
             name: node.name.text,
-            kind: ts.SyntaxKind[node.kind],
+            kind: toFriendlyKind(ts.SyntaxKind[node.kind]),
             type: type,
-            accessibility: access,
-            line: sf.getLineAndCharacterOfPosition(node.pos).line + 1
+            accessibility: accessibility,
+            line: sf.getLineAndCharacterOfPosition(node.name.getStart()).line + 1,
+            endLine: endLineOf(node, sf),
+            modifiers: modifiers,
+            isStatic: modifiers.indexOf('static') >= 0,
+            isAbstract: modifiers.indexOf('abstract') >= 0,
+            isAsync: modifiers.indexOf('async') >= 0,
+            parameters: isFn ? tsParams(node, sf, tc) : [],
+            typeParameters: tsTypeParams(node, sf),
+            enumMembers: ts.isEnumDeclaration(node) ? tsEnumMembers(node, sf) : [],
+            docSummary: doc.summary,
+            isDeprecated: doc.deprecated
         });
     });
     return results;
 }
 
-// ── findReferences ────────────────────────────────────────────────────────────
-function findReferences(fileName, symbolName) {
+// ── Inverted reference index (mirrors C# ProjectIndex.BuildReferenceIndex) ────
+// Built once per program version; subsequent lookups are O(1) dictionary reads.
+// This is what makes per-file reference analysis fast enough to stay within the
+// 45 s job timeout even on large TypeScript projects.
+
+var _refIndex = null;        // symbolName → [{filePath, line, context}]
+var _refIndexVersion = -1;   // program stamp — rebuild when a file is invalidated
+var _declFiles = null;       // name → [filePaths] of EVERY top-level declaration (collision diagnostics)
+
+function buildReferenceIndex() {
     var program = langService.getProgram();
-    if (!program) return [];
-    var sf = program.getSourceFile(fileName);
-    if (!sf) return [];
+    if (!program) { _declFiles = {}; return {}; }
+    var checker = program.getTypeChecker();
 
-    // Find the position of the first occurrence of symbolName in the file
-    var text = sf.getFullText();
-    var idx = text.indexOf(symbolName);
-    if (idx < 0) return [];
+    // Collect source files, skipping .d.ts declaration files and node_modules.
+    var sourceFilesRaw = program.getSourceFiles();
+    var sources = [];
+    for (var i = 0; i < sourceFilesRaw.length; i++) {
+        var sf = sourceFilesRaw[i];
+        if (!sf.isDeclarationFile && sf.fileName.indexOf('/node_modules/') < 0)
+            sources.push(sf);
+    }
 
-    var refs = langService.findReferences(fileName, idx);
-    if (!refs) return [];
+    // Pass 1: collect top-level exported declarations, mapping name → ts.Symbol.
+    // Mirrors ProjectIndex Pass 1 (declaredSymbols dictionary).  First declaration
+    // per name wins — same policy as Roslyn's BuildReferenceIndex.
+    var declSymbols = {};   // name → ts.Symbol of the canonical declaration
+    var declaredNames = {}; // name → true  (fast pre-filter before checker call)
 
-    var results = [];
-    refs.forEach(function(refGroup) {
-        refGroup.references.forEach(function(ref) {
-            var refSf = program.getSourceFile(ref.fileName);
-            var line = refSf ? refSf.getLineAndCharacterOfPosition(ref.textSpan.start).line + 1 : 0;
-            results.push({ filePath: ref.fileName, line: line, context: symbolName });
+    for (var si = 0; si < sources.length; si++) {
+        var sf0 = sources[si];
+        ts.forEachChild(sf0, function(node) {
+            function addDecl(nameNode) {
+                if (!nameNode || !ts.isIdentifier(nameNode)) return;
+                var name = nameNode.text;
+                if (declaredNames[name]) return; // first wins
+                var sym = checker.getSymbolAtLocation(nameNode);
+                if (!sym) return;
+                declSymbols[name]  = sym;
+                declaredNames[name] = true;
+            }
+            if (ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) ||
+                ts.isFunctionDeclaration(node) || ts.isEnumDeclaration(node) ||
+                ts.isTypeAliasDeclaration(node)) {
+                addDecl(node.name);
+            } else if (ts.isVariableStatement(node)) {
+                node.declarationList.declarations.forEach(function(d) { addDecl(d.name); });
+            }
         });
-    });
-    return results;
+    }
+
+    // Pass 2: single traversal of all files; for every identifier whose text matches a
+    // declared name, resolve via the type checker and check symbol identity — same as
+    // Roslyn's SymbolEqualityComparer.Default.Equals.
+    // ts.SymbolFlags.Alias = 2097152; follow through barrel re-exports (export * from './x').
+    var index = {};
+    for (var si2 = 0; si2 < sources.length; si2++) {
+        var sf2 = sources[si2];
+        var encStack = [];   // P5: stack of enclosing named declarations (caller attribution)
+        (function visit(node) {
+            var dn = tsDeclName(node, sf2);
+            if (dn) encStack.push(dn);
+
+            if (ts.isIdentifier(node) && declaredNames[node.text]) {
+                var sym = checker.getSymbolAtLocation(node);
+                if (sym) {
+                    var resolved = (sym.flags & 2097152) ? checker.getAliasedSymbol(sym) : sym;
+                    var name = node.text;
+                    if (declSymbols[name] && resolved === declSymbols[name]) {
+                        var lc = sf2.getLineAndCharacterOfPosition(node.getStart());
+                        if (!index[name]) index[name] = [];
+                        index[name].push({
+                            filePath: sf2.fileName, line: lc.line + 1, context: name,
+                            role: tsRefRole(node),
+                            enclosingName: encStack.length ? encStack[encStack.length - 1] : null
+                        });
+                    }
+                }
+            }
+            ts.forEachChild(node, visit);
+            if (dn) encStack.pop();
+        })(sf2);
+    }
+    // Pass 3: import-declaration fallback.
+    // When checker.getSymbolAtLocation returns null for type-only import specifiers
+    // (e.g. because lib.d.ts is missing and cascading errors impair type resolution),
+    // Pass 2 records nothing.  This pass detects relative imports of declared names by
+    // resolving the module specifier string to a file path and checking it against the
+    // symbol's declared source file — no type checker required.
+    for (var si3 = 0; si3 < sources.length; si3++) {
+        var sf3 = sources[si3];
+        var dir3 = sf3.fileName.replace(/\/[^\/]+$/, ''); // dirname
+        ts.forEachChild(sf3, function(iNode) {
+            if (!ts.isImportDeclaration(iNode)) return;
+            var modSpecNode = iNode.moduleSpecifier;
+            if (!ts.isStringLiteral(modSpecNode)) return;
+            var modText = modSpecNode.text;
+            if (modText.charAt(0) !== '.') return; // only relative imports
+
+            var clause = iNode.importClause;
+            if (!clause) return;
+            var names = [];
+            if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+                clause.namedBindings.elements.forEach(function(el) {
+                    names.push(el.name.text);
+                });
+            }
+            if (!names.length) return;
+
+            // Candidate absolute paths the module specifier could resolve to
+            var base = _joinPath(dir3, modText);
+            var candidates = [
+                base + '.ts', base + '.tsx',
+                base + '/index.ts', base + '/index.tsx'
+            ];
+
+            names.forEach(function(name) {
+                if (!declaredNames[name]) return;
+                // Already recorded by Pass 2 for this file — skip
+                if (index[name] && index[name].some(function(r) { return r.filePath === sf3.fileName; })) return;
+
+                var sym = declSymbols[name];
+                if (!sym || !sym.declarations || !sym.declarations.length) return;
+                var declSf = sym.declarations[0].getSourceFile();
+                if (!declSf) return;
+                var normDecl = _normPath(declSf.fileName);
+
+                for (var ci = 0; ci < candidates.length; ci++) {
+                    if (_normPath(candidates[ci]) === normDecl) {
+                        if (!index[name]) index[name] = [];
+                        var lc = sf3.getLineAndCharacterOfPosition(iNode.getStart());
+                        index[name].push({ filePath: sf3.fileName, line: lc.line + 1, context: name, role: 'import' });
+                        break;
+                    }
+                }
+            });
+        });
+    }
+
+    return index;
+}
+
+function _normPath(p) {
+    var parts = p.split('/');
+    var r = [];
+    for (var i = 0; i < parts.length; i++) {
+        var seg = parts[i];
+        if (seg === '..') { if (r.length) r.pop(); }
+        else if (seg && seg !== '.') r.push(seg.toLowerCase());
+    }
+    return r.join('/');
+}
+
+function _joinPath(a, b) {
+    return _normPath(a + '/' + b);
+}
+
+// Called from C# FindAllReferencesAsync.  symbolNames is a JS array (passed as a
+// JSON array literal in the eval string).  programVersion is an int bumped by C#
+// whenever a file is invalidated so the cache is rebuilt only when the program changes.
+function findAllReferences(symbolNames, programVersion) {
+    if (_refIndex === null || _refIndexVersion !== programVersion) {
+        _refIndex = buildReferenceIndex();
+        _refIndexVersion = programVersion;
+    }
+    var out = {};
+    for (var i = 0; i < symbolNames.length; i++) {
+        var refs = _refIndex[symbolNames[i]];
+        if (refs && refs.length) out[symbolNames[i]] = refs;
+    }
+    return JSON.stringify(out);
+}
+
+// ── findReferences ────────────────────────────────────────────────────────────
+// Single-symbol wrapper — delegates to findAllReferences so it also uses the
+// inverted index instead of the broken text.indexOf anchor.
+function findReferences(fileName, symbolName) {
+    var json = findAllReferences([symbolName], _refIndexVersion);
+    var allRefs = JSON.parse(json);
+    return allRefs[symbolName] || [];
 }
 
 // ── getDiagnostics ────────────────────────────────────────────────────────────
