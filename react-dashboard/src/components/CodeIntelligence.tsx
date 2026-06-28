@@ -3,7 +3,7 @@ import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import {
   Sparkles, Search, X, Loader2, AlertCircle, FileCode2,
   Boxes, Route, Database, Network, Settings2, ShieldAlert, Package,
-  FlaskConical, Trash2, Layers, Zap, ArrowDownLeft, ArrowUpRight, GitBranch,
+  FlaskConical, Layers, Zap, ArrowDownLeft, ArrowUpRight, GitBranch,
 } from 'lucide-react'
 import { api } from '../api'
 import { CodePeek, InsightCallout, type PeekTarget } from './intelligenceUi'
@@ -58,13 +58,12 @@ function StatCard({
 }
 
 function OverviewView({ data, onJump }: { data: IntelligenceOverview; onJump: (v: View) => void }) {
-  const hasInsights = data.orphanSymbols > 0 || data.securitySinks > 0
+  const hasInsights = data.securitySinks > 0
   return (
     <div className="space-y-4">
       {hasInsights && (
         <div className="flex flex-wrap gap-2">
-          <InsightCallout icon={Trash2}      count={data.orphanSymbols} label="orphan symbols (no references)" tone="border-orange-500/30 bg-orange-500/10 text-orange-400" onClick={() => onJump('api')} />
-          <InsightCallout icon={ShieldAlert} count={data.securitySinks} label="security-sensitive sinks"          tone="border-red-500/30 bg-red-500/10 text-red-400"        onClick={() => onJump('api')} />
+          <InsightCallout icon={ShieldAlert} count={data.securitySinks} label="security-sensitive sinks" tone="border-red-500/30 bg-red-500/10 text-red-400" onClick={() => onJump('api')} />
         </div>
       )}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
@@ -77,7 +76,6 @@ function OverviewView({ data, onJump }: { data: IntelligenceOverview; onJump: (v
       <StatCard icon={GitBranch}  label="Type relations" value={data.typeRelations}   tone="text-violet-400"  onClick={() => onJump('api')} />
       <StatCard icon={Settings2}  label="Config keys"    value={data.configKeys}      tone="text-cyan-400"    onClick={() => onJump('api')} />
       <StatCard icon={ShieldAlert} label="Security sinks" value={data.securitySinks}  tone="text-red-400"     onClick={() => onJump('api')} />
-      <StatCard icon={Trash2}     label="Orphan symbols" value={data.orphanSymbols}   tone="text-orange-400" />
       <StatCard icon={FlaskConical} label="Test files"   value={data.testFiles}       tone="text-green-400" />
       <StatCard icon={Package}    label="Packages"       value={data.packages}        tone="text-zinc-400"   onClick={() => onJump('manifests')} />
       </div>
@@ -304,6 +302,34 @@ const Empty = ({ icon: Icon, text }: { icon: React.ElementType; text: string }) 
     <Icon className="w-8 h-8 text-zinc-700 mx-auto" />
     <p className="text-zinc-500 text-sm max-w-md mx-auto">{text}</p>
   </div>
+
+// ── Named tab exports (used by ProjectDetail to embed individual tabs) ──────────
+
+export type IntelTab = View
+
+export function OverviewTab({ projectId, subProjectId, onJump }: {
+  projectId: string; subProjectId?: string; onJump: (tab: IntelTab) => void
+}) {
+  const { data } = useQuery({
+    queryKey: ['intel-overview', projectId, subProjectId],
+    queryFn: () => api.intelligence.getOverview(projectId, subProjectId),
+    staleTime: 30_000,
+  })
+  if (!data) return null
+  return <OverviewView data={data} onJump={onJump} />
+}
+
+export function ApiSurfaceTab({ projectId, subProjectId }: { projectId: string; subProjectId?: string }) {
+  return <ApiSurfaceView projectId={projectId} subProjectId={subProjectId} onPeek={() => {}} />
+}
+
+export function DependenciesTab({ projectId, onNavigateToFile }: { projectId: string; onNavigateToFile?: (id: string) => void }) {
+  return <DependenciesView projectId={projectId} onNavigate={onNavigateToFile} />
+}
+
+export function ManifestsTab({ projectId }: { projectId: string }) {
+  return <ManifestsView projectId={projectId} />
+}
 
 // ── Main hub ────────────────────────────────────────────────────────────────────
 

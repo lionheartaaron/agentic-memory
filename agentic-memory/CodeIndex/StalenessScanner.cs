@@ -49,6 +49,7 @@ public sealed class StalenessScanner
         var diskFiles = EnumerateIndexableFiles(projectRoot).ToList();
         _logger.LogInformation("Found {Count} indexable files in {Root}", diskFiles.Count, projectRoot);
 
+        var typesNowAvailable = TypeScript.TypeScriptLibResolver.HasResolvableTypes(projectRoot);
         int queued = 0, current = 0;
 
         foreach (var filePath in diskFiles)
@@ -58,7 +59,8 @@ public sealed class StalenessScanner
             if (existingByPath.TryGetValue(filePath, out var record))
             {
                 var diskModified = File.GetLastWriteTimeUtc(filePath);
-                if (diskModified > record.FileModifiedAt.AddSeconds(1) || record.IsStale)
+                if (diskModified > record.FileModifiedAt.AddSeconds(1) || record.IsStale ||
+                    (record.TypeScriptTypesResolved == false && typesNowAvailable))
                 {
                     record.IsStale = true;
                     await _repository.UpsertAsync(record, ct);
@@ -147,6 +149,9 @@ public sealed class StalenessScanner
             r => r.FilePath, StringComparer.OrdinalIgnoreCase);
 
         var diskFiles = EnumerateIndexableFiles(sub.RootPath).ToList();
+        // If a TS sub-project was indexed type-less but node_modules is now present, re-index it with
+        // full type resolution (auto-correct for the "indexed without node_modules" degraded state).
+        var typesNowAvailable = TypeScript.TypeScriptLibResolver.HasResolvableTypes(sub.RootPath);
         int queued = 0, current = 0;
 
         foreach (var filePath in diskFiles)
@@ -156,7 +161,8 @@ public sealed class StalenessScanner
             if (existingByPath.TryGetValue(filePath, out var record))
             {
                 var diskModified = File.GetLastWriteTimeUtc(filePath);
-                if (diskModified > record.FileModifiedAt.AddSeconds(1) || record.IsStale)
+                if (diskModified > record.FileModifiedAt.AddSeconds(1) || record.IsStale ||
+                    (record.TypeScriptTypesResolved == false && typesNowAvailable))
                 {
                     record.IsStale = true;
                     await _repository.UpsertAsync(record, ct);

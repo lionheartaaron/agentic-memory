@@ -193,8 +193,7 @@ public sealed class ReferenceIndexWorker : DedicatedWorker<ReferenceJob>, IRefer
         // Query the pre-built reference index — O(symbolNames.Count) dictionary lookups.
         // ProjectIndex already keeps this current via incremental updates in GetOrParseSyntaxTree.
         // A constructor is reached by instantiating its TYPE (`new Foo()` resolves the identifier
-        // "Foo" to the type, never to a "Foo()" method), so we look it up under the type's simple
-        // name — otherwise every constructor resolves to zero references and is flagged a false orphan.
+        // "Foo" to the type, never to a "Foo()" method), so we look it up under the type's simple name.
         var symbolNames = publicSymbols.Select(LookupName).Distinct().ToList();
         var allRefs     = _codeIndex.FindAllReferencesAsync(record.FilePath, symbolNames, ct)
                                     .GetAwaiter().GetResult();
@@ -233,11 +232,6 @@ public sealed class ReferenceIndexWorker : DedicatedWorker<ReferenceJob>, IRefer
                     ? bucket
                     : bucket.Where(x => sym.SymbolDocId is null || x.TargetDocId is null
                                         || x.TargetDocId == sym.SymbolDocId).ToList();
-
-                // Dead-code signal: orphan iff the symbol has NO references anywhere — including its
-                // own file. Declarations are never recorded as references, so an in-file caller counts
-                // (a public helper used only by its own class is reachable, not dead).
-                var hasAnyRef = reachableRefs.Any();
 
                 // The displayed/graph usage sites are the cross-file ones (self-edges are noise). For a
                 // constructor those are the instantiation sites — "who constructs this".
@@ -285,7 +279,6 @@ public sealed class ReferenceIndexWorker : DedicatedWorker<ReferenceJob>, IRefer
                     SubProjectId          = string.IsNullOrEmpty(record.SubProjectId) ? null : record.SubProjectId,
                     UsedBy                = usageSites,
                     ExternalUseCount      = usageSites.Count,
-                    IsOrphan              = !hasAnyRef,
                     TestedByFileIds       = testedBy,
                     UpdatedAt             = DateTime.UtcNow,
                 }, ct).GetAwaiter().GetResult();
@@ -304,17 +297,12 @@ public sealed class ReferenceIndexWorker : DedicatedWorker<ReferenceJob>, IRefer
         var dependsOnIds  = dependsOnRefs.Select(r => r.DefinedInFileId).Distinct()
                                          .Where(id => id != record.Id).ToList();
 
-        // P1 near-free rollups: dead-code (orphan public symbols) + test-subject linkage.
-        var orphanCount = mySymRefs.Count(r => r.IsOrphan);
-
         // Reload record to avoid clobbering concurrent ingestion writes.
         var fresh = _repository.GetByPathAsync(job.FilePath, ct).GetAwaiter().GetResult() ?? record;
-        fresh.UsedByFileIds        = usedByIds;
-        fresh.DependsOnFileIds     = dependsOnIds;
-        fresh.FanIn                = usedByIds.Count;
-        fresh.FanOut               = dependsOnIds.Count;
-        fresh.OrphanSymbolCount    = orphanCount;
-        fresh.HasUnusedPublicSymbols = orphanCount > 0;
+        fresh.UsedByFileIds    = usedByIds;
+        fresh.DependsOnFileIds = dependsOnIds;
+        fresh.FanIn            = usedByIds.Count;
+        fresh.FanOut           = dependsOnIds.Count;
         // For a test file, the production files it references are its test subjects.
         if (fresh.IsTestFile) fresh.TestSubjectFileIds = dependsOnIds;
         _repository.UpsertAsync(fresh, ct).GetAwaiter().GetResult();

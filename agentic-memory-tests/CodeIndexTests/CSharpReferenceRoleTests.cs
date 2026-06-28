@@ -11,12 +11,10 @@ public class CSharpReferenceRoleTests(CodeIndexFixture fixture)
     [Fact]
     public async Task Field_reads_and_writes_are_captured_with_roles()
     {
-        // Regression: field references were dropped (field names never entered the index), so a field
-        // had no usage edges and looked like an orphan. Now both the read and the write are recorded.
+        // Field references are captured with role labels (read/write).
         var field = await fixture.GetSymbolRefAsync("Variety.cs", "Field");
         Assert.NotNull(field);
-        Assert.False(field!.IsOrphan);
-        Assert.Contains(field.UsedBy, u => u.Role == "read");
+        Assert.Contains(field!.UsedBy, u => u.Role == "read");
         Assert.Contains(field.UsedBy, u => u.Role == "write");
     }
 

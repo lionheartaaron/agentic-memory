@@ -265,10 +265,20 @@ internal sealed class ProjectIndex : IDisposable
             var resolved = info.Symbol ?? info.CandidateSymbols.FirstOrDefault();
             if (resolved is null) continue;
 
-            // Normalise constructed generics / reduced extension methods to the declaration identity,
-            // then keep the site only if it resolves to a symbol declared in THIS project.
-            var docId = (resolved.OriginalDefinition ?? resolved).GetDocumentationCommentId();
-            if (docId is null || !declaredDocIds.Contains(docId)) continue;
+            // Normalise to the declaration identity so the DocId matches declaredDocIds:
+            //   • ReducedFrom: extension method called as receiver.Method() — Roslyn gives the
+            //     reduced form (this-param hidden); ReducedFrom is the original static declaration.
+            //   • OriginalDefinition: strips constructed generic type arguments.
+            // Both normalizations must be applied: a generic extension method needs both.
+            var declSym = resolved is IMethodSymbol { ReducedFrom: { } rf }
+                ? (ISymbol)(rf.OriginalDefinition ?? rf)
+                : (resolved.OriginalDefinition ?? resolved);
+            var docId = declSym.GetDocumentationCommentId();
+            // Null DocId means Roslyn resolved the symbol but couldn't produce a stable id
+            // (common when a parameter type is an unresolved framework type, e.g. WebApplication).
+            // Fall back to name-only matching rather than dropping the reference entirely.
+            // Non-null DocId not in declaredDocIds → belongs to a different symbol → skip.
+            if (docId is not null && !declaredDocIds.Contains(docId)) continue;
 
             var line = tree.GetLineSpan(id.Span).StartLinePosition.Line + 1;
             if (!refIndex.TryGetValue(name, out var list))
@@ -277,6 +287,80 @@ internal sealed class ProjectIndex : IDisposable
             list.Add(new ReferenceInfo(tree.FilePath, line, id.Parent?.ToString() ?? name)
             {
                 Role              = ClassifyRole(id),
+                EnclosingSymbolId = encId,
+                EnclosingName     = encName,
+                TargetDocId       = docId,
+            });
+        }
+
+        // Extension method call sites: receiver.Foo() where Foo is defined as static Foo(this T, …).
+        // GetSymbolInfo on just the IdentifierNameSyntax name node can return null for extension
+        // methods because the receiver type is needed to resolve the `this`-parameter match.
+        // Calling GetSymbolInfo on the full InvocationExpressionSyntax is more reliable.
+        // ReducedFrom may be null when the binding is only partial (receiver or parameter types
+        // not fully resolved); in that case the symbol IS already in its original static form.
+        foreach (var inv in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
+        {
+            ct.ThrowIfCancellationRequested();
+            if (inv.Expression is not MemberAccessExpressionSyntax ma) continue;
+            var name = ma.Name.Identifier.Text;
+            if (!declaredNames.Contains(name)) continue;
+
+            var info = model.GetSymbolInfo(inv, ct);
+            var resolved = info.Symbol ?? info.CandidateSymbols.FirstOrDefault();
+            if (resolved is not IMethodSymbol { IsExtensionMethod: true } ms) continue;
+
+            var origMethod = ms.ReducedFrom is { } rf
+                ? (ISymbol)(rf.OriginalDefinition ?? rf)
+                : (ISymbol)(ms.OriginalDefinition ?? ms);
+            var docId = origMethod.GetDocumentationCommentId();
+            if (docId is not null && !declaredDocIds.Contains(docId)) continue;
+
+            var line = tree.GetLineSpan(inv.Span).StartLinePosition.Line + 1;
+            // Skip if the IdentifierNameSyntax loop already captured this call site.
+            if (refIndex.TryGetValue(name, out var existing) &&
+                existing.Any(r => string.Equals(r.FilePath, tree.FilePath, StringComparison.OrdinalIgnoreCase)
+                               && r.Line == line)) continue;
+
+            if (!refIndex.TryGetValue(name, out var list))
+                refIndex[name] = list = [];
+            var (encId, encName) = EnclosingOf(model, inv.SpanStart, ct);
+            list.Add(new ReferenceInfo(tree.FilePath, line, ma.ToString())
+            {
+                Role              = "call",
+                EnclosingSymbolId = encId,
+                EnclosingName     = encName,
+                TargetDocId       = docId,
+            });
+        }
+
+        // Generic type references — e.g. DedicatedWorker<T> in a base-class list — use
+        // GenericNameSyntax whose Identifier is NOT an IdentifierNameSyntax child, so the
+        // loop above misses them. Without this pass every generic abstract base class looks
+        // like an orphan even when three concrete subclasses inherit from it.
+        foreach (var gn in root.DescendantNodes().OfType<GenericNameSyntax>()
+                     .Where(gn => declaredNames.Contains(gn.Identifier.Text)))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var name = gn.Identifier.Text;
+            var info = model.GetSymbolInfo(gn, ct);
+            var resolved = info.Symbol ?? info.CandidateSymbols.FirstOrDefault();
+            if (resolved is null) continue;
+
+            var declSym = resolved is IMethodSymbol { ReducedFrom: { } rf }
+                ? (ISymbol)(rf.OriginalDefinition ?? rf)
+                : (resolved.OriginalDefinition ?? resolved);
+            var docId = declSym.GetDocumentationCommentId();
+            if (docId is not null && !declaredDocIds.Contains(docId)) continue;
+
+            var line = tree.GetLineSpan(gn.Span).StartLinePosition.Line + 1;
+            if (!refIndex.TryGetValue(name, out var list))
+                refIndex[name] = list = [];
+            var (encId, encName) = EnclosingOf(model, gn.SpanStart, ct);
+            list.Add(new ReferenceInfo(tree.FilePath, line, gn.Parent?.ToString() ?? name)
+            {
+                Role              = gn.Parent is BaseTypeSyntax ? "implements" : "typeref",
                 EnclosingSymbolId = encId,
                 EnclosingName     = encName,
                 TargetDocId       = docId,

@@ -257,8 +257,6 @@ export interface CodeIndexFile {
   isTestFile?: boolean
   testFramework?: string | null
   testSubjectFileIds?: string[]
-  hasUnusedPublicSymbols?: boolean
-  orphanSymbolCount?: number
   hasValidation?: boolean
   architecturalRole?: string | null
   isEntrypoint?: boolean
@@ -351,7 +349,6 @@ export interface SymbolReference {
   definedAtLine: number
   fanIn: number
   usedBy: SymbolUsageSite[]
-  isOrphan?: boolean
   testedByFileIds?: string[] | null
 }
 
@@ -398,7 +395,6 @@ export interface IntelligenceOverview {
   typeRelations: number
   configKeys: number
   securitySinks: number
-  orphanSymbols: number
   testFiles: number
   packages: number
 }

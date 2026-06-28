@@ -36,7 +36,7 @@ public sealed class LanguageServiceHost
     {
         return new
         {
-            target = 2,         // ts.ScriptTarget.ES2015
+            target = 7,         // ts.ScriptTarget.ES2020 (matches the default lib we serve)
             module = 99,        // ts.ModuleKind.ESNext
             jsx = 4,            // ts.JsxEmit.ReactJSX
             strict = false,     // avoid false-positive errors in projects without full typings
@@ -45,7 +45,9 @@ public sealed class LanguageServiceHost
             allowSyntheticDefaultImports = true,
             esModuleInterop = true,
             resolveJsonModule = true,
-            moduleResolution = 99  // ts.ModuleResolutionKind.Bundler
+            moduleResolution = 99, // ts.ModuleResolutionKind.Bundler
+            skipLibCheck = true,        // don't type-check .d.ts files — faster, avoids 3rd-party lib errors
+            skipDefaultLibCheck = true
         };
     }
 
@@ -77,7 +79,23 @@ public sealed class LanguageServiceHost
 
     public string GetCurrentDirectory() => _projectRoot.Replace('\\', '/');
 
-    public string GetDefaultLibFileName(object options) => "lib.d.ts";
+    // The TypeScript checker is useless without the default lib (no Array/Promise/string/DOM/JSX
+    // globals → cascading errors → cross-file symbol resolution fails). Serve the project's own
+    // node_modules/typescript/lib so global + DOM types resolve; the lib's `/// <reference lib>`
+    // directives then resolve to siblings in the same directory. Falls back to the bare name (the
+    // previous degraded behaviour) when no TypeScript install is found.
+    private string? _libFile;
+    private bool _libResolved;
+
+    public string GetDefaultLibFileName(object options)
+    {
+        if (!_libResolved)
+        {
+            _libResolved = true;
+            _libFile = TypeScriptLibResolver.FindDefaultLibFile(_projectRoot);
+        }
+        return _libFile ?? "lib.d.ts";
+    }
 
     public bool FileExists(string path) => File.Exists(path) || Directory.Exists(path);
 

@@ -1087,8 +1087,6 @@ public static class WebApplicationExtensions
             IsTestFile:            r.IsTestFile,
             TestFramework:         r.TestFramework,
             TestSubjectFileIds:    r.TestSubjectFileIds.Count > 0 ? r.TestSubjectFileIds : null,
-            HasUnusedPublicSymbols:r.HasUnusedPublicSymbols,
-            OrphanSymbolCount:     r.OrphanSymbolCount,
             HasValidation:         r.HasValidation,
             ArchitecturalRole:     r.ArchitecturalRole,
             IsEntrypoint:          r.IsEntrypoint);
@@ -1386,9 +1384,10 @@ public static class WebApplicationExtensions
                 TypeRelations:   Count("type-relation"),
                 ConfigKeys:      Count("config-key"),
                 SecuritySinks:   Count("security-sink"),
-                OrphanSymbols:   syms.Count(s => s.IsOrphan),
+
                 TestFiles:       files.Count(f => f.IsTestFile),
-                Packages:        manifests.Sum(m => m.Packages.Count)));
+                Packages:        manifests.Sum(m => m.Packages.Count),
+                TypeScriptFilesWithoutTypes: files.Count(f => f.TypeScriptTypesResolved == false)));
         });
     }
 
@@ -1418,7 +1417,6 @@ public static class WebApplicationExtensions
             r.DefinedInFileId, r.DefinedInRelativePath, r.DefinedAtLine,
             r.UsedBy.Count,
             r.UsedBy.Select(u => new SymbolUsageSiteDto(u.FileId, u.RelativePath, u.Line, u.Context, u.Role, u.EnclosingName)).ToList(),
-            r.IsOrphan,
             r.TestedByFileIds.Count > 0 ? r.TestedByFileIds : null);
 
     // ── Legacy /api/projects/* aliases (backward compatible) ─────────────────

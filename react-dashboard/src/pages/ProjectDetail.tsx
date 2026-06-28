@@ -3,22 +3,31 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   FolderGit2, ChevronRight, FileCode, Loader2,
   Database, Zap, Activity, Code2, Sparkles,
+  Network, GitBranch, Package,
 } from 'lucide-react'
 import { api } from '../api'
 import { FileSummaryTool } from '../components/FileSummaryTool'
 import { FilesIndex } from '../components/FilesIndex'
 import { SymbolsIndex } from '../components/SymbolsIndex'
-import { CodeIntelligence } from '../components/CodeIntelligence'
+import {
+  OverviewTab, ApiSurfaceTab, DependenciesTab, ManifestsTab, type IntelTab,
+} from '../components/CodeIntelligence'
 import type { SubProjectRecord } from '../types'
 
 type ToolTab = { id: string; label: string; icon: React.ElementType }
 
 const TOOL_TABS: ToolTab[] = [
-  { id: 'intelligence', label: 'Intelligence', icon: Sparkles  },
+  { id: 'overview',     label: 'Overview',     icon: Sparkles  },
   { id: 'files',        label: 'Files',        icon: Database  },
   { id: 'symbols',      label: 'Symbols',      icon: Code2     },
+  { id: 'api',          label: 'API Surface',  icon: Network   },
+  { id: 'deps',         label: 'Dependencies', icon: GitBranch },
+  { id: 'manifests',    label: 'Manifests',    icon: Package   },
   { id: 'file-summary', label: 'File Summary', icon: FileCode  },
 ]
+
+// Tabs that respect the sub-project filter (the rest are project-wide).
+const SUBPROJECT_FILTERABLE = new Set(['overview', 'files', 'symbols', 'api'])
 
 const TYPE_BADGE: Record<string, { label: string; cls: string }> = {
   CSharpProject: { label: 'C#', cls: 'bg-violet-500/15 text-violet-300 border-violet-500/25' },
@@ -76,7 +85,7 @@ export default function ProjectDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
-  const activeTab          = searchParams.get('tab') ?? 'files'
+  const activeTab          = searchParams.get('tab') ?? 'overview'
   const activeSubProjectId = searchParams.get('sub') ?? undefined
 
   const setActiveTab = (tab: string) => {
@@ -221,8 +230,8 @@ export default function ProjectDetail() {
         </div>
       </div>
 
-      {/* Sub-project filter — shown on files, symbols and intelligence tabs */}
-      {(activeTab === 'files' || activeTab === 'symbols' || activeTab === 'intelligence') && subProjects.length > 1 && (
+      {/* Sub-project filter — shown on the sub-project-scoped tabs */}
+      {SUBPROJECT_FILTERABLE.has(activeTab) && subProjects.length > 1 && (
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs text-zinc-500 mr-1">Filter:</span>
           <SubProjectPill
@@ -242,12 +251,21 @@ export default function ProjectDetail() {
       )}
 
       {/* Tab content */}
-      {activeTab === 'intelligence' && (
-        <CodeIntelligence
+      {activeTab === 'overview' && (
+        <OverviewTab
           projectId={id!}
           subProjectId={activeSubProjectId}
-          onNavigateToFile={onNavigateToFile}
+          onJump={(tab: IntelTab) => setActiveTab(tab)}
         />
+      )}
+      {activeTab === 'api' && (
+        <ApiSurfaceTab projectId={id!} subProjectId={activeSubProjectId} />
+      )}
+      {activeTab === 'deps' && (
+        <DependenciesTab projectId={id!} onNavigateToFile={onNavigateToFile} />
+      )}
+      {activeTab === 'manifests' && (
+        <ManifestsTab projectId={id!} />
       )}
       {activeTab === 'files' && (
         <FilesIndex

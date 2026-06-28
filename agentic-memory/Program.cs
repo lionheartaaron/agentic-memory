@@ -115,11 +115,35 @@ internal class Program
                     Name = "agentic-memory",
                     Version = "1.0.0"
                 };
+                options.ServerInstructions = McpInstructions;
             })
             .WithHttpTransport()
             .WithTools<MemoryTools>()
             .WithTools<AgenticMemory.Tools.CodeIndexTools>();
     }
+
+    private const string McpInstructions =
+        """
+        You have compiler-level code intelligence via the agentic-memory MCP server. It is precise and
+        scoped — prefer it over grep and cold file reads, which cost far more tokens for less accuracy.
+
+        Tool order — follow this every session:
+
+        1. get_subproject_context — call once at the start to learn the workspace layout (sub-projects,
+           entry points, manifests). The 'subproject' names it returns scope every other tool.
+        2. get_file_context(path, subproject) — before read_file on any file. Returns its symbols,
+           signatures, imports/exports and dependencies without the bodies. Usually enough on its own.
+        3. get_symbol_context(symbol, subproject) — instead of grep for any named symbol. Returns the
+           definition, implementations, callers and reference count.
+        4. get_symbol_sourcecode(symbol, subproject) — instead of read_file when you know the symbol.
+           Returns just that symbol's source.
+        5. search_code(query, subproject) — when you don't yet know the file or symbol; semantic/keyword
+           file search. Then narrow with the tools above.
+
+        Always pass the 'subproject' argument when you know it — it scopes the lookup and improves
+        accuracy on multi-project repositories. Fall back to grep or read_file only when these return
+        nothing. All tools act on the active workspace (or the only one registered).
+        """;
 
     private static void PrintStartupInfo(WebApplication app, AppSettings settings)
     {

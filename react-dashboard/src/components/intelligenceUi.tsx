@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import {
   X, Loader2, AlertCircle, FileCode2, ArrowUpRight, AlertTriangle,
-  FlaskConical, Lock, Trash2, Code2, ShieldX,
+  FlaskConical, Lock, Code2, ShieldX,
 } from 'lucide-react'
 import { api } from '../api'
 import type { SymbolRecord, SymbolReference, FileContent } from '../types'
@@ -133,7 +133,6 @@ export function StatusBadges({ s, reference: r }: { s?: SymbolRecord; reference?
   return (
     <>
       {s?.isDeprecated && <Chip tone="orange" title={s.deprecationMessage ?? 'deprecated'}><AlertTriangle className="w-2.5 h-2.5" />deprecated</Chip>}
-      {r?.isOrphan && <Chip tone="red" title="no references anywhere — dead-code candidate"><Trash2 className="w-2.5 h-2.5" />orphan</Chip>}
       {(r?.testedByFileIds?.length ?? 0) > 0 && <Chip tone="green" title={`covered by ${r!.testedByFileIds!.length} test file(s)`}><FlaskConical className="w-2.5 h-2.5" />tested</Chip>}
     </>
   )

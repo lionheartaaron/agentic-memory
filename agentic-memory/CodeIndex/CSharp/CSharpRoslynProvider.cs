@@ -197,6 +197,41 @@ public sealed class CSharpRoslynProvider : ICodeIntelligenceProvider, IBatchRefe
                     results.Add(EnrichFromSymbol(pInfo, prop, recDecl));
                 }
             }
+
+            // Class/struct primary constructor ("class Foo(int x)"): not a ConstructorDeclarationSyntax,
+            // so synthesise its symbol from the type's primary constructor. (Records emit positional
+            // PROPERTIES above; for classes/structs the params are constructor parameters.)
+            if (model is not null && decl is TypeDeclarationSyntax { ParameterList: { } primaryList } typeDecl &&
+                decl is not RecordDeclarationSyntax &&
+                model.GetDeclaredSymbol(typeDecl) is INamedTypeSymbol primaryType &&
+                primaryType.InstanceConstructors.FirstOrDefault(c =>
+                    !c.IsImplicitlyDeclared && c.Parameters.Length == primaryList.Parameters.Count) is { } primaryCtor)
+            {
+                var cspan = tree.GetLineSpan(typeDecl.Identifier.Span);
+                var cInfo = new SymbolInfo(typeDecl.Identifier.Text + "()", "constructor", null, "public",
+                    cspan.StartLinePosition.Line + 1) { EndLine = cspan.EndLinePosition.Line + 1 };
+                results.Add(EnrichFromSymbol(cInfo, primaryCtor, decl));
+            }
+
+            // Additional declarators in a multi-variable field/event ("int X, Y;"): only the first is
+            // the node's primary name, so emit the rest — otherwise every field after the first is lost.
+            if (model is not null && decl is BaseFieldDeclarationSyntax multiField &&
+                multiField.Declaration.Variables.Count > 1)
+            {
+                var fieldKind = decl is EventFieldDeclarationSyntax ? "event" : "field";
+                foreach (var v in multiField.Declaration.Variables.Skip(1))
+                {
+                    if (model.GetDeclaredSymbol(v) is not { } vsym) continue;
+                    var vspan = tree.GetLineSpan(v.Span);
+                    var vInfo = new SymbolInfo(
+                        vsym.Name, fieldKind,
+                        (vsym as IFieldSymbol)?.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
+                        AccessibilityOf(vsym),
+                        vspan.StartLinePosition.Line + 1)
+                    { EndLine = vspan.EndLinePosition.Line + 1 };
+                    results.Add(EnrichFromSymbol(vInfo, vsym, decl));
+                }
+            }
         }
 
         return results;
@@ -314,8 +349,11 @@ public sealed class CSharpRoslynProvider : ICodeIntelligenceProvider, IBatchRefe
                 var symInfo  = model.GetSymbolInfo(id, ct);
                 var resolved = symInfo.Symbol ?? symInfo.CandidateSymbols.FirstOrDefault();
                 if (resolved is null) continue;
-                var docId = (resolved.OriginalDefinition ?? resolved).GetDocumentationCommentId();
-                if (docId is null || !declaredDocIds.Contains(docId)) continue;
+                var declSym = resolved is IMethodSymbol { ReducedFrom: { } rf }
+                    ? (ISymbol)(rf.OriginalDefinition ?? rf)
+                    : (resolved.OriginalDefinition ?? resolved);
+                var docId = declSym.GetDocumentationCommentId();
+                if (docId is not null && !declaredDocIds.Contains(docId)) continue;
 
                 var line = tree.GetLineSpan(id.Span).StartLinePosition.Line + 1;
                 if (!results.TryGetValue(name, out var list)) results[name] = list = [];
@@ -812,6 +850,11 @@ public sealed class CSharpRoslynProvider : ICodeIntelligenceProvider, IBatchRefe
             EventDeclarationSyntax ev    => (ev.Identifier.Text, "event"),
             EventFieldDeclarationSyntax ef => (ef.Declaration.Variables.FirstOrDefault()?.Identifier.Text, "event"),
             ConstructorDeclarationSyntax c => (c.Identifier.Text + "()", "constructor"),
+            DestructorDeclarationSyntax dt => ("~" + dt.Identifier.Text + "()", "destructor"),
+            DelegateDeclarationSyntax dl => (dl.Identifier.Text, "delegate"),
+            IndexerDeclarationSyntax     => ("this[]", "indexer"),
+            ConversionOperatorDeclarationSyntax co => ("operator " + co.Type, "operator"),
+            OperatorDeclarationSyntax op => ("operator " + op.OperatorToken.Text, "operator"),
             _                            => (null, "unknown")
         };
 

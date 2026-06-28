@@ -136,8 +136,6 @@ public record CodeIndexFileResponse(
     bool   IsTestFile           = false,
     string? TestFramework       = null,
     IReadOnlyList<string>? TestSubjectFileIds = null,
-    bool   HasUnusedPublicSymbols = false,
-    int    OrphanSymbolCount    = 0,
     bool   HasValidation        = false,
     string? ArchitecturalRole   = null,
     bool   IsEntrypoint         = false);
@@ -194,7 +192,6 @@ public record SymbolReferenceDto(
     int    DefinedAtLine,
     int    FanIn,
     IReadOnlyList<SymbolUsageSiteDto> UsedBy,
-    bool   IsOrphan = false,
     IReadOnlyList<string>? TestedByFileIds = null);
 
 public record SymbolSearchResponse(
@@ -281,9 +278,9 @@ public record IntelligenceOverviewDto(
     int TypeRelations,
     int ConfigKeys,
     int SecuritySinks,
-    int OrphanSymbols,
     int TestFiles,
-    int Packages);
+    int Packages,
+    int TypeScriptFilesWithoutTypes);
 
 public record RecentJobEntryDto(
     string RelativePath,

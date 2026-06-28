@@ -50,10 +50,10 @@ public class MemoryTools
     }
 
     [McpServerTool(Name = "store_memory")]
-    [Description("Store a new memory with automatic conflict resolution. Duplicates are detected and reinforced. Singular-state tags (employment, residence, etc.) automatically supersede older memories. Good for: facts learned, user preferences, decisions made, important context.")]
+    [Description("Store a new memory. REQUIRED: title (short label) and summary (1-2 sentences). Optional: content, tags, importance. Duplicates are detected and reinforced; singular-state tags (employment, residence, etc.) automatically supersede older memories.")]
     public async Task<string> StoreMemory(
-        [Description("Short, descriptive title (used in search results)")] string title,
-        [Description("1-2 sentence summary of the key information")] string summary,
+        [Description("(Required) Short, descriptive title used in search results — e.g. 'User prefers dark mode'")] string title,
+        [Description("(Required) 1-2 sentence summary of the key information")] string summary,
         [Description("Full details, context, and any relevant information")] string? content = null,
         [Description("Categorization tags. Singular-state tags (employment, residence, relationship-status) auto-supersede older memories with the same tag.")] string[]? tags = null,
         [Description("Priority 0.0-1.0 (higher = slower decay). Default 0.5")] double importance = 0.5,

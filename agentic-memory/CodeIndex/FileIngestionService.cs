@@ -96,6 +96,12 @@ public sealed class FileIngestionService
             SubProjectNamespace = string.IsNullOrEmpty(subProjectId) ? "" : $"sub:{subProjectId}",
         };
 
+        // Record whether TypeScript types could resolve at index time (node_modules present). Drives the
+        // dashboard "indexed without node_modules" warning and the staleness scanner's auto-reindex.
+        if (record.Language == "typescript")
+            record.TypeScriptTypesResolved =
+                TypeScript.TypeScriptLibResolver.HasResolvableTypes(effectiveRoot ?? Path.GetDirectoryName(filePath)!);
+
         // Steps 3 & 4: extract context + symbols via the compiler provider
         string extractedContext;
         try

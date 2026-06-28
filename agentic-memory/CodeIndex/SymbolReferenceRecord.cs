@@ -26,7 +26,6 @@ public class SymbolReferenceRecord
 
     // ── P1 near-free rollups over UsedBy (denormalized, indexable) ────────────
     public int ExternalUseCount { get; set; }              // UsedBy count excluding the defining file
-    public bool IsOrphan { get; set; }                     // ExternalUseCount == 0 — dead-code candidate
     public List<string> TestedByFileIds { get; set; } = []; // subset of UsedBy whose file IsTestFile
 
     public DateTime UpdatedAt { get; set; }

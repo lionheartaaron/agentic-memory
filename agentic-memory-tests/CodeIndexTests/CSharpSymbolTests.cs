@@ -209,4 +209,46 @@ public class CSharpSymbolTests(CodeIndexFixture fixture)
         var blocking = await fixture.GetSymbolAsync("Variety.cs", "Blocking");
         Assert.True(blocking.BlocksOnAsync);
     }
+
+    [Theory]
+    [InlineData("this[]", "indexer")]
+    [InlineData("operator +", "operator")]
+    [InlineData("operator int", "operator")]
+    [InlineData("ExNestedDelegate", "delegate")]
+    [InlineData("ExTopDelegate", "delegate")]
+    public async Task Exotic_declaration_forms_are_extracted(string name, string kind)
+    {
+        var sym = await fixture.GetSymbolAsync("Exotic.cs", name);
+        Assert.Equal(kind, sym.Kind);
+    }
+
+    [Fact]
+    public async Task Multi_declarator_field_emits_every_variable()
+    {
+        var rec = await fixture.GetRecordAsync("Exotic.cs");
+        Assert.Contains(rec.Symbols, s => s.Name == "ExA" && s.Kind == "field");
+        Assert.Contains(rec.Symbols, s => s.Name == "ExB" && s.Kind == "field");
+    }
+
+    [Fact]
+    public async Task Class_primary_constructor_is_extracted_with_parameters()
+    {
+        var ctor = await fixture.GetSymbolAsync("Exotic.cs", "ExoticService()");
+        Assert.Equal("constructor", ctor.Kind);
+        Assert.Contains(ctor.Parameters, p => p.Name == "seed");
+    }
+
+    [Fact]
+    public async Task Destructor_is_extracted()
+    {
+        var dtor = await fixture.GetSymbolAsync("Exotic.cs", "~ExoticFinalizer()");
+        Assert.Equal("destructor", dtor.Kind);
+    }
+
+    [Fact]
+    public async Task Non_typescript_files_have_no_type_resolution_flag()
+    {
+        var domain = await fixture.GetRecordAsync("Domain.cs");
+        Assert.Null(domain.TypeScriptTypesResolved); // flag is TS-only
+    }
 }

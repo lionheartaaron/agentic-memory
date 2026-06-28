@@ -18,7 +18,7 @@ namespace AgenticMemoryTests.CodeIndexTests;
 /// running on its dedicated thread — exactly as in production — and we block until it drains.
 ///
 /// Embeddings and LLM summaries are disabled (no model downloads): the structural index, references,
-/// orphans, domain facts and manifests are all fully exercised; semantic-search assertions live
+/// domain facts and manifests are all fully exercised; semantic-search assertions live
 /// elsewhere and are gated on availability.
 /// </summary>
 public sealed class CodeIndexFixture : IAsyncLifetime

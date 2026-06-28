@@ -44,18 +44,21 @@ public class CodeIndexRecord
     public List<string> TypeHierarchy { get; set; } = [];  // ["implements ISearchService","extends BaseRepo"]
     public string DiagnosticSummary   { get; set; } = "";  // compiler errors, condensed (UI only, not embedded)
 
-    // ── P1 near-free rollups (test linkage + dead-code; indexable scalars) ─────
+    // ── P1 near-free rollups (test linkage; indexable scalars) ─────────────
     public bool IsTestFile { get; set; }                   // declared convention: references a known test framework
     public string? TestFramework { get; set; }             // "xunit" | "nunit" | "mstest" | "vitest" | "jest"
     public List<string> TestSubjectFileIds { get; set; } = []; // for a test file: production files it references
-    public bool HasUnusedPublicSymbols { get; set; }       // any public/exported symbol with zero external use
-    public int OrphanSymbolCount { get; set; }             // count of this file's symbols with zero external use
 
     public bool HasValidation { get; set; }                // any symbol carries a validation rule (P2, indexable)
 
     // ── P6: architectural orientation (indexable scalars) ─────────────────────
     public string? ArchitecturalRole { get; set; }         // controller/service/repository/component/page/… (from the file classifier)
     public bool IsEntrypoint { get; set; }                 // Program.cs / Main / app entry
+
+    // For TypeScript files only: true when the file was indexed with full type resolution
+    // (node_modules/typescript present), false when indexed in degraded/type-less mode (references and
+    // type info are import-only), null for non-TS files. Drives the dashboard warning + auto-reindex.
+    public bool? TypeScriptTypesResolved { get; set; }
 }
 
 /// <summary>

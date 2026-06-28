@@ -1,6 +1,5 @@
 {
-  "inputs": [],
-  "servers": {
+  "mcpServers": {
     "agentic-memory": {
       "type": "http",
       "url": "http://localhost:3377/mcp",

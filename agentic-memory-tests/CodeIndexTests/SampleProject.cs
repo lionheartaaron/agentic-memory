@@ -338,6 +338,110 @@ internal static class SampleProject
             public class DerivedHook : BaseHook { public override void Hook() { } }
             """,
 
+        // Declaration-shape permutations for "View source" span correctness. Every block body carries
+        // a unique VSMARK_* token so a test can prove the slice captured the WHOLE body.
+        ["backend/ViewSource.cs"] = """
+            using System;
+
+            namespace Backend.ViewSrc;
+
+            public class VsHost
+            {
+                public int VsExpr() => 42;
+
+                public int VsBlock()
+                {
+                    var x = 1; // VSMARK_BLOCK
+                    return x;
+                }
+
+                public int VsMultiSig(
+                    int a,
+                    int b)
+                {
+                    return a + b; // VSMARK_MULTISIG
+                }
+
+                [Obsolete("x")]
+                public int VsAttr()
+                {
+                    return 0; // VSMARK_ATTR
+                }
+
+                public T VsGeneric<T>(T input)
+                    where T : class
+                {
+                    return input; // VSMARK_GENERIC
+                }
+
+                public int VsAuto { get; set; }
+
+                public int VsProp
+                {
+                    get { return _backing; } // VSMARK_PROP
+                    set { _backing = value; }
+                }
+                private int _backing;
+
+                public int VsExprProp => _backing;
+
+                public const int VsConst = 7;
+
+                public event Action? VsEvent;
+
+                public VsHost()
+                {
+                    VsAuto = 1; // VSMARK_CTOR
+                }
+            }
+
+            public interface IVsShape
+            {
+                int VsArea();
+            }
+
+            public record VsRecord(int VsFirst, string VsSecond);
+
+            public enum VsEnum
+            {
+                VsA = 1,
+                VsB = 2,
+            }
+
+            public struct VsStruct
+            {
+                public int VsX; // VSMARK_STRUCT
+            }
+            """,
+
+        // Less-common C# declaration forms — to audit/guarantee extraction completeness.
+        ["backend/Exotic.cs"] = """
+            using System;
+
+            namespace Backend.Exotic;
+
+            public class ExoticHost
+            {
+                public int this[int i] => i;
+                public static ExoticHost operator +(ExoticHost a, ExoticHost b) => a;
+                public static implicit operator int(ExoticHost h) => 0;
+                public int ExA, ExB;
+                public delegate int ExNestedDelegate(int x);
+            }
+
+            public delegate void ExTopDelegate(string s);
+
+            public class ExoticService(int seed)
+            {
+                public int Seed => seed;
+            }
+
+            public class ExoticFinalizer
+            {
+                ~ExoticFinalizer() { }
+            }
+            """,
+
         ["backend/RoleConsumer.cs"] = """
             namespace Backend;
 
@@ -426,6 +530,7 @@ internal static class SampleProject
             """,
 
         ["web/src/models.ts"] = """
+            /** A user in the system. */
             export interface User {
               id: string;
               name: string;
@@ -433,18 +538,184 @@ internal static class SampleProject
 
             export type Identifier = string;
 
+            export enum Role {
+              Admin = 1,
+              Member = 2,
+            }
+
             export class Repository<T> {
               private items: T[] = [];
+              static empty = 0;
+
+              /** Adds an item to the repository. */
               add(item: T): void {
                 this.items.push(item);
               }
+
               all(): T[] {
+                return this.items;
+              }
+
+              get count(): number {
+                return this.items.length;
+              }
+
+              /** @deprecated use all() instead */
+              legacy(): T[] {
                 return this.items;
               }
             }
 
             export function makeUser(id: string, name: string): User {
               return { id, name };
+            }
+
+            export async function loadUser(id: string): Promise<User> {
+              const res = await fetch("/api/users");
+              return res.json();
+            }
+
+            export function identity<T>(value: T): T {
+              return value;
+            }
+            """,
+
+        ["web/src/consumer.ts"] = """
+            import { Repository, makeUser } from "./models";
+
+            export function buildRepo(): Repository<unknown> {
+              const repo = new Repository();
+              repo.add(makeUser("1", "Ada"));
+              return repo;
+            }
+            """,
+
+        // TS declaration-shape permutations for "View source" span correctness (VSMARK_* in bodies).
+        ["web/src/viewsource.ts"] = """
+            export const vsArrow = (a: number): number => a + 1;
+
+            export const vsArrowBlock = (a: number): number => {
+              const x = a; // VSMARK_ARROWBLOCK
+              return x;
+            };
+
+            export function vsFunc(a: number): number {
+              const x = a; // VSMARK_FUNC
+              return x;
+            }
+
+            export function vsMultiSig(
+              a: number,
+              b: number
+            ): number {
+              return a + b; // VSMARK_MULTISIG
+            }
+
+            export async function vsAsync(): Promise<number> {
+              return 1; // VSMARK_ASYNC
+            }
+
+            export interface VsShape {
+              area: number;
+              name: string;
+            }
+
+            export type VsUnion =
+              | "a"
+              | "b";
+
+            export enum VsEnum2 {
+              A = 1,
+              B = 2,
+            }
+
+            export class VsClass {
+              private x = 0;
+
+              vsMethod(): number {
+                return this.x; // VSMARK_METHOD
+              }
+
+              get vsGetter(): number {
+                return this.x; // VSMARK_GETTER
+              }
+            }
+
+            export default function VsDefault(): number {
+              return 7; // VSMARK_DEFAULT
+            }
+            """,
+
+        // Default-exported component + default-import + JSX usage — the React orphan-false-positive repro.
+        ["web/src/Card.tsx"] = """
+            export default function Card(): string {
+              return "card";
+            }
+            """,
+
+        ["web/src/CardConsumer.tsx"] = """
+            import { Routes } from "react-router-dom";
+            import Card from "./Card";
+
+            export function CardView() {
+              return (
+                <Routes>
+                  <Card />
+                </Routes>
+              );
+            }
+            """,
+
+        // Less-common TS declaration forms — extraction-completeness audit.
+        ["web/src/exotic.ts"] = """
+            export namespace ExNs {
+              export function nsFunc(): number {
+                return 1;
+              }
+            }
+
+            export const enum ExConstEnum {
+              A,
+              B,
+            }
+
+            export abstract class ExAbstract {
+              abstract doThing(): void;
+            }
+
+            export const { exDestructuredA, exDestructuredB } = { exDestructuredA: 1, exDestructuredB: 2 };
+
+            export default function () {
+              return 42;
+            }
+            """,
+
+        ["web/src/hooks.ts"] = """
+            import { useMutation, useQueryClient } from "@tanstack/react-query";
+            import { useNavigate } from "react-router-dom";
+
+            export function useCreateOrder() {
+              const queryClient = useQueryClient();
+              const navigate = useNavigate();
+              return useMutation({
+                mutationFn: (name: string) => fetch("/api/orders", { method: "POST", body: name }),
+                onSuccess: () => {
+                  queryClient.invalidateQueries({ queryKey: ["orders"] });
+                  navigate("/orders");
+                },
+              });
+            }
+            """,
+
+        ["web/src/OrdersPage.tsx"] = """
+            import { Link } from "react-router-dom";
+
+            export function OrdersPage(): string {
+              return "orders";
+            }
+
+            export function NewOrderLink() {
+              return <Link to="/orders/new">New order</Link>;
             }
             """,
     };

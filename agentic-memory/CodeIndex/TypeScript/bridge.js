@@ -21,7 +21,8 @@ var tsHost = {
             noEmit: s.noEmit, allowJs: s.allowJs,
             allowSyntheticDefaultImports: s.allowSyntheticDefaultImports,
             esModuleInterop: s.esModuleInterop, resolveJsonModule: s.resolveJsonModule,
-            moduleResolution: s.moduleResolution
+            moduleResolution: s.moduleResolution,
+            skipLibCheck: s.skipLibCheck, skipDefaultLibCheck: s.skipDefaultLibCheck
         };
     },
     getScriptFileNames:      function()         { return dotnetArrayToJs(nativeHost.GetScriptFileNames()); },
@@ -332,16 +333,19 @@ function getFileInfo(fileName) {
 // Kind names are normalised to short friendly names ('Function', 'Variable',
 // 'Class', …) so they align with the C# Roslyn provider's naming and the
 // SymbolsIndex kind filter in the dashboard.
+// Canonical lowercase kinds, aligned with the C# Roslyn provider (and the dashboard's lowercase
+// 'method'/'function'/'constructor' expectations) so an agent sees ONE vocabulary across languages.
 var _KIND_MAP = {
-    ClassDeclaration:     'Class',
-    InterfaceDeclaration: 'Interface',
-    FunctionDeclaration:  'Function',
-    EnumDeclaration:      'Enum',
-    TypeAliasDeclaration: 'TypeAlias',
-    VariableDeclaration:  'Variable',
+    ClassDeclaration:     'class',
+    InterfaceDeclaration: 'interface',
+    FunctionDeclaration:  'function',
+    EnumDeclaration:      'enum',
+    TypeAliasDeclaration: 'type-alias',
+    VariableDeclaration:  'variable',
+    ModuleDeclaration:    'namespace',
 };
 function toFriendlyKind(syntaxKindName) {
-    return _KIND_MAP[syntaxKindName] || syntaxKindName;
+    return _KIND_MAP[syntaxKindName] || syntaxKindName.toLowerCase();
 }
 
 // ── P1 Tier 0 helpers: structured symbol shape (camelCase keys map onto the C# SymbolInfo) ────
@@ -378,6 +382,20 @@ function tsDeclName(node, sf) {
         return node.parent.name.getText(sf);
     }
     return null;
+}
+
+// True when this identifier IS the name of a declaration (not a usage). The C# index never records
+// declaration sites because a declaration name is a token, not an IdentifierNameSyntax — TS must
+// skip them explicitly or every symbol gains a spurious self-reference.
+function tsIsDeclarationName(node) {
+    var p = node.parent;
+    if (!p || p.name !== node) return false;
+    return ts.isClassDeclaration(p) || ts.isInterfaceDeclaration(p) || ts.isFunctionDeclaration(p) ||
+           ts.isEnumDeclaration(p) || ts.isEnumMember(p) || ts.isTypeAliasDeclaration(p) ||
+           ts.isVariableDeclaration(p) || ts.isParameter(p) ||
+           ts.isMethodDeclaration(p) || ts.isMethodSignature(p) ||
+           ts.isPropertyDeclaration(p) || ts.isPropertySignature(p) ||
+           ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p);
 }
 
 // P2: usage-kind label for a reference identifier (mirrors C# ProjectIndex.ClassifyRole).
@@ -463,6 +481,81 @@ function tsEnumMembers(enumNode, sf) {
     });
 }
 
+// Return type of a function-like declaration. The C# provider reports a method's return type (not
+// the whole signature) as Type; match that so the two languages agree.
+function tsReturnType(node, sf, tc) {
+    try {
+        var sig = tc.getSignatureFromDeclaration(node);
+        if (sig) return tc.typeToString(tc.getReturnTypeOfSignature(sig));
+    } catch (e) {}
+    return null;
+}
+
+// Unwrap Promise<T> → T (the TS analog of the C# provider's Task<T>/ValueTask<T> unwrap), so an
+// async function's "real" return type is available in one place across both languages.
+function tsUnwrapPromise(typeStr) {
+    if (!typeStr) return null;
+    var m = /^Promise<([\s\S]+)>$/.exec(typeStr);
+    return m ? m[1] : null;
+}
+
+function tsMemberKind(m) {
+    if (ts.isMethodDeclaration(m) || ts.isMethodSignature(m)) return 'method';
+    if (ts.isGetAccessorDeclaration(m) || ts.isSetAccessorDeclaration(m)) return 'property';
+    if (ts.isPropertyDeclaration(m) || ts.isPropertySignature(m)) return 'property';
+    if (ts.isConstructorDeclaration(m)) return 'constructor';
+    return null;
+}
+
+// Emit method / property / constructor symbols for a class or interface body. The previous
+// non-recursive top-level walk dropped every member, so an agent saw a class with no methods.
+function tsEmitMembers(typeNode, typeName, sf, tc, out) {
+    if (!typeNode.members) return;
+    for (var i = 0; i < typeNode.members.length; i++) {
+        var m = typeNode.members[i];
+        var mk = tsMemberKind(m);
+        if (!mk) continue;
+        var mname = mk === 'constructor' ? 'constructor' : (m.name ? m.name.getText(sf) : null);
+        if (!mname) continue;
+        var mmods = tsModifiers(m);
+        var maccess = mmods.indexOf('private') >= 0 ? 'private'
+                    : mmods.indexOf('protected') >= 0 ? 'protected' : 'public';
+        var isFnLike = (mk === 'method' || mk === 'constructor');
+        var mtype = null;
+        var mUnwrap = null;
+        if (isFnLike) {
+            mtype = tsReturnType(m, sf, tc);
+            mUnwrap = tsUnwrapPromise(mtype);
+        } else if (m.name) {
+            try {
+                var msym = tc.getSymbolAtLocation(m.name);
+                if (msym) mtype = tc.typeToString(tc.getTypeOfSymbolAtLocation(msym, m));
+            } catch (e) {}
+        }
+        var mdoc = tsDoc(m);
+        var anchor = m.name || m;
+        out.push({
+            name: mname,
+            kind: mk,
+            type: mtype,
+            accessibility: maccess,
+            line: sf.getLineAndCharacterOfPosition(anchor.getStart()).line + 1,
+            endLine: endLineOf(m, sf),
+            modifiers: mmods,
+            isStatic: mmods.indexOf('static') >= 0,
+            isAbstract: mmods.indexOf('abstract') >= 0,
+            isAsync: mmods.indexOf('async') >= 0,
+            isAwaitable: !!mUnwrap || mmods.indexOf('async') >= 0,
+            returnTypeUnwrapped: mUnwrap,
+            parameters: isFnLike ? tsParams(m, sf, tc) : [],
+            typeParameters: mk === 'method' ? tsTypeParams(m, sf) : [],
+            docSummary: mdoc.summary,
+            isDeprecated: mdoc.deprecated,
+            containingTypeFullName: typeName
+        });
+    }
+}
+
 function getSymbols(fileName) {
     var program = langService.getProgram();
     if (!program) return [];
@@ -471,27 +564,48 @@ function getSymbols(fileName) {
     var tc = program.getTypeChecker();
     var results = [];
 
-    ts.forEachChild(sf, function(node) {
+    function processNode(node) {
         // Check modifiers directly — getCombinedModifierFlags can return 0 for exported
         // nodes in some TypeScript 5.x builds running inside ClearScript/V8.
         var modifiers = tsModifiers(node);
-        var isExported = modifiers.indexOf('export') >= 0;
-        var accessibility = isExported ? 'exported' : 'public';
+        // Exported = the external API surface → 'public'; module-scoped → 'internal'. Same vocabulary
+        // the C# provider uses, so accessibility means the same thing across languages.
+        var accessibility = modifiers.indexOf('export') >= 0 ? 'public' : 'internal';
         var doc = tsDoc(node);
 
-        // VariableStatement: export const Foo = () => {} / export const api = { ... }
+        // VariableStatement: export const Foo = () => {} / export const api = { ... } / destructured.
         if (ts.isVariableStatement(node)) {
             node.declarationList.declarations.forEach(function(decl) {
-                if (!decl.name || !ts.isIdentifier(decl.name)) return;
+                if (!decl.name) return;
+                if (!ts.isIdentifier(decl.name)) {
+                    // Destructured export: export const { a, b } = ... / export const [x] = ...
+                    var elems = (ts.isObjectBindingPattern(decl.name) || ts.isArrayBindingPattern(decl.name))
+                        ? decl.name.elements : [];
+                    elems.forEach(function(el) {
+                        if (!el.name || !ts.isIdentifier(el.name)) return;
+                        var esym = tc.getSymbolAtLocation(el.name);
+                        results.push({
+                            name: el.name.text, kind: 'variable',
+                            type: esym ? tc.typeToString(tc.getTypeOfSymbolAtLocation(esym, el)) : null,
+                            accessibility: accessibility,
+                            line: sf.getLineAndCharacterOfPosition(el.name.getStart()).line + 1,
+                            endLine: endLineOf(el, sf), modifiers: modifiers,
+                            docSummary: doc.summary, isDeprecated: doc.deprecated
+                        });
+                    });
+                    return;
+                }
                 var sym = tc.getSymbolAtLocation(decl.name);
                 if (!sym) return;
-                var type = tc.typeToString(tc.getTypeOfSymbolAtLocation(sym, decl));
                 var fn = (decl.initializer &&
                     (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer)))
                     ? decl.initializer : null;
+                var type = fn ? tsReturnType(fn, sf, tc)
+                              : tc.typeToString(tc.getTypeOfSymbolAtLocation(sym, decl));
+                var vUnwrap = fn ? tsUnwrapPromise(type) : null;
                 results.push({
                     name: decl.name.text,
-                    kind: fn ? 'Function' : 'Variable',
+                    kind: fn ? 'function' : 'variable',
                     type: type,
                     accessibility: accessibility,
                     line: sf.getLineAndCharacterOfPosition(decl.name.getStart()).line + 1,
@@ -499,7 +613,9 @@ function getSymbols(fileName) {
                     modifiers: modifiers,
                     isStatic: modifiers.indexOf('static') >= 0,
                     isAbstract: modifiers.indexOf('abstract') >= 0,
-                    isAsync: fn ? !!(fn.modifiers && tsModifiers(fn).indexOf('async') >= 0) : false,
+                    isAsync: fn ? (tsModifiers(fn).indexOf('async') >= 0) : false,
+                    isAwaitable: fn ? (!!vUnwrap || tsModifiers(fn).indexOf('async') >= 0) : false,
+                    returnTypeUnwrapped: vUnwrap,
                     parameters: fn ? tsParams(fn, sf, tc) : [],
                     typeParameters: fn ? tsTypeParams(fn, sf) : [],
                     docSummary: doc.summary,
@@ -509,29 +625,48 @@ function getSymbols(fileName) {
             return;
         }
 
-        if (!node.name || !ts.isIdentifier(node.name)) return;
-        var sym = tc.getSymbolAtLocation(node.name);
-        if (!sym) return;
-        var type = tc.typeToString(tc.getTypeOfSymbolAtLocation(sym, node));
+        // Named declaration, or an anonymous `export default function/class` (synthetic name "default").
+        var declName = (node.name && ts.isIdentifier(node.name)) ? node.name.text
+            : (modifiers.indexOf('default') >= 0 &&
+               (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) ? 'default' : null);
+        if (declName === null) return;
+
         var isFn = ts.isFunctionDeclaration(node);
+        var nsym = node.name ? tc.getSymbolAtLocation(node.name) : null;
+        var ntype = isFn ? tsReturnType(node, sf, tc)
+                         : (nsym ? tc.typeToString(tc.getTypeOfSymbolAtLocation(nsym, node)) : null);
+        var nUnwrap = isFn ? tsUnwrapPromise(ntype) : null;
         results.push({
-            name: node.name.text,
+            name: declName,
             kind: toFriendlyKind(ts.SyntaxKind[node.kind]),
-            type: type,
+            type: ntype,
             accessibility: accessibility,
-            line: sf.getLineAndCharacterOfPosition(node.name.getStart()).line + 1,
+            line: sf.getLineAndCharacterOfPosition((node.name || node).getStart()).line + 1,
             endLine: endLineOf(node, sf),
             modifiers: modifiers,
             isStatic: modifiers.indexOf('static') >= 0,
             isAbstract: modifiers.indexOf('abstract') >= 0,
             isAsync: modifiers.indexOf('async') >= 0,
+            isAwaitable: isFn && (!!nUnwrap || modifiers.indexOf('async') >= 0),
+            returnTypeUnwrapped: nUnwrap,
             parameters: isFn ? tsParams(node, sf, tc) : [],
             typeParameters: tsTypeParams(node, sf),
             enumMembers: ts.isEnumDeclaration(node) ? tsEnumMembers(node, sf) : [],
             docSummary: doc.summary,
             isDeprecated: doc.deprecated
         });
-    });
+
+        // Recurse into class / interface bodies so members are surfaced (with their containing type).
+        if (ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node)) {
+            tsEmitMembers(node, declName, sf, tc, results);
+        }
+        // Namespace members: recurse into the module body.
+        if (ts.isModuleDeclaration(node) && node.body && node.body.statements) {
+            ts.forEachChild(node.body, processNode);
+        }
+    }
+
+    ts.forEachChild(sf, processNode);
     return results;
 }
 
@@ -563,27 +698,51 @@ function buildReferenceIndex() {
     // per name wins — same policy as Roslyn's BuildReferenceIndex.
     var declSymbols = {};   // name → ts.Symbol of the canonical declaration
     var declaredNames = {}; // name → true  (fast pre-filter before checker call)
+    var defaultExportByNormPath = {}; // normalised file path → name of its default export
 
     for (var si = 0; si < sources.length; si++) {
         var sf0 = sources[si];
-        ts.forEachChild(sf0, function(node) {
-            function addDecl(nameNode) {
-                if (!nameNode || !ts.isIdentifier(nameNode)) return;
-                var name = nameNode.text;
-                if (declaredNames[name]) return; // first wins
-                var sym = checker.getSymbolAtLocation(nameNode);
-                if (!sym) return;
-                declSymbols[name]  = sym;
-                declaredNames[name] = true;
+        function addDecl(nameNode) {
+            if (!nameNode || !ts.isIdentifier(nameNode)) return;
+            var name = nameNode.text;
+            if (declaredNames[name]) return; // first wins
+            var sym = checker.getSymbolAtLocation(nameNode);
+            if (!sym) return;
+            declSymbols[name]  = sym;
+            declaredNames[name] = true;
+        }
+        var collectDecls = function(node) {
+            // Record the file's default export name so default imports (`import App from './App'`)
+            // resolve syntactically in Pass 3 when the type checker is degraded (missing lib/types).
+            var nmods = tsModifiers(node);
+            if (nmods.indexOf('export') >= 0 && nmods.indexOf('default') >= 0 &&
+                node.name && ts.isIdentifier(node.name)) {
+                defaultExportByNormPath[_normPath(sf0.fileName)] = node.name.text;
+            } else if (ts.isExportAssignment(node) && !node.isExportEquals &&
+                node.expression && ts.isIdentifier(node.expression)) {
+                defaultExportByNormPath[_normPath(sf0.fileName)] = node.expression.text;
             }
-            if (ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) ||
-                ts.isFunctionDeclaration(node) || ts.isEnumDeclaration(node) ||
+            if (ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node)) {
+                addDecl(node.name);
+                // Member-level declarations too, so `obj.method()` / `obj.prop` references are tracked
+                // (parity with the C# provider, which indexes every member).
+                if (node.members) node.members.forEach(function(m) {
+                    if (m.name && ts.isIdentifier(m.name) && tsMemberKind(m)) addDecl(m.name);
+                });
+            } else if (ts.isFunctionDeclaration(node) || ts.isEnumDeclaration(node) ||
                 ts.isTypeAliasDeclaration(node)) {
                 addDecl(node.name);
             } else if (ts.isVariableStatement(node)) {
-                node.declarationList.declarations.forEach(function(d) { addDecl(d.name); });
+                node.declarationList.declarations.forEach(function(d) {
+                    if (ts.isIdentifier(d.name)) addDecl(d.name);
+                    else if (ts.isObjectBindingPattern(d.name) || ts.isArrayBindingPattern(d.name))
+                        d.name.elements.forEach(function(el) { if (el.name) addDecl(el.name); }); // destructured export
+                });
+            } else if (ts.isModuleDeclaration(node) && node.body && node.body.statements) {
+                ts.forEachChild(node.body, collectDecls); // namespace members
             }
-        });
+        };
+        ts.forEachChild(sf0, collectDecls);
     }
 
     // Pass 2: single traversal of all files; for every identifier whose text matches a
@@ -598,12 +757,27 @@ function buildReferenceIndex() {
             var dn = tsDeclName(node, sf2);
             if (dn) encStack.push(dn);
 
-            if (ts.isIdentifier(node) && declaredNames[node.text]) {
+            if (ts.isIdentifier(node) && declaredNames[node.text] && !tsIsDeclarationName(node)) {
                 var sym = checker.getSymbolAtLocation(node);
                 if (sym) {
-                    var resolved = (sym.flags & 2097152) ? checker.getAliasedSymbol(sym) : sym;
+                    var isAlias = (sym.flags & 2097152) !== 0;
+                    var resolved = isAlias ? checker.getAliasedSymbol(sym) : sym;
                     var name = node.text;
-                    if (declSymbols[name] && resolved === declSymbols[name]) {
+                    var canonical = declSymbols[name];
+                    // Match by symbol identity; by shared declaration node (instantiated generic
+                    // members — the analog of Roslyn's OriginalDefinition); or, for an imported alias of
+                    // a project-declared name, by the name. getAliasedSymbol frequently yields a
+                    // declaration-LESS export symbol cross-file (no node/name to compare), so the
+                    // `declaredNames` pre-filter is the guard: `name` is always a project declaration.
+                    // The rare miss (a renamed external import colliding with a project name) errs
+                    // toward "used" — the safe direction for orphan detection.
+                    var matches = !!canonical && (
+                        resolved === canonical ||
+                        (resolved && resolved.declarations && canonical.declarations &&
+                         resolved.declarations.length && canonical.declarations.length &&
+                         resolved.declarations[0] === canonical.declarations[0]) ||
+                        isAlias);
+                    if (matches) {
                         var lc = sf2.getLineAndCharacterOfPosition(node.getStart());
                         if (!index[name]) index[name] = [];
                         index[name].push({
@@ -636,13 +810,6 @@ function buildReferenceIndex() {
 
             var clause = iNode.importClause;
             if (!clause) return;
-            var names = [];
-            if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
-                clause.namedBindings.elements.forEach(function(el) {
-                    names.push(el.name.text);
-                });
-            }
-            if (!names.length) return;
 
             // Candidate absolute paths the module specifier could resolve to
             var base = _joinPath(dir3, modText);
@@ -650,27 +817,41 @@ function buildReferenceIndex() {
                 base + '.ts', base + '.tsx',
                 base + '/index.ts', base + '/index.tsx'
             ];
+            var importLine = sf3.getLineAndCharacterOfPosition(iNode.getStart()).line + 1;
 
-            names.forEach(function(name) {
-                if (!declaredNames[name]) return;
-                // Already recorded by Pass 2 for this file — skip
+            function recordImport(name) {
+                if (!name || !declaredNames[name]) return;
                 if (index[name] && index[name].some(function(r) { return r.filePath === sf3.fileName; })) return;
+                if (!index[name]) index[name] = [];
+                index[name].push({ filePath: sf3.fileName, line: importLine, context: name, role: 'import' });
+            }
 
-                var sym = declSymbols[name];
-                if (!sym || !sym.declarations || !sym.declarations.length) return;
-                var declSf = sym.declarations[0].getSourceFile();
-                if (!declSf) return;
-                var normDecl = _normPath(declSf.fileName);
-
-                for (var ci = 0; ci < candidates.length; ci++) {
-                    if (_normPath(candidates[ci]) === normDecl) {
-                        if (!index[name]) index[name] = [];
-                        var lc = sf3.getLineAndCharacterOfPosition(iNode.getStart());
-                        index[name].push({ filePath: sf3.fileName, line: lc.line + 1, context: name, role: 'import' });
-                        break;
+            // Named imports — match each name against the file that declares it.
+            if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+                clause.namedBindings.elements.forEach(function(el) {
+                    var name = el.name.text;
+                    if (!declaredNames[name]) return;
+                    var sym = declSymbols[name];
+                    if (!sym || !sym.declarations || !sym.declarations.length) return;
+                    var declSf = sym.declarations[0].getSourceFile();
+                    if (!declSf) return;
+                    var normDecl = _normPath(declSf.fileName);
+                    for (var ci = 0; ci < candidates.length; ci++) {
+                        if (_normPath(candidates[ci]) === normDecl) { recordImport(name); break; }
                     }
+                });
+            }
+
+            // Default import (`import App from './App'`): resolve the module to the file's default
+            // export — the local binding name is irrelevant. Without this, every default-exported
+            // React component (App, the pages, Layout, …) is a false orphan whenever the checker is
+            // degraded (no node_modules types) and Pass 2 resolves nothing.
+            if (clause.name && ts.isIdentifier(clause.name)) {
+                for (var di = 0; di < candidates.length; di++) {
+                    var defName = defaultExportByNormPath[_normPath(candidates[di])];
+                    if (defName) { recordImport(defName); break; }
                 }
-            });
+            }
         });
     }
 

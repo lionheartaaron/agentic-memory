@@ -188,7 +188,6 @@ function FileRow({
         <div className="flex items-center gap-2 flex-shrink-0">
           {file.isEntrypoint && <Chip tone="green" title="entrypoint"><Zap className="w-2.5 h-2.5" />entry</Chip>}
           {file.isTestFile && <Chip tone="sky" title={file.testFramework ?? 'test file'}><FlaskConical className="w-2.5 h-2.5" />test</Chip>}
-          {(file.orphanSymbolCount ?? 0) > 0 && <Chip tone="orange" title="public symbols with no references anywhere">{file.orphanSymbolCount} orphan</Chip>}
           {file.score != null && <ScoreBadge score={file.score} />}
           {langBadge(file.language)}
           <span className="text-xs text-zinc-500 tabular-nums">{file.symbols.length} sym</span>
@@ -280,7 +279,6 @@ function FileRow({
             {file.isEntrypoint && <Chip tone="green"><Zap className="w-2.5 h-2.5" />entrypoint</Chip>}
             {file.isTestFile && <Chip tone="sky"><FlaskConical className="w-2.5 h-2.5" />{file.testFramework ?? 'test'}</Chip>}
             {file.hasValidation && <Chip tone="green"><ShieldCheck className="w-2.5 h-2.5" />validated DTOs</Chip>}
-            {file.hasUnusedPublicSymbols && <Chip tone="orange"><Trash2 className="w-2.5 h-2.5" />{file.orphanSymbolCount ?? 0} orphan symbol(s)</Chip>}
             <span className="ml-auto flex items-center gap-1.5">
               <span className="text-[10px] text-indigo-400 tabular-nums" title="files depending on this">↙{fanIn} in</span>
               <span className="text-[10px] text-emerald-400 tabular-nums" title="files this depends on">↗{fanOut} out</span>

@@ -308,8 +308,9 @@ public sealed class LiteDbCodeIndexRepository : ICodeIndexRepository
                 ? _symRefCol.Find(r => r.ProjectId == projectId)
                 : _symRefCol.FindAll();
 
-        if (!string.IsNullOrWhiteSpace(query))
-            candidates = candidates.Where(r => r.SymbolName.Contains(query, StringComparison.OrdinalIgnoreCase));
+        var q = query?.Trim() ?? "";
+        if (q.Length > 0)
+            candidates = candidates.Where(r => r.SymbolName.Contains(q, StringComparison.OrdinalIgnoreCase));
 
         if (publicOnly)
             candidates = candidates.Where(r => r.Accessibility is "public" or "exported" or "internal");
@@ -323,9 +324,40 @@ public sealed class LiteDbCodeIndexRepository : ICodeIndexRepository
         if (minFanIn > 0)
             candidates = candidates.Where(r => r.UsedBy.Count >= minFanIn);
 
-        return Task.FromResult<IReadOnlyList<SymbolReferenceRecord>>(
-            candidates.OrderByDescending(r => r.UsedBy.Count).ToList());
+        // Ranking — match quality FIRST, popularity second. An AI/MCP caller supplies a known symbol
+        // name and expects the exact symbol back, never a more-referenced near-name. So:
+        //   tier 0 = exact (case-insensitive) > tier 1 = prefix > tier 2 = substring,
+        // then fan-in (most-used wins ties), then visibility (public surface first), then the
+        // shortest/alphabetical name (closest to the query). With an empty query the tier is constant,
+        // so this collapses to the previous fan-in ordering.
+        var ranked = candidates
+            .OrderBy(r => MatchTier(r.SymbolName, q))
+            .ThenByDescending(r => r.UsedBy.Count)
+            .ThenBy(r => AccessibilityRank(r.Accessibility))
+            .ThenBy(r => r.SymbolName.Length)
+            .ThenBy(r => r.SymbolName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return Task.FromResult<IReadOnlyList<SymbolReferenceRecord>>(ranked);
     }
+
+    /// <summary>0 = exact, 1 = prefix, 2 = substring/other. Empty query → all symbols share tier 0.</summary>
+    private static int MatchTier(string name, string query)
+    {
+        if (query.Length == 0) return 0;
+        if (name.Equals(query, StringComparison.OrdinalIgnoreCase)) return 0;
+        if (name.StartsWith(query, StringComparison.OrdinalIgnoreCase)) return 1;
+        return 2;
+    }
+
+    /// <summary>Public API surface ranks ahead of internal/protected/private when all else is equal.</summary>
+    private static int AccessibilityRank(string accessibility) => accessibility switch
+    {
+        "public" or "exported" or "export" => 0,
+        "internal" => 1,
+        "protected" or "protected internal" => 2,
+        _ => 3,
+    };
 
     public Task<IReadOnlyList<SymbolReferenceRecord>> GetHotSymbolsAsync(
         string projectId, int topN = 20, CancellationToken ct = default)
