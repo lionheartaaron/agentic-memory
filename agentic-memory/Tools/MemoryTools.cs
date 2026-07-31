@@ -133,7 +133,7 @@ public class MemoryTools(
         var recorded = $" | recorded {r.Memory.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC";
 
         var contested = r.IsContradicted
-            ? "\n! Another memory in these results contradicts this one. Do not answer from it alone — "
+            ? "\n! Another memory in these results contradicts this one. Do not answer from it alone: "
               + "read both, prefer the more recently recorded, and check the contradictions listed below."
             : "";
 

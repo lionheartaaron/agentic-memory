@@ -231,9 +231,9 @@ public static class WebApplicationExtensions
                 // studio and the chat card render both without knowing which produced them.
                 Description =
                     $"newer: \"{PolarityDetector.Statement(fresh)}\" " +
-                    $"(recorded {fresh.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC) — " +
+                    $"(recorded {fresh.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC); " +
                     $"earlier: \"{PolarityDetector.Statement(existing)}\" " +
-                    $"(recorded {existing.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC) — {request.Reason}",
+                    $"(recorded {existing.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC); {request.Reason}",
             };
 
             await repository.ExecuteAsync(

@@ -69,7 +69,7 @@ A memory store that behaves more like human recall than a key-value cache.
 - **Hybrid retrieval:** ONNX SBERT embeddings (`all-MiniLM-L6-v2`, 384-dim), BM25F lexical ranking, trigram fuzzy matching, slot lookup and recency, fused by Reciprocal Rank Fusion and diversified with MMR.
 - **Scoped, not one flat pool:** every read is bounded by user, and by which companion is asking. Some facts are shared by all of a user's companions; others are private to one.
 - **Nothing is silently lost:** decay is a *ranking* signal only. Old memories are archived, superseded versions are kept as history, and a user-requested forget is tombstoned and restorable. Physical removal happens only on an explicit retention schedule.
-- **Conflict resolution on write:** near-duplicates reinforce; a replacement is allowed only when the slot, subject, scope and provenance say it is legal; a genuine contradiction is raised rather than resolved automatically.
+- **Conflict resolution on write:** near-duplicates reinforce; a replacement is allowed only when the slot, subject, scope and provenance say it is legal; a genuine contradiction is raised rather than resolved automatically. Three detectors cover the three ways a user contradicts himself: a registered slot changing value, a statement meeting its denial, and one value substituted for another in free text.
 - **Bitemporal:** memories carry both when they were learned and when they were true, so `AsOf` can answer a question as the store would have answered it at a past instant.
 
 ### 🔍 Code Intelligence
@@ -317,7 +317,7 @@ integration against. Highlights:
 | Area | Endpoints |
 |------|-----------|
 | **Memory** | `GET/POST /api/memory`, `GET/PUT/DELETE /api/memory/{id}`, `POST /api/memory/search`, `POST /api/memory/{id}/restore`, `GET /api/memory/{id}/history` |
-| **Slots & conflicts** | `GET /api/memory/{slots,slot,conflicts}`, `GET /api/memory/conflicts/{id}`, `POST /api/memory/conflicts/{id}/resolve` |
+| **Slots & conflicts** | `GET /api/memory/{slots,slot,conflicts}`, `GET /api/memory/conflicts/{id}`, `POST /api/memory/conflicts`, `POST /api/memory/conflicts/{id}/resolve` |
 | **Workspaces** | `GET/POST /api/workspaces`, `POST /api/workspaces/{id}/discover`, `.../activate`, `.../reindex`, `GET /api/workspaces/{id}/{sub-projects,files,stale-files,error-files}` |
 | **Code Intelligence** | `GET /api/workspaces/{id}/intelligence/{symbols,hotspots,entrypoints,graph,domain-facts,overview,semantic,manifests,file/{fileId}}` |
 | **Generation** | `POST /api/generate`, `POST /api/generate/stream` (SSE), `GET /api/generate/status` |
@@ -386,6 +386,31 @@ and provenance:
 A threshold alone cannot tell "contradicts" from "same topic": *"I love pizza"* and *"I love pasta"*
 sit well above any similarity bar, so the old rule deleted one food preference when you stored
 another. Nothing here is ever hard-deleted by conflict resolution.
+
+**The two contradictions the slot gate cannot see.** The gate only rules where both memories assert
+the same registered predicate, which leaves the ordinary ways people correct themselves uncovered:
+
+- **A statement and its denial.** *"I drink coffee every morning"* against *"I've stopped drinking
+  coffee"*. Candidates for this cannot be proposed by embedding distance, because sentence
+  embeddings are actively misleading about negation: *"no allergies"* measures **0.50** against
+  *"allergic to bears"*, further apart than plenty of unrelated pairs. So the pair is proposed on
+  wording instead, and the contradiction is recorded with both sides left active.
+- **One value substituted for another.** *"my car is a blue Corolla"* against *"my car is a red
+  Civic"*: no slot, no negation, so nothing rules on it. This one is deliberately **proposed and not
+  decided**, because the same wording shape covers *"a dog called Salt"* against *"a cat called
+  Pepper"*, which are both true. The store hands the pair back on `StoreResult.ContradictionCandidates`
+  and the caller's own model settles it, posting a yes to `POST /api/memory/conflicts`.
+
+**"I have none of those" is not a value.** *"I am not allergic to anything"* claims the allergies set
+is *empty*, so a later *"I am allergic to bears"* supersedes it even though `allergies` is
+multi-valued and multi-valued never supersedes. Only in that direction: retracting a recorded allergy
+back to "none" raises a conflict instead. Without this the denial stayed active beside the allergy,
+both scored identically on recall, and *"what am I allergic to"* could be answered either way.
+
+**Recall says which fact is current.** Every result carries the timestamp it was recorded at, to the
+second, and a result that is one side of an open contradiction is marked as such when the other side
+is in the same response. Ties on relevance break by recency, so a correction reads before the thing
+it corrected.
 
 **Settling one.** A raised conflict waits for a person. Both `list_conflicts` over MCP and
 `GET /api/memory/conflicts` return the contradiction with **both memories inlined**: title, value,

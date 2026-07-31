@@ -356,9 +356,9 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
             // read it no way to tell what the disagreement was, let alone which side was current.
             Description =
                 $"newer: \"{PolarityDetector.Statement(incoming)}\" " +
-                $"(recorded {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC) — " +
+                $"(recorded {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC); " +
                 $"earlier: \"{PolarityDetector.Statement(existing)}\" " +
-                $"(recorded {existing.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC) — {reason}",
+                $"(recorded {existing.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC); {reason}",
         };
 
     private static void Normalize(MemoryNodeEntity entity, MemoryScope scope)
