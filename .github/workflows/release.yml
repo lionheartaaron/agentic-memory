@@ -2,7 +2,8 @@ name: Release
 
 # Push a tag like "v1.3.0" to build and publish the server for every platform it runs on:
 # Windows, Linux and macOS, each on x64 and arm64. Every asset is a self-contained folder —
-# the .NET runtime is inside it — so a host machine needs nothing installed.
+# the .NET runtime is inside it — so a host machine needs nothing installed. Windows also gets a
+# portable zip, which is the same build plus the marker that keeps its data in its own folder.
 #
 # What is NOT in the assets: model weights. The embedding model (~90 MB) downloads on first
 # run; the generative model (~5 GB) only if Generation is enabled. See RELEASING.md.
@@ -110,12 +111,19 @@ jobs:
           # x64 Linux) can't be started here; nothing is compiled on the runner for them, the
           # runtime and every native dependency arrive prebuilt from NuGet, so the output is the
           # same as it would be on a native runner — it just goes out unexercised.
-          - { rid: win-x64,     os: windows-latest, archive: zip, native: true }
-          - { rid: win-arm64,   os: windows-latest, archive: zip, native: false }
-          - { rid: linux-x64,   os: ubuntu-latest,  archive: tar, native: true }
-          - { rid: linux-arm64, os: ubuntu-latest,  archive: tar, native: false }
-          - { rid: osx-arm64,   os: macos-latest,   archive: tar, native: true }
-          - { rid: osx-x64,     os: macos-15-intel, archive: tar, native: true }
+          #
+          # `portable: true` adds a second zip carrying the portable.txt marker. Windows only: an
+          # archive is the whole delivery mechanism on Windows, where "no installer, no registry,
+          # runs from a USB stick" is a thing people specifically look for, and the marker is what
+          # makes that true rather than merely implied. The tarballs are already extract-and-run
+          # for anyone who wants that, and giving every platform two assets would double the list
+          # to say something the .tar.gz users are not asking about.
+          - { rid: win-x64,     os: windows-latest, archive: zip, native: true,  portable: true }
+          - { rid: win-arm64,   os: windows-latest, archive: zip, native: false, portable: true }
+          - { rid: linux-x64,   os: ubuntu-latest,  archive: tar, native: true,  portable: false }
+          - { rid: linux-arm64, os: ubuntu-latest,  archive: tar, native: false, portable: false }
+          - { rid: osx-arm64,   os: macos-latest,   archive: tar, native: true,  portable: false }
+          - { rid: osx-x64,     os: macos-15-intel, archive: tar, native: true,  portable: false }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
@@ -267,16 +275,55 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path "staging/$env:PKG" -DestinationPath "dist/$env:PKG.zip"
 
+      # A second Windows asset that keeps every byte it writes inside its own folder. portable.txt
+      # is the marker AppPaths looks for: with it present the database, snapshots and logs resolve
+      # to <app>/Data instead of %LOCALAPPDATA%, so the install is one directory that can sit on a
+      # USB stick, be copied between machines, or be deleted without leaving anything behind.
+      #
+      # Built from the same staged output as the ordinary zip rather than from a second publish, so
+      # the two assets are the same program and differ only by the marker.
+      - name: Archive (portable zip)
+        if: matrix.portable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          # Braces around the variable: a bare $env:PKG-portable reads as one name up to the
+          # hyphen today, but the name is the last thing that should be left to parser precedence.
+          $portable = "portable/${env:PKG}-portable"
+          New-Item -ItemType Directory -Force -Path $portable | Out-Null
+          Copy-Item -Path "staging/${env:PKG}/*" -Destination $portable -Recurse
+
+          # The file's presence is the whole signal; AppPaths never reads the contents. It is
+          # written anyway, because the first thing someone does with an unexplained file in an
+          # application folder is open it, and the second is delete it.
+          Set-Content -Path "$portable/portable.txt" -Encoding utf8 -Value @(
+            'Portable mode.',
+            '',
+            'While this file exists, Agentic Memory keeps its database, snapshots and logs in the',
+            'Data folder beside the executable instead of in your user profile. Delete this file to',
+            'go back to the normal per-user location; move the Data folder yourself if you want to',
+            'keep what is already stored.'
+          )
+
+          Compress-Archive -Path $portable -DestinationPath "dist/${env:PKG}-portable.zip"
+
       - name: Checksum
         run: |
           cd dist
-          ARCHIVE=$(ls)
-          if command -v sha256sum > /dev/null 2>&1; then
-            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
-          else
-            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
-          fi
-          cat "${ARCHIVE}.sha256"
+          # Every archive, not the single one there used to be: Windows now produces an ordinary
+          # zip and a portable one, and `ls` returning two names would have silently checksummed
+          # neither correctly.
+          for archive in *.zip *.tar.gz; do
+            [ -e "$archive" ] || continue
+            if command -v sha256sum > /dev/null 2>&1; then
+              sha256sum "$archive" > "${archive}.sha256"
+            else
+              shasum -a 256 "$archive" > "${archive}.sha256"
+            fi
+          done
+          cat ./*.sha256
 
       - uses: actions/upload-artifact@v7
         with:

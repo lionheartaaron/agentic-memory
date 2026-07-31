@@ -71,6 +71,71 @@ jobs:
           --logger "trx;LogFileName=test-results-${{ matrix.os }}.trx"
           --results-directory TestResults
 
+      # Without this, a failing run says "Failed test were found" and nothing else: the reporter
+      # below writes its detail to the job summary, and the names and messages are otherwise only
+      # in the .trx artifact, which needs repository access to download. That makes a failure on a
+      # platform you do not develop on almost unreadable from outside. Printing each failure to the
+      # log and raising it as an annotation puts the reason on the run page itself.
+      #
+      # pwsh rather than bash because it parses XML without a dependency and is present on all
+      # three runner images.
+      - name: Report failing tests
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $files = @(Get-ChildItem TestResults -Filter *.trx -ErrorAction SilentlyContinue)
+          if ($files.Count -eq 0) {
+            Write-Host 'No .trx file was produced, so the run failed before or during the build.'
+            exit 0
+          }
+
+          # Workflow commands take the message on one line, and a literal % would be read as the
+          # start of an escape.
+          function Format-Data([string] $text) {
+            if (-not $text) { return '' }
+            $text.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+          }
+
+          $workspace = "$env:GITHUB_WORKSPACE".Replace('\', '/').TrimEnd('/')
+          $failed = 0
+
+          foreach ($file in $files) {
+            $xml = [xml](Get-Content $file.FullName -Raw)
+
+            foreach ($result in @($xml.TestRun.Results.UnitTestResult)) {
+              if ($result.outcome -ne 'Failed') { continue }
+              $failed++
+
+              $name    = $result.testName
+              $message = $result.Output.ErrorInfo.Message
+              $stack   = $result.Output.ErrorInfo.StackTrace
+
+              Write-Host ''
+              Write-Host "FAILED  $name"
+              Write-Host $message
+              Write-Host $stack
+
+              # Anchor the annotation on the test's own source line where the stack trace names it,
+              # so it is clickable in the diff rather than landing on the workflow file.
+              $location = ''
+              if ("$stack" -match '(?m) in (.+?):line (\d+)') {
+                $path = $Matches[1].Replace('\', '/')
+                if ($workspace -and $path.StartsWith($workspace)) {
+                  $path = $path.Substring($workspace.Length).TrimStart('/')
+                }
+                $location = "file=$path,line=$($Matches[2]),"
+              }
+
+              $title = (Format-Data $name).Replace(':', '%3A').Replace(',', '%2C')
+              Write-Host "::error ${location}title=$title::$(Format-Data "$message`n$stack")"
+            }
+          }
+
+          Write-Host ''
+          Write-Host "$failed failing test(s) across $($files.Count) result file(s)."
+
       - name: Publish test results
         uses: dorny/test-reporter@v3
         if: always()

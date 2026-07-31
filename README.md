@@ -4,6 +4,7 @@
 
 ### **A local-first context engine for AI agents: memory, code intelligence, and an on-device LLM**
 
+[![Release](https://img.shields.io/github/v/release/lionheartaaron/agentic-memory?label=release&color=success)](https://github.com/lionheartaaron/agentic-memory/releases/latest)
 [![CI](https://github.com/lionheartaaron/agentic-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/lionheartaaron/agentic-memory/actions/workflows/ci.yml)
 [![.NET 10](https://img.shields.io/badge/.NET-10.0-512BD4?style=flat&logo=dotnet)](https://dotnet.microsoft.com/)
 [![MCP Compatible](https://img.shields.io/badge/MCP-Compatible-green?style=flat)](https://modelcontextprotocol.io/)
@@ -92,6 +93,16 @@ An LLM that runs on your CPU, with no GPU or cloud required.
 ---
 
 ## Quick Start
+
+### Download a build
+
+[The latest release](https://github.com/lionheartaaron/agentic-memory/releases/latest) has a
+self-contained archive for Windows, macOS and Linux on x64 and arm64. The .NET runtime is inside
+it, so nothing needs installing: unpack it and run `agentic-memory`. Windows also gets a
+`-portable.zip`, which is the same build set to keep its database in its own folder rather than in
+your user profile. See [Releasing](RELEASING.md) for what is in each asset.
+
+Everything below is for building from source.
 
 ### Prerequisites
 - **.NET 10 SDK**

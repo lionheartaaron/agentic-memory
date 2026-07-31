@@ -100,19 +100,21 @@ instead of quietly shipping a release built from unreviewed code.
 
 ## What a release produces
 
-Six self-contained folders, archived. Self-contained means the .NET runtime is inside the
-archive, so a host machine needs nothing installed. That matters when this ships as a sidecar
-next to an Electron app.
+Six self-contained builds, one per platform, plus a portable variant of each Windows build.
+Self-contained means the .NET runtime is inside the archive, so a host machine needs nothing
+installed. That matters when this ships as a sidecar next to an Electron app.
 
 | Asset | Platform |
 |---|---|
 | `agentic-memory-X.Y.Z-win-x64.zip` | Windows, Intel/AMD |
+| `agentic-memory-X.Y.Z-win-x64-portable.zip` | Windows, Intel/AMD, keeps its data in its own folder |
 | `agentic-memory-X.Y.Z-win-arm64.zip` | Windows on ARM |
+| `agentic-memory-X.Y.Z-win-arm64-portable.zip` | Windows on ARM, keeps its data in its own folder |
 | `agentic-memory-X.Y.Z-linux-x64.tar.gz` | Linux, Intel/AMD |
 | `agentic-memory-X.Y.Z-linux-arm64.tar.gz` | Linux on ARM (Raspberry Pi 5, Ampere, AWS Graviton) |
 | `agentic-memory-X.Y.Z-osx-arm64.tar.gz` | macOS, Apple Silicon |
 | `agentic-memory-X.Y.Z-osx-x64.tar.gz` | macOS, Intel |
-| `SHA256SUMS.txt` | Checksums for all six |
+| `SHA256SUMS.txt` | Checksums for all eight |
 
 Each archive unpacks into a folder of its own name containing `agentic-memory` (or
 `agentic-memory.exe`), `appsettings.json`, `wwwroot/` and the runtime. Roughly 190 MB
@@ -127,6 +129,24 @@ has to work offline needs its models directory seeded in advance. See
 `SHA256SUMS.txt` matters more here than it would for a normal app. A host process that downloads
 this sidecar at install time should verify it, because whatever it unpacks is going to be
 executed.
+
+### Portable builds
+
+The two `-portable.zip` assets are the same program as the plain Windows zips. The only difference
+is a `portable.txt` file beside the executable. `AppPaths` looks for that file, and when it is
+there the database, snapshots and logs resolve to `Data/` inside the application folder instead of
+`%LOCALAPPDATA%\AgenticMemory`. Everything the server writes then stays inside the folder you
+unzipped, which is what makes it safe to run from a USB stick, copy between machines, or delete
+without leaving state behind.
+
+The file's contents are ignored; only its presence matters. Delete it to turn a portable copy into
+a normal one, and move the `Data` folder yourself if you want to keep what is already stored.
+
+Two things to know before choosing it. An update that replaces the application folder takes the
+`Data` folder with it, so a portable copy has to be updated by hand: unzip the new version, then
+copy `Data` across. And `--data-dir`, the `AGENTIC_MEMORY_DATA_DIR` variable and a configured
+`Storage:DataDirectory` all still outrank the marker, so an Electron host passing an explicit
+location gets that location whichever zip it unpacked.
 
 ### Platform notes
 

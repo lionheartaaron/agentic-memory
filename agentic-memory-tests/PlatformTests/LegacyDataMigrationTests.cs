@@ -160,24 +160,44 @@ public class LegacyDataMigrationTests
     }
 
     /// <summary>
+    /// Makes the move of <paramref name="destination"/> fail, on every operating system.
+    ///
+    /// The real-world trigger is a second copy of the server holding the database open, and on
+    /// Windows a test can reproduce that directly: sharing modes are enforced by the kernel, so a
+    /// <c>FileShare.None</c> handle is enough to make <c>File.Move</c> throw. Unix has no equivalent.
+    /// Locks there are advisory and <c>rename(2)</c> does not consult them, so the same test moved
+    /// the file happily and the assertion failed on Linux and macOS while passing on Windows.
+    ///
+    /// A directory sitting where the file has to land fails the move everywhere, for the same
+    /// reason it would in production: the destination cannot be created. Which error arrives is not
+    /// what is under test — <c>MigrateDatabase</c> catches anything, rolls back and rethrows as one
+    /// <see cref="IOException"/> — so this exercises exactly the path a held file would.
+    /// </summary>
+    private static void Block(string destination) => Directory.CreateDirectory(destination);
+
+    /// <summary>
     /// The database is the one move that must not fail quietly: starting with an empty store while
     /// the real one sits untouched next door looks exactly like total data loss.
     /// </summary>
     [Fact]
     public void AFailedDatabaseMoveStopsStartupInsteadOfStartingEmpty()
     {
-        using var install = new Install().WithLegacyDatabase();
+        using var install = new Install().WithLegacyDatabase("aaron's memories");
         var (paths, settings) = install.Resolve();
 
-        using var held = new FileStream(
-            install.LegacyDb, FileMode.Open, FileAccess.Read, FileShare.None);
+        Block(settings.Storage.DatabasePath);
 
         var ex = Assert.Throws<IOException>(() => LegacyDataMigration.Run(paths, settings));
 
         Assert.Contains(install.LegacyDb, ex.Message);
         Assert.Contains(settings.Storage.DatabasePath, ex.Message);
         Assert.True(File.Exists(install.LegacyDb), "the original must be left exactly where it was");
-        Assert.False(File.Exists(settings.Storage.DatabasePath));
+        Assert.Equal("aaron's memories", File.ReadAllText(install.LegacyDb));
+
+        // Nothing reached the new location, so there is no half-migrated store for the next startup
+        // to open. Asserting on the directory rather than on the database path alone, because the
+        // path itself is the blocker here and would report "not a file" whatever happened.
+        Assert.Empty(Directory.EnumerateFiles(Path.GetDirectoryName(settings.Storage.DatabasePath)!));
     }
 
     /// <summary>
@@ -191,10 +211,10 @@ public class LegacyDataMigrationTests
         using var install = new Install().WithLegacyDatabase("committed").WithLegacyLog("pending writes");
         var (paths, settings) = install.Resolve();
 
-        // The main database is moved first by construction, so locking the log fails the group
+        // The main database is moved first by construction, so blocking the log fails the group
         // *after* something has already moved — which is the only state the rollback exists for.
-        using var held = new FileStream(
-            install.LegacyLog, FileMode.Open, FileAccess.Read, FileShare.None);
+        var dataDirectory = Path.GetDirectoryName(settings.Storage.DatabasePath)!;
+        Block(Path.Combine(dataDirectory, "agentic-memory-log.db"));
 
         var ex = Assert.Throws<IOException>(() => LegacyDataMigration.Run(paths, settings));
 
