@@ -1,12 +1,22 @@
 name: Release
 
 # Push a tag like "v1.3.0" to build and publish the server for every platform it runs on:
-# Windows, Linux and macOS, each on x64 and arm64. Every asset is a self-contained folder —
-# the .NET runtime is inside it — so a host machine needs nothing installed. Windows also gets a
-# portable zip, which is the same build plus the marker that keeps its data in its own folder.
+# Windows, Linux and macOS, each on x64 and arm64. Every asset is self-contained — the .NET
+# runtime is inside it — so a host machine needs nothing installed.
 #
-# What is NOT in the assets: model weights. The embedding model (~90 MB) downloads on first
-# run; the generative model (~5 GB) only if Generation is enabled. See RELEASING.md.
+# Each platform gets the installer it expects plus an archive:
+#
+#   Windows   MSI (per-user, no elevation)         + portable zip
+#   Linux     .deb, and an AppImage on x64          + tar.gz
+#   macOS     .dmg containing an .app bundle        + tar.gz
+#
+# The archive is the format an Electron host embeds; the installer is for someone putting this
+# on their own machine. See RELEASING.md for which is which and why.
+#
+# What is NOT in the assets: model weights. The embedding model (~90 MB) downloads on first run;
+# the generative model (~5 GB) only if Generation is enabled. Every installer here puts the
+# program somewhere its owner cannot write, so each one redirects the models directory to the
+# user's own data folder — see the launcher scripts under Packaging/.
 #
 # macOS builds are ad-hoc signed, not Developer ID signed or notarized, so Gatekeeper still
 # requires a right-click > Open (or `xattr -cr`) the first time.
@@ -28,6 +38,7 @@ env:
   NODE_VERSION: '22.x'
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
+  WIX_VERSION: '7.0.0'
 
 jobs:
   verify-tag:
@@ -106,24 +117,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # One job per target, with the packaging it produces expressed as flags rather than as
+          # separate per-OS jobs. Publishing, signing, smoke testing and staging are identical for
+          # all six and are worth writing once; only the last few steps differ.
+          #
           # `native: true` means the runner can execute what it just built, so the smoke test
           # runs. The two cross-published targets (win-arm64 from x64 Windows, linux-arm64 from
           # x64 Linux) can't be started here; nothing is compiled on the runner for them, the
           # runtime and every native dependency arrive prebuilt from NuGet, so the output is the
           # same as it would be on a native runner — it just goes out unexercised.
           #
-          # `portable: true` adds a second zip carrying the portable.txt marker. Windows only: an
-          # archive is the whole delivery mechanism on Windows, where "no installer, no registry,
-          # runs from a USB stick" is a thing people specifically look for, and the marker is what
-          # makes that true rather than merely implied. The tarballs are already extract-and-run
-          # for anyone who wants that, and giving every platform two assets would double the list
-          # to say something the .tar.gz users are not asking about.
-          - { rid: win-x64,     os: windows-latest, archive: zip, native: true,  portable: true }
-          - { rid: win-arm64,   os: windows-latest, archive: zip, native: false, portable: true }
-          - { rid: linux-x64,   os: ubuntu-latest,  archive: tar, native: true,  portable: false }
-          - { rid: linux-arm64, os: ubuntu-latest,  archive: tar, native: false, portable: false }
-          - { rid: osx-arm64,   os: macos-latest,   archive: tar, native: true,  portable: false }
-          - { rid: osx-x64,     os: macos-15-intel, archive: tar, native: true,  portable: false }
+          # The Linux runners are pinned older than ubuntu-latest on purpose: the AppImage bundles
+          # libicu and libssl copied off the runner, so the runner's glibc becomes the floor for
+          # every host that AppImage has to run on. Build on the oldest LTS GitHub still offers.
+          # GitHub begins deprecating this image 2026-09-17 (unsupported by 2027-04-17) — move to
+          # whatever LTS replaces it before then.
+          - { rid: win-x64,     os: windows-latest, archive: zip, native: true,  msi: true, wixArch: x64 }
+          - { rid: win-arm64,   os: windows-latest, archive: zip, native: false, msi: true, wixArch: arm64 }
+          - { rid: linux-x64,   os: ubuntu-22.04,   archive: tar, native: true,  debArch: amd64, appimage: true }
+          - { rid: linux-arm64, os: ubuntu-22.04,   archive: tar, native: false, debArch: arm64 }
+          - { rid: osx-arm64,   os: macos-latest,   archive: tar, native: true,  dmg: true }
+          - { rid: osx-x64,     os: macos-15-intel, archive: tar, native: true,  dmg: true }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
@@ -141,6 +155,13 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "PKG=agentic-memory-${VERSION}-${{ matrix.rid }}" >> "$GITHUB_ENV"
+
+          # Windows Installer versions are four numeric fields and nothing else, so a pre-release
+          # tag has to drop its suffix here: v1.3.0-rc.1 becomes 1.3.0.0. Note that this makes an
+          # rc and its final release the same version as far as MajorUpgrade is concerned, so
+          # upgrading between them needs the rc uninstalled first. The asset filename keeps the
+          # full tag either way.
+          echo "MSI_VERSION=${VERSION%%-*}.0" >> "$GITHUB_ENV"
 
       - name: Fetch the prebuilt dashboard
         uses: actions/download-artifact@v8
@@ -172,6 +193,10 @@ jobs:
           # Mach-O found is free and needs no Apple Developer account. It is NOT Developer ID
           # signing or notarization, which we're deliberately skipping: Gatekeeper still shows
           # the "unidentified developer" prompt on both architectures.
+          #
+          # The .app bundle built further down is signed again as a bundle, which is a different
+          # thing from signing the files inside it and does not make this redundant: the tarball
+          # ships these same files with no bundle around them.
           find "publish/${{ matrix.rid }}" -type f -print0 | while IFS= read -r -d '' f; do
             if file "$f" | grep -q 'Mach-O'; then
               codesign --force --sign - "$f"
@@ -246,6 +271,8 @@ jobs:
           fi
           echo "${{ matrix.rid }} started, answered health, and served the dashboard."
 
+      # Every asset below is built from this one directory, so they are all the same program by
+      # construction rather than by six separate publishes that could drift.
       - name: Stage the package
         run: |
           rm -rf staging && mkdir -p "staging/${PKG}"
@@ -267,23 +294,17 @@ jobs:
           # COPYFILE_DISABLE stops macOS tar writing ._ AppleDouble files into the archive.
           COPYFILE_DISABLE=1 tar -czf "dist/${PKG}.tar.gz" -C staging "${PKG}"
 
-      - name: Archive (zip)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path "staging/$env:PKG" -DestinationPath "dist/$env:PKG.zip"
-
-      # A second Windows asset that keeps every byte it writes inside its own folder. portable.txt
-      # is the marker AppPaths looks for: with it present the database, snapshots and logs resolve
-      # to <app>/Data instead of %LOCALAPPDATA%, so the install is one directory that can sit on a
-      # USB stick, be copied between machines, or be deleted without leaving anything behind.
+      # The one Windows archive, and it is the portable one. There used to be two — a plain zip and
+      # a portable zip differing by a single text file — which is 190 MB of duplication to express
+      # a flag. Now that the MSI covers installing, the archive's job is the opposite case: no
+      # installer, no registry, nothing left behind, which is what portable.txt actually delivers.
       #
-      # Built from the same staged output as the ordinary zip rather than from a second publish, so
-      # the two assets are the same program and differ only by the marker.
+      # AppPaths reads the marker's presence, never its contents. Deleting it turns this back into
+      # an ordinary copy that stores data under %LOCALAPPDATA%, and an explicit --data-dir (how a
+      # host process is expected to point the sidecar at its own storage) outranks the marker
+      # whether it is there or not.
       - name: Archive (portable zip)
-        if: matrix.portable
+        if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -295,9 +316,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $portable | Out-Null
           Copy-Item -Path "staging/${env:PKG}/*" -Destination $portable -Recurse
 
-          # The file's presence is the whole signal; AppPaths never reads the contents. It is
-          # written anyway, because the first thing someone does with an unexplained file in an
-          # application folder is open it, and the second is delete it.
+          # Written out even though only its presence is read, because the first thing someone does
+          # with an unexplained file in an application folder is open it, and the second is delete it.
           Set-Content -Path "$portable/portable.txt" -Encoding utf8 -Value @(
             'Portable mode.',
             '',
@@ -309,18 +329,190 @@ jobs:
 
           Compress-Archive -Path $portable -DestinationPath "dist/${env:PKG}-portable.zip"
 
+      - name: Install WiX
+        if: matrix.msi
+        run: |
+          # install-or-update: `dotnet tool install` fails outright if the runner image ever starts
+          # shipping wix, and failing there would burn a tag on something this incidental.
+          dotnet tool install --global wix --version ${{ env.WIX_VERSION }} \
+            || dotnet tool update --global wix --version ${{ env.WIX_VERSION }}
+          wix eula accept wix7
+          # -g caches the extension for the user instead of in a .wix folder under the workspace.
+          wix extension add -g WixToolset.UI.wixext
+
+      # Per-user, into %LOCALAPPDATA%\Programs — see the long note in Product.wxs for why this is
+      # not a Program Files install. The short version: AppPaths puts model weights beside the
+      # program and the server downloads ~90 MB of them on first run, so the program directory has
+      # to be somewhere its owner can write.
+      - name: Build the MSI
+        if: matrix.msi
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $msi = "dist/${env:PKG}.msi"
+
+          # Harvested from the staged copy rather than from publish/, so the MSI contains exactly
+          # what the archive contains — including the smoke test's leftovers having been removed.
+          wix build Packaging/windows/Product.wxs `
+            -ext WixToolset.UI.wixext `
+            -arch ${{ matrix.wixArch }} `
+            -d "ProductVersion=${env:MSI_VERSION}" `
+            -d "PublishDir=$(Resolve-Path "staging/${env:PKG}")" `
+            -d "RepoRoot=$PWD" `
+            -out $msi
+          if ($LASTEXITCODE -ne 0) { throw 'wix build failed' }
+
+          # `wix build` does not validate in v7 — validation is this separate command, so leaving
+          # it out is the default rather than a decision. It catches duplicate component GUIDs,
+          # broken conditions and bad sequencing, which are exactly the faults that survive a
+          # successful build and surface on a user's machine.
+          #
+          # The three suppressed ICEs are the standard false positives for a package that is
+          # per-user on purpose. ICE38 and ICE64 police per-machine packages that write into a
+          # user profile as a side effect, where a repair by a second user finds nothing; ICE91
+          # warns that per-user directories do not vary with ALLUSERS. Here the whole product is
+          # registered per user, which is what makes all three moot — and satisfying ICE38
+          # literally would mean inventing an HKCU key for each of several hundred harvested files.
+          wix msi validate -sice ICE38 -sice ICE64 -sice ICE91 $msi
+          if ($LASTEXITCODE -ne 0) { throw 'wix msi validate failed' }
+
+          Write-Host "Built $msi ($([math]::Round((Get-Item $msi).Length / 1MB, 1)) MB)"
+
+      # Program in /usr/lib, a wrapper on $PATH, and a systemd user unit that is installed but not
+      # enabled. No .desktop entry: this is a server, and an application-menu launcher for
+      # something with no window is clutter. The wrapper exists because /usr/lib is root's and the
+      # models directory has to land somewhere the user can write — see Packaging/linux/agentic-memory.
+      - name: Build the .deb
+        if: matrix.debArch
+        run: |
+          set -e
+          ROOT=pkgroot
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/lib/agentic-memory" "$ROOT/usr/bin" "$ROOT/usr/lib/systemd/user"
+
+          cp -r "staging/${PKG}/." "$ROOT/usr/lib/agentic-memory/"
+          chmod +x "$ROOT/usr/lib/agentic-memory/agentic-memory"
+
+          install -m 0755 Packaging/linux/agentic-memory "$ROOT/usr/bin/agentic-memory"
+          install -m 0644 Packaging/linux/systemd/agentic-memory.service "$ROOT/usr/lib/systemd/user/agentic-memory.service"
+
+          sed -e "s/__VERSION__/${VERSION}/" -e "s/__ARCH__/${{ matrix.debArch }}/" \
+            Packaging/linux/debian/control.template > "$ROOT/DEBIAN/control"
+          chmod 0755 "$ROOT/DEBIAN"
+          chmod 0644 "$ROOT/DEBIAN/control"
+
+          mkdir -p dist
+          dpkg-deb --build --root-owner-group "$ROOT" "dist/${PKG}.deb"
+          dpkg-deb --info "dist/${PKG}.deb"
+
+      # x64 only. An arm64 AppImage needs a cross-architecture runtime fed to appimagetool, and
+      # unlike the cross-published binaries — which come prebuilt from NuGet and are therefore the
+      # same bytes a native runner would produce — that packaging step would go out having never
+      # been executed anywhere. arm64 gets the .deb and the tarball instead.
+      - name: Build the AppImage
+        if: matrix.appimage
+        run: |
+          set -e
+          APPDIR=AppDir
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
+          cp -r "staging/${PKG}/." "$APPDIR/usr/bin/"
+          chmod +x "$APPDIR/usr/bin/agentic-memory"
+
+          # Bundle libicu/libssl so the AppImage doesn't depend on the host distro having a
+          # compatible major version — unlike the .deb, there is no Depends field to pull the
+          # right one in. AppRun puts usr/lib on LD_LIBRARY_PATH.
+          for lib in libicudata libicuuc libicui18n libssl libcrypto; do
+            path=$(ldconfig -p | awk -v n="$lib" '{split($1,a,".so"); if (a[1]==n) print $NF}' | sort -V | tail -n1)
+            if [ -n "$path" ]; then
+              cp -L "$path" "$APPDIR/usr/lib/"
+            else
+              echo "::warning::No $lib found on the runner; the AppImage will fall back to the host's copy."
+            fi
+          done
+
+          install -m 0755 Packaging/linux/appimage/AppRun "$APPDIR/AppRun"
+          cp Packaging/linux/appimage/agentic-memory.desktop "$APPDIR/agentic-memory.desktop"
+          cp Packaging/icons/agentic-memory-512.png "$APPDIR/agentic-memory.png"
+
+          # appimagetool moved out of AppImageKit into its own repo with real versioned releases;
+          # AppImageKit's own "continuous" release is now literally named "obsolete" upstream. Pin
+          # a version and verify its published checksum rather than trusting a floating tag.
+          APPIMAGETOOL_VERSION=1.9.1
+          APPIMAGETOOL_SHA256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+          curl -fsSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          echo "${APPIMAGETOOL_SHA256}  appimagetool" | sha256sum -c -
+          chmod +x appimagetool
+
+          mkdir -p dist
+          # --appimage-extract-and-run because the runners have no FUSE for appimagetool to mount
+          # itself with.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$APPDIR" "dist/${PKG}.AppImage"
+
+      # A .app whose executable is a launcher script: it redirects the models directory out of
+      # /Applications, opens the dashboard once the server answers, then execs the server in its
+      # own place so quitting the app stops it. See Packaging/macos/AgenticMemory.
+      - name: Build the .app and .dmg
+        if: matrix.dmg
+        run: |
+          set -e
+          APP="appstage/Agentic Memory.app"
+          rm -rf appstage
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          cp -R "staging/${PKG}/." "$APP/Contents/MacOS/"
+          chmod +x "$APP/Contents/MacOS/agentic-memory"
+          install -m 0755 Packaging/macos/AgenticMemory "$APP/Contents/MacOS/AgenticMemory"
+
+          sed "s/__VERSION__/${VERSION}/g" Packaging/macos/Info.plist.template > "$APP/Contents/Info.plist"
+
+          # Build the .icns from the largest source PNG at build time, so there is no binary icns
+          # committed to the repo; sips and iconutil are stock on macOS runners.
+          ICONSET="$(mktemp -d)/agentic-memory.iconset"
+          mkdir -p "$ICONSET"
+          for size in 16 32 128 256 512; do
+            double=$((size * 2))
+            sips -z $size $size Packaging/icons/agentic-memory-1024.png --out "$ICONSET/icon_${size}x${size}.png" > /dev/null
+            sips -z $double $double Packaging/icons/agentic-memory-1024.png --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null
+          done
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/agentic-memory.icns"
+
+          # Signing the bundle, having already signed the individual Mach-O files above. --deep so
+          # the seal covers the self-contained publish output's loose dylibs, which a top-level
+          # signature would leave out.
+          codesign --force --deep --sign - "$APP"
+
+          # Plain --verify, not --deep --strict. What is being checked is that the bundle really
+          # got signed and its seal is intact, which is the failure worth catching. --strict also
+          # enforces where nested code may live, and a self-contained .NET publish puts its dylibs
+          # straight in Contents/MacOS rather than Contents/Frameworks — a layout the runtime
+          # requires and codesign dislikes, so asking for it would fail the release over something
+          # that cannot be changed.
+          codesign --verify "$APP"
+
+          DMGROOT=dmgroot
+          rm -rf "$DMGROOT"
+          mkdir -p "$DMGROOT"
+          cp -R "$APP" "$DMGROOT/"
+          ln -s /Applications "$DMGROOT/Applications"
+
+          mkdir -p dist
+          hdiutil create -volname "Agentic Memory" -srcfolder "$DMGROOT" -ov -format UDZO \
+            "dist/${PKG}.dmg"
+
       - name: Checksum
         run: |
           cd dist
-          # Every archive, not the single one there used to be: Windows now produces an ordinary
-          # zip and a portable one, and `ls` returning two names would have silently checksummed
-          # neither correctly.
-          for archive in *.zip *.tar.gz; do
-            [ -e "$archive" ] || continue
+          # Every asset this job produced, whatever its extension. This used to read the single
+          # name `ls` returned, which stopped being correct the moment a job emitted an installer
+          # as well as an archive.
+          shopt -s nullglob
+          for asset in *.zip *.tar.gz *.msi *.deb *.AppImage *.dmg; do
             if command -v sha256sum > /dev/null 2>&1; then
-              sha256sum "$archive" > "${archive}.sha256"
+              sha256sum "$asset" > "${asset}.sha256"
             else
-              shasum -a 256 "$archive" > "${archive}.sha256"
+              shasum -a 256 "$asset" > "${asset}.sha256"
             fi
           done
           cat ./*.sha256

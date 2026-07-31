@@ -417,3 +417,15 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# WiX caches extensions under the working directory unless `wix extension add -g` is used, so this
+# appears at the repo root the moment anyone forgets the flag.
+.wix/
+
+# Staging directories the packaging steps build in (see Packaging/ and .github/workflows/release.yml)
+/dist/
+/publish/
+/pkgroot/
+/AppDir/
+/portable/
+/staging/

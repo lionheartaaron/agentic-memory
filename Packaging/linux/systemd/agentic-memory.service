@@ -1,0 +1,36 @@
+# A systemd *user* unit, installed by the .deb but deliberately NOT enabled.
+#
+#     systemctl --user enable --now agentic-memory
+#     systemctl --user status agentic-memory
+#     journalctl --user -u agentic-memory -f
+#
+# A user unit rather than a system one because the memories are the user's: it runs as them, finds
+# $XDG_DATA_HOME the same way an interactive run does, and reads the same database. A system unit
+# would run as root or as a service account and quietly build up a second, separate store.
+#
+# Not enabled on install, because the shipped configuration listens on every interface with no API
+# key. That is a reasonable default for something started by hand on a laptop and a poor one for
+# something started at every login on a machine that may be on a network. Set Server:ApiKey, or
+# Server:BindAddress to 127.0.0.1, in appsettings.json before enabling this.
+#
+# Add `systemctl --user enable linger` territory only if you want it running while logged out:
+# `loginctl enable-linger $USER`. Without that it starts at login and stops at logout, which is
+# usually what is wanted for a companion process.
+
+[Unit]
+Description=Agentic Memory - local memory and code intelligence server for AI agents
+Documentation=https://github.com/lionheartaaron/agentic-memory
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/agentic-memory
+Restart=on-failure
+RestartSec=5
+
+# The first start downloads the embedding model before it begins listening, which on a slow link
+# takes longer than systemd's patience with a service that has not signalled anything.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target

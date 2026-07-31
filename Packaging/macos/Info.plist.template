@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Agentic Memory</string>
+    <key>CFBundleDisplayName</key>
+    <string>Agentic Memory</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.aaronlionheart.agenticmemory</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+
+    <!-- The launcher script, not the server binary. It sets the models directory and opens the
+         dashboard once the server answers, then execs the server in its own place. See
+         Packaging/macos/AgenticMemory. -->
+    <key>CFBundleExecutable</key>
+    <string>AgenticMemory</string>
+
+    <key>CFBundleIconFile</key>
+    <string>agentic-memory.icns</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright (c) 2026 Aaron Lionheart. MIT licensed.</string>
+</dict>
+</plist>

@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Windows MSI for Agentic Memory, built with WiX Toolset v7 (`wix build`).
+
+  Expects these preprocessor variables from the command line (see
+  .github/workflows/release.yml or Packaging/windows/build-local.ps1):
+    ProductVersion  - four-part numeric version, e.g. 1.3.0.0
+    PublishDir      - path to a self-contained `dotnet publish -r win-x64|win-arm64` output folder
+    RepoRoot        - path to the repo root (for the icon and License.rtf)
+
+  Also requires at `wix build` time:
+    -ext WixToolset.UI.wixext  - the wizard UI (WixUI_InstallDir) and its dialog set
+    -arch x64|arm64            - must match the RID the publish output was built for
+
+  No util extension and no custom actions, deliberately. Everything that would have needed one
+  (a "launch now" checkbox is the usual reason) is done with properties instead, because the
+  util extension's custom action binary is referenced per architecture — Wix4UtilCA_X64 versus
+  Wix4UtilCA_A64 — and one .wxs that builds for both is worth more than a checkbox.
+
+  UpgradeCode below must NEVER change across releases: it is how Windows Installer recognises a
+  future version as an upgrade of this same product rather than a second copy of it.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <!--
+    Per-user, not per-machine, and this is a product decision rather than a packaging preference.
+
+    AppPaths resolves the models directory to the program directory unless it is told otherwise,
+    and the server downloads the embedding model (~90 MB) into it on first run. Under
+    %ProgramFiles% that download fails for anyone not running elevated, so a per-machine install
+    would produce a program that installs cleanly and then cannot start. Installing into the
+    user's own profile makes the program directory writable, which is what the runtime already
+    assumes.
+
+    It also means no UAC prompt, and an appsettings.json the owner can actually edit — which
+    matters here, because setting an API key is a file edit and the default configuration binds
+    every interface without one.
+
+    Data is unaffected either way: the database resolves to %LOCALAPPDATA%\AgenticMemory, outside
+    the install folder, so an uninstall or an upgrade never touches it.
+  -->
+  <Package Name="Agentic Memory"
+           Manufacturer="Aaron Lionheart"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="6066278b-3a56-4148-8cd9-09eeb2b4bbc3"
+           Language="1033"
+           Compressed="yes"
+           Scope="perUser">
+
+    <SummaryInformation Description="Agentic Memory Installer" Keywords="Installer,Memory,MCP" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Agentic Memory is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(var.RepoRoot)\Packaging\icons\agentic-memory.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/lionheartaaron/agentic-memory" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/lionheartaaron/agentic-memory/issues" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <!-- LocalAppData\Programs is the established home for a per-user application install. -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Agentic Memory" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppProgramMenuFolder" Name="Agentic Memory" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Agentic Memory" Level="1">
+      <ComponentGroupRef Id="PublishedFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DataDirectoryCleanup" />
+    </Feature>
+
+    <!-- Welcome -> License -> choose folder -> our own shortcut page -> Ready -> Finish. See the
+         ShortcutOptionsDlg fragment and the Publish overrides below for how the extra page is
+         spliced into the stock WixUI_InstallDir sequence. -->
+    <ui:WixUI Id="WixUI_InstallDir" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.RepoRoot)\Packaging\windows\License.rtf" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <!-- Checked by default; unchecking it on ShortcutOptionsDlg skips the StartMenuShortcut
+         component below via its Condition. -->
+    <Property Id="INSTALLSHORTCUT" Value="1" />
+
+    <!-- The finish page carries the one thing someone needs to know next. A server has nothing to
+         show when it is launched from a shortcut, so saying where it will be listening is more
+         use than a "launch now" checkbox would be. This is a plain property on the stock
+         ExitDialog, which is why no custom action is involved. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
+              Value="Start Agentic Memory from the Start Menu. It serves its dashboard and API at http://127.0.0.1:3377 and keeps your memories in %LOCALAPPDATA%\AgenticMemory, which uninstalling leaves untouched. The default configuration accepts connections from any interface with no API key; if this machine is not on a network you trust, set Server:ApiKey or Server:BindAddress in appsettings.json inside the install folder." />
+
+    <UI>
+      <!-- Splice ShortcutOptionsDlg between InstallDirDlg and VerifyReadyDlg. A higher Order than
+           the stock rows (which top out at 4) means these fire last for the same button click, so
+           they are the transition that takes effect; the condition mirrors InstallDirDlg's own
+           stock "path is valid" check so Next cannot skip past an unvalidated folder. -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="ShortcutOptionsDlg" Order="10" Condition="WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID=&quot;1&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="ShortcutOptionsDlg" Order="10" Condition="NOT Installed" />
+    </UI>
+  </Package>
+
+  <!-- Custom wizard page: a single "Create a Start Menu shortcut" checkbox, styled to match the
+       stock InstallDirDlg/VerifyReadyDlg pages it sits between. -->
+  <Fragment>
+    <UI>
+      <Dialog Id="ShortcutOptionsDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Shortcuts" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="340" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose whether to create a shortcut for Agentic Memory." />
+
+        <Control Id="StartMenuShortcutCheckBox" Type="CheckBox" X="25" Y="65" Width="300" Height="18" Property="INSTALLSHORTCUT" CheckBoxValue="1" Text="Create a Start Menu shortcut" />
+
+        <Control Id="ShortcutNote" Type="Text" X="25" Y="90" Width="320" Height="40" NoPrefix="yes"
+                 Text="Agentic Memory runs as a local server. Starting it opens a console window that stays open while it is running; close that window to stop it." />
+
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&lt; Back">
+          <Publish Event="NewDialog" Value="InstallDirDlg" Condition="1" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="Next &gt;">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" Condition="1" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" Condition="1" />
+        </Control>
+      </Dialog>
+    </UI>
+  </Fragment>
+
+  <!-- One Component per file under the publish output, auto-harvested (no heat.exe needed). -->
+  <Fragment>
+    <ComponentGroup Id="PublishedFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.PublishDir)\**" />
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <DirectoryRef Id="AppProgramMenuFolder">
+      <!-- The Condition skips this component entirely — no shortcut, no registry key, no Start
+           Menu folder — when the checkbox on ShortcutOptionsDlg is cleared. -->
+      <Component Id="StartMenuShortcut" Guid="c4cb0a89-110d-426e-8066-983020b14a63" Condition="INSTALLSHORTCUT = &quot;1&quot;">
+        <Shortcut Id="StartMenuShortcutEntry"
+                  Name="Agentic Memory"
+                  Description="Local memory and code intelligence server for AI agents"
+                  Target="[INSTALLFOLDER]agentic-memory.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIcon" />
+        <RemoveFolder Id="RemoveAppProgramMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\AgenticMemory" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <!--
+      Everything the server writes at runtime lands outside the install folder except the model
+      weights, which AppPaths puts beside the program. Windows Installer only removes files it
+      installed, so without this an uninstall leaves a ~90 MB Models folder behind — more if the
+      generative model was enabled, which is another 5 GB.
+
+      RemoveFolderEx would be the tidy way to do this and it lives in the util extension, which
+      this package deliberately does not use (see the header). Naming the folder explicitly costs
+      one element and covers the case that actually occurs.
+    -->
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="DataDirectoryCleanup" Guid="273aaeba-8716-4ac6-9481-dd66a2f90e64">
+        <RemoveFile Id="RemoveDownloadedModels" Directory="ModelsFolder" Name="*" On="uninstall" />
+        <RemoveFolder Id="RemoveModelsFolder" Directory="ModelsFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\AgenticMemory" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Directory Id="ModelsFolder" Name="Models" />
+    </DirectoryRef>
+  </Fragment>
+</Wix>

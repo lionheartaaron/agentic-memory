@@ -1,0 +1,26 @@
+#!/bin/sh
+# Entry point inside the AppImage. See .github/workflows/release.yml for what is assembled around
+# it.
+set -e
+
+HERE="$(dirname "$(readlink -f "${0}")")"
+
+# usr/lib carries a bundled libicu and libssl so the AppImage does not depend on whichever ICU and
+# OpenSSL majors the host distro happens to have. That is the whole reason this asset exists
+# alongside the .deb, which declares them as dependencies instead, and the .tar.gz, which assumes
+# them.
+export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# An AppImage is a read-only squashfs mount, so the models directory cannot be the program
+# directory the way AppPaths would otherwise resolve it — the embedding model download on first
+# run would fail against a read-only filesystem. Point it at the user's data directory, beside
+# where the database already goes.
+#
+# Only a default: an explicit AGENTIC_MEMORY_MODELS_DIR is left alone, and --models-dir on the
+# command line outranks both.
+if [ -z "${AGENTIC_MEMORY_MODELS_DIR}" ]; then
+    AGENTIC_MEMORY_MODELS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/agentic-memory/models"
+    export AGENTIC_MEMORY_MODELS_DIR
+fi
+
+exec "$HERE/usr/bin/agentic-memory" "$@"

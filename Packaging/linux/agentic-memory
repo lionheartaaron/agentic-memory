@@ -1,0 +1,21 @@
+#!/bin/sh
+# Installed as /usr/bin/agentic-memory by the .deb. A wrapper rather than the symlink into
+# /usr/lib that a packaged application usually gets, for one reason:
+#
+# AppPaths resolves the models directory to the program directory unless something overrides it,
+# and the server downloads the embedding model (~90 MB, and ~5 GB more if generation is enabled)
+# into it on first run. The program directory here is /usr/lib/agentic-memory, which is root's.
+# Left alone, every non-root user gets a server that installs perfectly and then cannot start.
+#
+# The database needs no such help: its default is already $XDG_DATA_HOME/agentic-memory.
+#
+# Only a default is set. An explicit AGENTIC_MEMORY_MODELS_DIR still wins, as does --models-dir on
+# the command line, which outranks the variable.
+set -e
+
+if [ -z "${AGENTIC_MEMORY_MODELS_DIR}" ]; then
+    AGENTIC_MEMORY_MODELS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/agentic-memory/models"
+    export AGENTIC_MEMORY_MODELS_DIR
+fi
+
+exec /usr/lib/agentic-memory/agentic-memory "$@"

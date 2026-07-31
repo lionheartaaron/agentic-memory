@@ -1,0 +1,19 @@
+[Desktop Entry]
+# Required by the AppImage format rather than wanted for its own sake: appimagetool refuses to
+# build an AppDir without a desktop entry and a matching icon, and desktop integration tools read
+# this one if the user installs the AppImage into their menus.
+#
+# The .deb deliberately ships no equivalent. There the binary goes on $PATH, which is where a
+# server belongs; an application-menu entry for something with no window is clutter.
+#
+# Terminal=true because there is a window to show after all — the console the server logs to,
+# including the URL it ends up serving on. Launched without it, this would look like nothing
+# happened.
+Type=Application
+Name=Agentic Memory
+Comment=Local memory and code intelligence server for AI agents
+Exec=agentic-memory
+Icon=agentic-memory
+Terminal=true
+Categories=Development;Utility;
+Keywords=AI;memory;MCP;code;

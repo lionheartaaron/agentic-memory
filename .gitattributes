@@ -1,0 +1,42 @@
+# Line endings.
+#
+# This repository is developed on Windows and packaged on Linux and macOS, so the shell scripts
+# under Packaging/ are written by an editor that defaults to CRLF and then executed by /bin/sh.
+# A CRLF shebang line fails with "bad interpreter: /bin/sh^M", and the first place that would
+# surface is a released AppImage or .app that nobody can run.
+#
+# Whether it happens today depends on each contributor's core.autocrlf, which is not somewhere
+# a broken release should be able to come from. These say it outright.
+
+* text=auto
+
+*.sh          text eol=lf
+*.service     text eol=lf
+*.desktop     text eol=lf
+*.template    text eol=lf
+
+# The three launcher scripts, which carry no extension because they are installed under the name
+# they have here.
+Packaging/linux/agentic-memory        text eol=lf
+Packaging/linux/appimage/AppRun       text eol=lf
+Packaging/macos/AgenticMemory         text eol=lf
+
+# Anything Debian reads out of the control archive.
+Packaging/linux/debian/*  text eol=lf
+
+# Scripts that only ever run on Windows; leaving them CRLF keeps diffs quiet in Windows editors.
+*.ps1         text eol=crlf
+*.cmd         text eol=crlf
+*.bat         text eol=crlf
+
+# Binary, so git never tries to normalise or diff them as text.
+*.png         binary
+*.ico         binary
+*.icns        binary
+*.onnx        binary
+*.zip         binary
+*.msi         binary
+
+# RTF is technically text, but it is a generated document consumed only by the Windows installer
+# UI; treating it as binary keeps git from rewriting bytes inside it.
+*.rtf         binary

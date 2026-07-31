@@ -79,7 +79,8 @@ migration step moves the schema version by itself, so there is no number to edit
    git push origin v1.3.0
    ```
    Pushing the tag triggers [`release.yml`](.github/workflows/release.yml), which builds the
-   server for all six platform targets and publishes them as a GitHub Release.
+   server for all six platform targets, packages each one as an installer and an archive, and
+   publishes the lot as a GitHub Release.
 
 5. **Merge `main` back into `develop`** so the version bump (and anything else that landed
    directly on `main`) isn't lost:
@@ -100,61 +101,182 @@ instead of quietly shipping a release built from unreviewed code.
 
 ## What a release produces
 
-Six self-contained builds, one per platform, plus a portable variant of each Windows build.
-Self-contained means the .NET runtime is inside the archive, so a host machine needs nothing
-installed. That matters when this ships as a sidecar next to an Electron app.
+Six self-contained builds, one per platform, packaged two ways each: the installer that platform
+expects, and an archive. Self-contained means the .NET runtime is inside every one of them, so a
+host machine needs nothing installed. That matters when this ships as a sidecar next to an
+Electron app.
 
-| Asset | Platform |
-|---|---|
-| `agentic-memory-X.Y.Z-win-x64.zip` | Windows, Intel/AMD |
-| `agentic-memory-X.Y.Z-win-x64-portable.zip` | Windows, Intel/AMD, keeps its data in its own folder |
-| `agentic-memory-X.Y.Z-win-arm64.zip` | Windows on ARM |
-| `agentic-memory-X.Y.Z-win-arm64-portable.zip` | Windows on ARM, keeps its data in its own folder |
-| `agentic-memory-X.Y.Z-linux-x64.tar.gz` | Linux, Intel/AMD |
-| `agentic-memory-X.Y.Z-linux-arm64.tar.gz` | Linux on ARM (Raspberry Pi 5, Ampere, AWS Graviton) |
-| `agentic-memory-X.Y.Z-osx-arm64.tar.gz` | macOS, Apple Silicon |
-| `agentic-memory-X.Y.Z-osx-x64.tar.gz` | macOS, Intel |
-| `SHA256SUMS.txt` | Checksums for all eight |
+| Asset | Platform | What it is |
+|---|---|---|
+| `agentic-memory-X.Y.Z-win-x64.msi` | Windows, Intel/AMD | Per-user installer |
+| `agentic-memory-X.Y.Z-win-x64-portable.zip` | Windows, Intel/AMD | Unpack and run |
+| `agentic-memory-X.Y.Z-win-arm64.msi` | Windows on ARM | Per-user installer |
+| `agentic-memory-X.Y.Z-win-arm64-portable.zip` | Windows on ARM | Unpack and run |
+| `agentic-memory-X.Y.Z-linux-x64.deb` | Linux, Intel/AMD | Debian/Ubuntu package |
+| `agentic-memory-X.Y.Z-linux-x64.AppImage` | Linux, Intel/AMD | One executable file, no install |
+| `agentic-memory-X.Y.Z-linux-x64.tar.gz` | Linux, Intel/AMD | Unpack and run |
+| `agentic-memory-X.Y.Z-linux-arm64.deb` | Linux on ARM (Raspberry Pi 5, Ampere, Graviton) | Debian/Ubuntu package |
+| `agentic-memory-X.Y.Z-linux-arm64.tar.gz` | Linux on ARM | Unpack and run |
+| `agentic-memory-X.Y.Z-osx-arm64.dmg` | macOS, Apple Silicon | Drag-to-Applications disk image |
+| `agentic-memory-X.Y.Z-osx-arm64.tar.gz` | macOS, Apple Silicon | Unpack and run |
+| `agentic-memory-X.Y.Z-osx-x64.dmg` | macOS, Intel | Drag-to-Applications disk image |
+| `agentic-memory-X.Y.Z-osx-x64.tar.gz` | macOS, Intel | Unpack and run |
+| `SHA256SUMS.txt` | | Checksums for all thirteen |
+
+Every asset for a given platform is built from **one** publish output, staged once and packaged
+several ways, so an installer and its archive are the same program by construction rather than by
+two builds that could drift.
 
 Each archive unpacks into a folder of its own name containing `agentic-memory` (or
 `agentic-memory.exe`), `appsettings.json`, `wwwroot/` and the runtime. Roughly 190 MB
 uncompressed, most of it ONNX Runtime and V8.
 
-**Model weights are not in the archives.** The embedding model (~90 MB) downloads from Hugging
-Face on first run; the TypeScript compiler downloads on first workspace registration; the
-generative model (~5 GB) downloads only if `Generation.Enabled` is turned on. An install that
-has to work offline needs its models directory seeded in advance. See
+**Model weights are in none of them.** The embedding model (~90 MB) downloads from Hugging Face on
+first run; the TypeScript compiler downloads on first workspace registration; the generative model
+(~5 GB) downloads only if `Generation.Enabled` is turned on. An install that has to work offline
+needs its models directory seeded in advance. See
 [Where your data lives](README.md#where-your-data-lives).
 
 `SHA256SUMS.txt` matters more here than it would for a normal app. A host process that downloads
 this sidecar at install time should verify it, because whatever it unpacks is going to be
 executed.
 
-### Portable builds
+### The thing every installer has to get right
 
-The two `-portable.zip` assets are the same program as the plain Windows zips. The only difference
-is a `portable.txt` file beside the executable. `AppPaths` looks for that file, and when it is
-there the database, snapshots and logs resolve to `Data/` inside the application folder instead of
-`%LOCALAPPDATA%\AgenticMemory`. Everything the server writes then stays inside the folder you
-unzipped, which is what makes it safe to run from a USB stick, copy between machines, or delete
-without leaving state behind.
+`AppPaths` resolves the **models** directory to the program directory unless something overrides
+it, and the server downloads the embedding model into it on first run. That default is correct for
+an archive, which is unpacked wherever its owner chose. It is wrong for every installer here,
+because all three put the program somewhere its owner cannot write: `%LOCALAPPDATA%` is the
+exception, `/usr/lib` belongs to root, `/Applications` belongs to root, and an AppImage is mounted
+read-only. Left alone, each would install cleanly and then fail on first run.
+
+Each package solves it in the way that suits it, and only by setting a default. An explicit
+`AGENTIC_MEMORY_MODELS_DIR`, and `--models-dir` above it, still win:
+
+| Package | Program directory | Models go to |
+|---|---|---|
+| MSI | `%LOCALAPPDATA%\Programs\Agentic Memory` | beside the program, because that path is writable |
+| `.deb` | `/usr/lib/agentic-memory` | `$XDG_DATA_HOME/agentic-memory/models`, via the `/usr/bin` wrapper |
+| AppImage | read-only mount | `$XDG_DATA_HOME/agentic-memory/models`, via `AppRun` |
+| `.dmg` | `/Applications/Agentic Memory.app` | `~/Library/Application Support/AgenticMemory/models`, via the bundle launcher |
+
+The **database** needs none of this. It already resolves to a per-user location on every platform,
+outside the install folder, so uninstalling never takes your memories with it.
+
+### Windows: the MSI
+
+Per-user, into `%LOCALAPPDATA%\Programs\Agentic Memory`. No UAC prompt, no elevation, and an
+`appsettings.json` its owner can actually edit, which matters because setting an API key is a
+file edit. It is per-user precisely so the program directory is writable; see the long note at the
+top of [`Product.wxs`](Packaging/windows/Product.wxs).
+
+The wizard is the stock WiX `WixUI_InstallDir` set with one extra page offering a Start Menu
+shortcut. Uninstalling removes the program and any downloaded model weights, and leaves
+`%LOCALAPPDATA%\AgenticMemory`, the database, alone.
+
+Built with [WiX Toolset](https://wixtoolset.org/) v7. To build one without cutting a tag:
+
+```powershell
+pwsh Packaging/windows/build-local.ps1                      # win-x64, version from the csproj
+pwsh Packaging/windows/build-local.ps1 -Rid win-arm64
+```
+
+`wix build` does not run ICE validation in v7. `wix msi validate` is a separate command, so the
+release runs it explicitly. Three ICEs are suppressed (ICE38, ICE64, ICE91); all three fire only
+because the package is deliberately per-user, and the reasoning is in the workflow beside the
+suppression.
+
+### Windows: the portable zip
+
+The same build with a `portable.txt` file beside the executable. `AppPaths` looks for that file,
+and when it is there the database, snapshots and logs resolve to `Data/` inside the application
+folder instead of `%LOCALAPPDATA%\AgenticMemory`. Everything the server writes stays inside the
+folder you unzipped, which is what makes it safe to run from a USB stick, copy between machines, or
+delete without leaving state behind.
 
 The file's contents are ignored; only its presence matters. Delete it to turn a portable copy into
-a normal one, and move the `Data` folder yourself if you want to keep what is already stored.
+an ordinary one.
 
-Two things to know before choosing it. An update that replaces the application folder takes the
-`Data` folder with it, so a portable copy has to be updated by hand: unzip the new version, then
-copy `Data` across. And `--data-dir`, the `AGENTIC_MEMORY_DATA_DIR` variable and a configured
-`Storage:DataDirectory` all still outrank the marker, so an Electron host passing an explicit
-location gets that location whichever zip it unpacked.
+There used to be a plain zip alongside this, differing by that one file. Two 190 MB assets to
+express a flag was not worth it once the MSI existed to cover installing, so Windows ships one
+archive and it is this one.
+
+**If you are embedding this as a sidecar, pass `--data-dir`.** It outranks the marker, so the host
+gets the location it asked for. A host that unpacks the portable zip and passes nothing gets a
+database inside its own application folder, which an auto-update then replaces wholesale: the
+exact failure `AppPaths` exists to prevent.
+
+### Linux: the .deb
+
+Program in `/usr/lib/agentic-memory`, a wrapper on `PATH` at `/usr/bin/agentic-memory`, and a
+systemd **user** unit at `/usr/lib/systemd/user/agentic-memory.service` that is installed but
+deliberately not enabled:
+
+```bash
+sudo apt install ./agentic-memory-X.Y.Z-linux-x64.deb
+systemctl --user enable --now agentic-memory     # optional
+```
+
+A user unit rather than a system one because the memories belong to a user: it runs as them and
+reads the same database an interactive run would. It is not enabled on install because the shipped
+configuration listens on every interface with no API key, which is fine for something started by
+hand and poor for something started at every login. Set `Server:ApiKey`, or `Server:BindAddress` to
+`127.0.0.1`, before enabling it.
+
+No `.desktop` entry. This is a server; an application-menu launcher for something with no window
+is clutter.
+
+### Linux: the AppImage
+
+One executable file that runs on any distro, x64 only. It bundles libicu and libssl, which is what
+distinguishes it from the tarball (assumes the host has compatible majors) and the `.deb`
+(declares them as dependencies).
+
+arm64 gets no AppImage. Producing one needs a cross-architecture runtime handed to `appimagetool`,
+and unlike the cross-published *binaries*, which arrive prebuilt from NuGet and are therefore the
+same bytes a native runner would produce, that packaging step would ship having never been run
+anywhere. arm64 has the `.deb` and the tarball.
+
+### macOS: the .dmg
+
+A disk image with `Agentic Memory.app` and a shortcut to `/Applications`. The bundle's executable
+is a small launcher script that redirects the models directory out of `/Applications`, opens the
+dashboard in your browser once the server answers, then `exec`s the server in its own place so
+quitting the app actually stops it. Without it, double-clicking a server looks exactly like nothing
+happening.
+
+The launcher assumes the shipped port, 3377. Change the port and you keep the server and lose the
+automatic browser open.
+
+### Where the packaging lives
+
+Everything the installers are built from is under [`Packaging/`](Packaging/). The workflow only
+assembles and invokes; nothing that defines an installer is written inline in the YAML, so a
+change to how something is packaged is a change to a file you can read on its own.
+
+```
+Packaging/
+  icons/       agentic-memory.ico + PNGs, and the script that regenerates them
+  windows/     Product.wxs (the MSI), License.rtf, build-local.ps1
+  linux/       agentic-memory (the /usr/bin wrapper), debian/control.template,
+               systemd/agentic-memory.service, appimage/AppRun + .desktop
+  macos/       Info.plist.template, AgenticMemory (the bundle launcher)
+```
+
+The icons are checked in rather than generated during the release, because
+`Packaging/icons/generate-icons.ps1` needs GDI+ and therefore Windows, while the Linux and macOS
+packaging consume the same files. Replacing the mark is a supported thing to do: drop your own
+`agentic-memory.ico` and PNGs in that folder and delete the script.
 
 ### Platform notes
 
 - **macOS builds are ad-hoc signed, not notarized.** Apple Silicon refuses to run *any* unsigned
   Mach-O code, so the workflow signs the launcher and every native library with identity `-`;
-  without that the arm64 build is killed by the kernel on launch. That is not Developer ID
+  without that the arm64 build is killed by the kernel on launch. The `.app` is then signed again
+  as a bundle, which is a different thing from signing the files inside it and is not redundant:
+  the tarball ships those same files with no bundle around them. None of this is Developer ID
   signing, so Gatekeeper still shows the "unidentified developer" prompt the first time and a
-  user needs right-click → Open, or `xattr -cr agentic-memory`.
+  user needs right-click → Open, or `xattr -cr`.
 - **The two ARM targets are cross-published** (win-arm64 from an x64 Windows runner, linux-arm64
   from an x64 Linux runner). Nothing is compiled on the runner, since the runtime and every
   native dependency arrive prebuilt from NuGet, so the output is identical to what a native
@@ -220,6 +342,7 @@ to track the app version. See [Two versions](#two-versions-and-only-one-of-them-
 | Ship what's on `develop` | Merge `develop` → `main`, bump `<Version>`, tag `main`, push tag |
 | Ship an urgent fix now | Branch `hotfix/*` from `main`, merge to `main`, bump, tag, back-merge to `develop` |
 | Run tests without releasing | Just push; [`ci.yml`](.github/workflows/ci.yml) runs on every push/PR, any branch |
+| Build an MSI without releasing | `pwsh Packaging/windows/build-local.ps1`, output in `artifacts/dist` |
 | Ship a release candidate | Tag `v1.3.0-rc.1`; it publishes as a GitHub pre-release |
 | Re-run a failed release | Delete the tag locally and remotely, fix the problem, re-tag, re-push |
 | Check what schema version a build supports | `GET /api/admin/database` → `supportedSchemaVersion` |

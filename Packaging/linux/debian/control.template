@@ -1,0 +1,21 @@
+Package: agentic-memory
+Version: __VERSION__
+Section: devel
+Priority: optional
+Architecture: __ARCH__
+Depends: libc6, libgcc-s1 | libgcc1, libstdc++6, zlib1g, ca-certificates, libgssapi-krb5-2, libssl3t64 | libssl3 | libssl1.1, libicu76 | libicu74 | libicu72 | libicu71 | libicu70 | libicu69 | libicu68 | libicu67 | libicu66 | libicu63 | libicu60
+Maintainer: Aaron Lionheart <lionheartaaron@gmail.com>
+Homepage: https://github.com/lionheartaaron/agentic-memory
+Description: Local memory and code intelligence server for AI agents
+ Agentic Memory gives an AI assistant a memory that persists between
+ conversations, and a symbol-level understanding of the codebases it is
+ pointed at. It runs as a local server, speaks MCP and a REST API, and
+ serves its own dashboard.
+ .
+ Everything stays on the machine it runs on. Embeddings are computed
+ locally with ONNX Runtime, C# is analysed with Roslyn and TypeScript
+ with the real TypeScript compiler hosted in V8.
+ .
+ The .NET runtime is bundled, so nothing else needs installing. Model
+ weights are not: the embedding model downloads on first run into
+ $XDG_DATA_HOME/agentic-memory/models.

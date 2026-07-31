@@ -1,0 +1,47 @@
+#!/bin/sh
+# CFBundleExecutable for Agentic Memory.app. Double-clicking a bundle whose executable is a server
+# looks exactly like nothing happening: no window opens, and the console it would have logged to
+# is not attached to anything. This turns the app into something with a visible result.
+#
+# Two jobs, then it gets out of the way.
+set -e
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# /Applications belongs to root, and AppPaths resolves the models directory to the program
+# directory unless told otherwise — so the embedding model download on first run would fail for
+# every non-admin user. Put it beside the database instead, under Application Support.
+#
+# Only a default. An explicit AGENTIC_MEMORY_MODELS_DIR is left alone, and --models-dir outranks
+# both.
+if [ -z "${AGENTIC_MEMORY_MODELS_DIR}" ]; then
+    AGENTIC_MEMORY_MODELS_DIR="$HOME/Library/Application Support/AgenticMemory/models"
+    export AGENTIC_MEMORY_MODELS_DIR
+fi
+
+# The port the shipped appsettings.json binds. Someone who changes it also loses the automatic
+# browser open, which is a fair trade for not parsing JSON in sh.
+URL="http://127.0.0.1:3377"
+
+# $$ is captured before the exec below, and exec keeps the pid — so this is the server's pid by
+# the time the loop is running, and the watcher stops as soon as the server is gone rather than
+# outliving a failed start.
+MAIN=$$
+(
+    attempts=0
+    # Generous: the first run downloads the embedding model (~90 MB) before it starts listening.
+    while [ "$attempts" -lt 150 ]; do
+        kill -0 "$MAIN" 2>/dev/null || exit 0
+        if curl -fsS --max-time 2 "$URL/api/admin/health" > /dev/null 2>&1; then
+            open "$URL/"
+            exit 0
+        fi
+        attempts=$((attempts + 1))
+        sleep 2
+    done
+) &
+
+# exec, so the server takes over this process rather than running as a child of it. Quitting the
+# app from the Dock then stops the server, instead of killing a shell and leaving the thing it
+# started running with nothing to stop it.
+exec "$HERE/agentic-memory" "$@"

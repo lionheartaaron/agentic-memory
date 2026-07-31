@@ -96,11 +96,20 @@ An LLM that runs on your CPU, with no GPU or cloud required.
 
 ### Download a build
 
-[The latest release](https://github.com/lionheartaaron/agentic-memory/releases/latest) has a
-self-contained archive for Windows, macOS and Linux on x64 and arm64. The .NET runtime is inside
-it, so nothing needs installing: unpack it and run `agentic-memory`. Windows also gets a
-`-portable.zip`, which is the same build set to keep its database in its own folder rather than in
-your user profile. See [Releasing](RELEASING.md) for what is in each asset.
+[The latest release](https://github.com/lionheartaaron/agentic-memory/releases/latest) covers
+Windows, macOS and Linux on x64 and arm64. Every asset is self-contained, meaning the .NET runtime
+is inside it, so nothing else needs installing.
+
+| | Install it | Just run it |
+|---|---|---|
+| **Windows** | `.msi`, per-user, no admin prompt, Start Menu entry | `-portable.zip`: unpack and run, keeps everything in its own folder |
+| **macOS** | `.dmg`, drag to Applications; launching it opens the dashboard | `.tar.gz` |
+| **Linux** | `.deb`, puts `agentic-memory` on your `PATH` | `.AppImage` (x64) or `.tar.gz` |
+
+The `.dmg` is not notarized, so the first launch needs right-click → Open. Model weights are not in
+any of these; the embedding model (~90 MB) downloads on first run. See
+[Releasing](RELEASING.md#what-a-release-produces) for the full asset list and what each one does
+with your data.
 
 Everything below is for building from source.
 
