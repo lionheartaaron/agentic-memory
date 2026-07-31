@@ -1,25 +1,28 @@
 using AgenticMemory.Brain.Models;
+using AgenticMemory.Brain.Retrieval;
 
 namespace AgenticMemory.Brain.Interfaces;
 
-
 /// <summary>
-/// High-level search service with multi-signal scoring
+/// Multi-channel memory retrieval.
 /// </summary>
 public interface ISearchService
 {
     /// <summary>
-    /// Search for memory nodes using multi-signal scoring
+    /// Full retrieval: scope filter, parallel candidate channels, rank fusion, diversification,
+    /// and a calibrated confidence so a caller can hedge instead of confabulating.
     /// </summary>
-    /// <param name="query">The search query text</param>
-    /// <param name="topN">Maximum number of results to return</param>
-    /// <param name="tags">Optional tag filters</param>
-    /// <param name="cancellationToken">Cancellation token</param>
-    /// <returns>Scored search results</returns>
+    Task<MemoryRetrievalResult> RetrieveAsync(RetrievalRequest request, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Convenience overload against <see cref="MemoryScope.Default"/> — the single-user store.
+    /// Still scoped; it simply targets the default user rather than bypassing scoping.
+    /// </summary>
     Task<IReadOnlyList<ScoredMemory>> SearchAsync(
         string query,
         int topN = 5,
         IEnumerable<string>? tags = null,
         CancellationToken cancellationToken = default);
-}
 
+    bool SemanticSearchAvailable { get; }
+}

@@ -20,16 +20,22 @@ public partial class LocalEmbeddingService : IEmbeddingService
     private readonly int _dimensions;
     private readonly int _maxSequenceLength;
     private readonly bool _isAvailable;
+    private readonly string _modelId;
     private bool _disposed;
 
     public int Dimensions => _dimensions;
     public bool IsAvailable => _isAvailable && !_disposed;
+
+    /// <summary>Derived from the configured model file so that changing the model in settings
+    /// changes the stamp, marking previously stored vectors as incomparable.</summary>
+    public string ModelId => _modelId;
 
     public LocalEmbeddingService(EmbeddingsSettings settings, ILogger<LocalEmbeddingService>? logger = null)
     {
         _logger = logger;
         _dimensions = settings.ModelDimensions;
         _maxSequenceLength = settings.MaxSequenceLength;
+        _modelId = $"{Path.GetFileNameWithoutExtension(settings.ModelFileName)}-{settings.ModelDimensions}d";
 
         var modelPath = settings.GetModelPath();
         var vocabPath = settings.GetVocabPath();
@@ -129,6 +135,39 @@ public partial class LocalEmbeddingService : IEmbeddingService
         }
 
         return text;
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _knownTermCache = new();
+
+    /// <summary>
+    /// A term is "known" when the WordPiece tokenizer represents it with a single vocabulary entry.
+    /// Anything split into <c>##</c> continuation pieces, or replaced by the unknown token, is being
+    /// reconstructed from fragments and carries no reliable meaning of its own.
+    /// </summary>
+    public bool IsKnownTerm(string term)
+    {
+        if (!IsAvailable || _tokenizer is null || string.IsNullOrWhiteSpace(term)) return true;
+
+        return _knownTermCache.GetOrAdd(term, static (t, tokenizer) =>
+        {
+            try
+            {
+                var pieces = tokenizer.EncodeToTokens(t, out _);
+
+                var content = pieces
+                    .Select(p => p.Value)
+                    .Where(v => !(v.StartsWith('[') && v.EndsWith(']')))   // [CLS] / [SEP]
+                    .ToList();
+
+                if (content.Count != 1) return false;
+                return !content[0].StartsWith("##", StringComparison.Ordinal);
+            }
+            catch
+            {
+                // Never let a tokenizer quirk make a real query look like nonsense.
+                return true;
+            }
+        }, _tokenizer);
     }
 
     private (long[] inputIds, long[] attentionMask, long[] tokenTypeIds) Tokenize(string text)

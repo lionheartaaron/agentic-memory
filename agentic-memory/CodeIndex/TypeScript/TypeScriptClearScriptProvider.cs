@@ -42,13 +42,17 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider, I
     private readonly ConcurrentDictionary<string, ProjectIndex> _projects
         = new(StringComparer.OrdinalIgnoreCase);
     private readonly ILogger<TypeScriptClearScriptProvider> _logger;
+    private readonly ExcludedFolderMatcher _excluded;
 
     public TypeScriptClearScriptProvider(
         string? typescriptJsPath,
-        ILogger<TypeScriptClearScriptProvider> logger)
+        ILogger<TypeScriptClearScriptProvider> logger,
+        Configuration.CodeIndexSettings? settings = null)
     {
         _typescriptJsPath = typescriptJsPath;
         _logger = logger;
+        _excluded = new ExcludedFolderMatcher(
+            (settings ?? new Configuration.CodeIndexSettings()).ExcludePatterns);
     }
 
     public string ProviderType => "typescript-react-native-expo";
@@ -60,8 +64,10 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider, I
     public bool CanHandle(string filePath)
     {
         var ext = Path.GetExtension(filePath);
-        return ext.Equals(".ts", StringComparison.OrdinalIgnoreCase) ||
-               ext.Equals(".tsx", StringComparison.OrdinalIgnoreCase);
+        return ext.Equals(".ts",  StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".tsx", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".jsx", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".js",  StringComparison.OrdinalIgnoreCase);
     }
 
     // ── Project registration ──────────────────────────────────────────────────
@@ -88,7 +94,7 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider, I
             return;
         }
 
-        var index = new ProjectIndex(projectRoot, _typescriptJsPath, _logger);
+        var index = new ProjectIndex(projectRoot, _typescriptJsPath, _excluded, _logger);
         try
         {
             await index.InitialiseAsync(ct);
@@ -196,16 +202,18 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider, I
 
         private readonly string _projectRoot;
         private readonly string _typescriptJsPath;
+        private readonly ExcludedFolderMatcher _excluded;
         private readonly ILogger _logger;
         private V8ScriptEngine? _engine;
         private ScriptFileCache _cache = new();
         private LanguageServiceHost? _host;
         private int _programVersion; // bumped on every file invalidation; drives findAllReferences cache
 
-        internal ProjectIndex(string projectRoot, string tsPath, ILogger logger)
+        internal ProjectIndex(string projectRoot, string tsPath, ExcludedFolderMatcher excluded, ILogger logger)
         {
             _projectRoot = projectRoot;
             _typescriptJsPath = tsPath;
+            _excluded = excluded;
             _logger = logger;
         }
 
@@ -218,7 +226,7 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider, I
 
                 // Expose C# host object to JavaScript. All file I/O routes here — V8 never touches
                 // the file system directly.
-                _host = new LanguageServiceHost(_projectRoot, _cache);
+                _host = new LanguageServiceHost(_projectRoot, _cache, _excluded);
                 _engine.AddHostObject("nativeHost", HostItemFlags.None, _host);
                 _engine.AddHostType("Console", typeof(Console));
 
@@ -641,7 +649,6 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider, I
                 }
 
                 // Misc structural hints
-                bool hasStructural = false;
                 foreach (var hint in hintList)
                 {
                     switch (Str(hint, "kind"))
@@ -650,13 +657,13 @@ public sealed class TypeScriptClearScriptProvider : ICodeIntelligenceProvider, I
                             var method = Str(hint, "method") ?? "GET";
                             var url = Str(hint, "url") ?? "";
                             sb.Append("// endpoint: ").Append(method).Append(' ').AppendLine(url);
-                            hasStructural = true; break;
+                            break;
                         case "abortable":
-                            sb.AppendLine("// abortable"); hasStructural = true; break;
+                            sb.AppendLine("// abortable"); break;
                         case "sse-source":
-                            sb.AppendLine("// sse-source"); hasStructural = true; break;
+                            sb.AppendLine("// sse-source"); break;
                         case "streams-sse":
-                            sb.AppendLine("// streams-sse"); hasStructural = true; break;
+                            sb.AppendLine("// streams-sse"); break;
                     }
                 }
 

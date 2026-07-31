@@ -7,9 +7,16 @@ namespace AgenticMemory.CodeIndex;
 public sealed class WorkspaceDiscoveryService
 {
     private readonly ILogger<WorkspaceDiscoveryService> _logger;
+    private readonly ExcludedFolderMatcher _excluded;
 
-    public WorkspaceDiscoveryService(ILogger<WorkspaceDiscoveryService> logger)
-        => _logger = logger;
+    public WorkspaceDiscoveryService(
+        ILogger<WorkspaceDiscoveryService> logger,
+        Configuration.CodeIndexSettings? settings = null)
+    {
+        _logger = logger;
+        _excluded = new ExcludedFolderMatcher(
+            (settings ?? new Configuration.CodeIndexSettings()).ExcludePatterns);
+    }
 
     /// <summary>
     /// Derives a stable GUID from the manifest path so re-runs produce the same IDs.
@@ -101,19 +108,14 @@ public sealed class WorkspaceDiscoveryService
             Namespace:    $"sub:{id}");
     }
 
-    private static readonly string[] ExcludeSegments =
-        ["node_modules", "bin", "obj", ".git", ".vs", "dist", "build", "out", ".next"];
-
-    private static IEnumerable<string> FindFiles(string root, string pattern)
+    private IEnumerable<string> FindFiles(string root, string pattern)
     {
         IEnumerable<string> files;
         try { files = Directory.EnumerateFiles(root, pattern, SearchOption.AllDirectories); }
         catch (UnauthorizedAccessException) { yield break; }
 
-        var sep = Path.DirectorySeparatorChar.ToString();
         foreach (var f in files)
-            if (!ExcludeSegments.Any(seg =>
-                    f.Contains($"{sep}{seg}{sep}", StringComparison.OrdinalIgnoreCase)))
+            if (!_excluded.IsExcluded(f, root))
                 yield return f;
     }
 

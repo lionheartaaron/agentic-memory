@@ -3,7 +3,9 @@ using AgenticMemory.Brain.Embeddings;
 using AgenticMemory.Brain.Generation;
 using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Brain.Maintenance;
+using AgenticMemory.Brain.Retrieval;
 using AgenticMemory.Brain.Search;
+using AgenticMemory.Brain.Slots;
 using AgenticMemory.Brain.Storage;
 using AgenticMemory.CodeIndex;
 using AgenticMemory.CodeIndex.CSharp;
@@ -23,10 +25,17 @@ public static class ServiceCollectionExtensions
     /// <summary>
     /// Adds all application services to the dependency injection container.
     /// </summary>
-    public static IServiceCollection AddAgenticMemoryServices(this IServiceCollection services, AppSettings settings)
+    /// <param name="database">
+    /// An already-open database. The host passes one so that opening the file — and therefore the
+    /// schema migration that happens on open — is a step it can order and report on, rather than a
+    /// side effect of the first service to be resolved.
+    /// </param>
+    public static IServiceCollection AddAgenticMemoryServices(
+        this IServiceCollection services, AppSettings settings, SharedLiteDatabase? database = null)
     {
         services.AddConfiguration(settings);
-        services.AddSingleton(new SharedLiteDatabase(settings.Storage.DatabasePath));
+        services.AddSingleton(database ?? new SharedLiteDatabase(
+            settings.Storage.DatabasePath, settings.Maintenance.BackupPath));
         services.AddMemoryRepository(settings);
         services.AddKeyValueStore(settings);
         services.AddEmbeddingService();
@@ -48,14 +57,33 @@ public static class ServiceCollectionExtensions
         services.AddSingleton(settings.Embeddings);
         services.AddSingleton(settings.Generation);
         services.AddSingleton(settings.Maintenance);
+        services.AddSingleton(settings.Retrieval);
+        services.AddSingleton(settings.CodeIndex);
+
+        // Slot definitions govern conflict resolution; a single shared registry keeps the store
+        // path and the maintenance path in agreement.
+        services.AddSingleton(new SlotRegistry());
 
         return services;
     }
 
     private static IServiceCollection AddMemoryRepository(this IServiceCollection services, AppSettings settings)
     {
-        services.AddSingleton<IMemoryRepository>(sp =>
-            new LiteDbMemoryRepository(sp.GetRequiredService<SharedLiteDatabase>()));
+        services.AddSingleton<IMemoryEventLog>(sp =>
+            new LiteDbMemoryEventLog(sp.GetRequiredService<SharedLiteDatabase>()));
+
+        // One instance serves both surfaces. They are separate interfaces so that a service taking
+        // only IMemoryRepository cannot reach across the user boundary even by accident.
+        services.AddSingleton(sp => new LiteDbMemoryRepository(
+            sp.GetRequiredService<SharedLiteDatabase>(),
+            sp.GetRequiredService<IMemoryEventLog>(),
+            sp.GetRequiredService<ILogger<LiteDbMemoryRepository>>()));
+
+        services.AddSingleton<IMemoryRepository>(sp => sp.GetRequiredService<LiteDbMemoryRepository>());
+        services.AddSingleton<IMemoryAdminStore>(sp => sp.GetRequiredService<LiteDbMemoryRepository>());
+        services.AddSingleton<MemoryVectorCache>(_ => new MemoryVectorCache());
+        services.AddSingleton<MemoryLexicalCache>(_ => new MemoryLexicalCache());
+
         return services;
     }
 
@@ -229,26 +257,31 @@ public static class ServiceCollectionExtensions
 
     private static IServiceCollection AddSearchService(this IServiceCollection services)
     {
-        services.AddSingleton<ISearchService>(sp =>
-        {
-            var repository = sp.GetRequiredService<IMemoryRepository>();
-            var embeddingService = sp.GetRequiredService<IEmbeddingService>();
-            var logger = sp.GetRequiredService<ILogger<MemorySearchEngine>>();
-            return new MemorySearchEngine(repository, embeddingService, logger);
-        });
+        services.AddSingleton<ISearchService>(sp => new MemorySearchEngine(
+            sp.GetRequiredService<IMemoryRepository>(),
+            sp.GetRequiredService<IEmbeddingService>(),
+            sp.GetRequiredService<RetrievalSettings>(),
+            sp.GetRequiredService<MemoryVectorCache>(),
+            sp.GetRequiredService<MemoryLexicalCache>(),
+            sp.GetRequiredService<ILogger<MemorySearchEngine>>()));
 
         return services;
     }
 
     private static IServiceCollection AddMaintenanceServices(this IServiceCollection services, AppSettings settings)
     {
-        services.AddSingleton<IMaintenanceService>(sp =>
-        {
-            var repository = sp.GetRequiredService<IMemoryRepository>();
-            var embeddingService = sp.GetRequiredService<IEmbeddingService>();
-            var logger = sp.GetRequiredService<ILogger<MaintenanceService>>();
-            return new MaintenanceService(repository, embeddingService, logger);
-        });
+        services.AddSingleton<IMemoryBackupService>(sp => new LiteDbBackupService(
+            sp.GetRequiredService<SharedLiteDatabase>(),
+            sp.GetRequiredService<MaintenanceSettings>(),
+            sp.GetRequiredService<ILogger<LiteDbBackupService>>()));
+
+        services.AddSingleton<IMaintenanceService>(sp => new MaintenanceService(
+            sp.GetRequiredService<IMemoryRepository>(),
+            sp.GetRequiredService<IMemoryAdminStore>(),
+            sp.GetRequiredService<IEmbeddingService>(),
+            sp.GetRequiredService<MaintenanceSettings>(),
+            sp.GetRequiredService<IMemoryBackupService>(),
+            sp.GetRequiredService<ILogger<MaintenanceService>>()));
 
         if (settings.Maintenance.Enabled)
         {
@@ -266,15 +299,12 @@ public static class ServiceCollectionExtensions
 
     private static IServiceCollection AddConflictAwareStorage(this IServiceCollection services)
     {
-        services.AddSingleton<IConflictAwareStorage>(sp =>
-        {
-            var repository = sp.GetRequiredService<IMemoryRepository>();
-            var searchService = sp.GetRequiredService<ISearchService>();
-            var embeddingService = sp.GetRequiredService<IEmbeddingService>();
-            var conflictSettings = sp.GetRequiredService<ConflictSettings>();
-            var logger = sp.GetRequiredService<ILogger<ConflictAwareStorageService>>();
-            return new ConflictAwareStorageService(repository, searchService, embeddingService, conflictSettings, logger);
-        });
+        services.AddSingleton<IConflictAwareStorage>(sp => new ConflictAwareStorageService(
+            sp.GetRequiredService<IMemoryRepository>(),
+            sp.GetRequiredService<IEmbeddingService>(),
+            sp.GetRequiredService<ConflictSettings>(),
+            sp.GetRequiredService<SlotRegistry>(),
+            sp.GetRequiredService<ILogger<ConflictAwareStorageService>>()));
 
         return services;
     }
@@ -301,14 +331,14 @@ public static class ServiceCollectionExtensions
                 if (settings.EnableCSharpRoslyn)
                 {
                     var logger = sp.GetRequiredService<ILogger<CSharpRoslynProvider>>();
-                    providers.Add(new CSharpRoslynProvider(logger));
+                    providers.Add(new CSharpRoslynProvider(logger, settings));
                 }
 
                 if (settings.EnableTypeScriptV8)
                 {
                     var tsPath = ResolveTypeScriptPath(sp, settings);
                     var logger = sp.GetRequiredService<ILogger<TypeScriptClearScriptProvider>>();
-                    providers.Add(new TypeScriptClearScriptProvider(tsPath, logger));
+                    providers.Add(new TypeScriptClearScriptProvider(tsPath, logger, settings));
                 }
             }
 

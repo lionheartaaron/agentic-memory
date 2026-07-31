@@ -14,7 +14,7 @@ public class MaintenanceBackgroundService : IHostedService, IAsyncDisposable
     private readonly ILogger<MaintenanceBackgroundService>? _logger;
 
     private CancellationTokenSource? _cts;
-    private Task? _decayTask;
+    private Task? _upkeepTask;
     private Task? _consolidationTask;
     private bool _isRunning;
 
@@ -66,14 +66,14 @@ public class MaintenanceBackgroundService : IHostedService, IAsyncDisposable
 
         if (_settings.DecayEnabled)
         {
-            _decayTask = RunDecayLoopAsync(_cts.Token);
+            _upkeepTask = RunUpkeepLoopAsync(_cts.Token);
             _logger?.LogInformation(
-                "Decay background task started. Interval: {Interval}h, Prune threshold: {Threshold}",
-                _settings.DecayIntervalHours, _settings.PruneThreshold);
+                "Upkeep background task started. Interval: {Interval}h, cold storage after {Days}d. Upkeep never deletes memories.",
+                _settings.DecayIntervalHours, _settings.ArchiveEpisodicAfterDays);
         }
         else
         {
-            _logger?.LogInformation("Decay background task is disabled");
+            _logger?.LogInformation("Upkeep background task is disabled");
         }
 
         if (_settings.ConsolidationEnabled)
@@ -102,7 +102,7 @@ public class MaintenanceBackgroundService : IHostedService, IAsyncDisposable
         _cts?.Cancel();
 
         var tasks = new List<Task>();
-        if (_decayTask != null) tasks.Add(_decayTask);
+        if (_upkeepTask != null) tasks.Add(_upkeepTask);
         if (_consolidationTask != null) tasks.Add(_consolidationTask);
 
         if (tasks.Count > 0)
@@ -125,7 +125,7 @@ public class MaintenanceBackgroundService : IHostedService, IAsyncDisposable
         _logger?.LogInformation("Maintenance background service stopped");
     }
 
-    private async Task RunDecayLoopAsync(CancellationToken cancellationToken)
+    private async Task RunUpkeepLoopAsync(CancellationToken cancellationToken)
     {
         // Initial delay before first run
         await Task.Delay(TimeSpan.FromMinutes(_settings.InitialDelayMinutes), cancellationToken);
@@ -134,18 +134,29 @@ public class MaintenanceBackgroundService : IHostedService, IAsyncDisposable
         {
             try
             {
-                _logger?.LogDebug("Running scheduled decay operation");
-                var result = await _maintenanceService.ApplyDecayAsync(_settings.PruneThreshold, cancellationToken);
+                _logger?.LogDebug("Running scheduled upkeep");
+                var result = await _maintenanceService.RunUpkeepAsync(_settings, cancellationToken);
 
                 if (result.Success)
                 {
                     _logger?.LogInformation(
-                        "Scheduled decay completed: {Processed} processed, {Pruned} pruned",
-                        result.MemoriesProcessed, result.MemoriesPruned);
+                        "Scheduled upkeep completed: {Processed} processed, {Expired} expired, {Archived} moved to cold storage",
+                        result.MemoriesProcessed, result.Expired, result.ArchivedToCold);
                 }
                 else
                 {
-                    _logger?.LogWarning("Scheduled decay failed: {Error}", result.ErrorMessage);
+                    _logger?.LogWarning("Scheduled upkeep failed: {Error}", result.ErrorMessage);
+                }
+
+                // The only path that physically removes anything, and only for memories the user
+                // explicitly asked to forget.
+                if (_settings.PurgeForgottenAfterDays > 0)
+                {
+                    var purge = await _maintenanceService.PurgeForgottenAsync(
+                        TimeSpan.FromDays(_settings.PurgeForgottenAfterDays), cancellationToken);
+
+                    if (purge is { Success: true, MemoriesPurged: > 0 })
+                        _logger?.LogInformation("Purged {Count} forgotten memories past retention", purge.MemoriesPurged);
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -154,7 +165,7 @@ public class MaintenanceBackgroundService : IHostedService, IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger?.LogError(ex, "Unhandled error in decay loop");
+                _logger?.LogError(ex, "Unhandled error in upkeep loop");
             }
 
             try

@@ -19,7 +19,30 @@ public interface IEmbeddingService : IDisposable
     int Dimensions { get; }
 
     /// <summary>
+    /// Identifies the model producing these vectors, e.g. "all-MiniLM-L6-v2".
+    ///
+    /// Stored alongside every embedding so that vectors from different models are recognised as
+    /// incomparable rather than silently compared.
+    /// </summary>
+    string ModelId { get; }
+
+    /// <summary>
     /// Whether the embedding service is available and ready
     /// </summary>
     bool IsAvailable { get; }
+
+    /// <summary>
+    /// Whether the model recognises <paramref name="term"/> as a word in its own right, rather than
+    /// reassembling it from sub-word fragments or falling back to the unknown token.
+    ///
+    /// This is how a meaningless query is told apart from a merely unanswerable one. A sentence
+    /// transformer given invented tokens still returns a perfectly well-formed vector, and that
+    /// vector sits near the centre of the corpus — so gibberish scores <em>above</em> many genuine
+    /// matches and lifts every similarity at once. Knowing that the words themselves are real is the
+    /// signal the geometry cannot supply.
+    ///
+    /// Defaults to true, so an implementation without vocabulary information never causes a query to
+    /// be treated as nonsense.
+    /// </summary>
+    bool IsKnownTerm(string term) => true;
 }

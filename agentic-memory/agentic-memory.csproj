@@ -1,44 +1,94 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk.Web">
 
+  <!-- TargetFramework, nullability and PlatformTarget come from Directory.Build.props. -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
-    <PlatformTarget>x64</PlatformTarget>
     <RootNamespace>AgenticMemory</RootNamespace>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
+
+    <!--
+      The application version, recorded in the database on every open so a support question can be
+      answered from the file. Independent of the database schema version, which lives in
+      Persistence/Migrations/DatabaseSchema.cs and only moves when the stored data changes shape.
+    -->
+    <Version>1.2.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- So migration tests can drive the runner with a deliberately failing step. -->
+    <InternalsVisibleTo Include="agentic-memory-tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="LiteDB" Version="5.0.21" />
-    <PackageReference Include="Spectre.Console" Version="0.49.1" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.24.4" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntimeGenAI" Version="0.14.0" />
+    <PackageReference Include="Spectre.Console" Version="0.57.2" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.28.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntimeGenAI" Version="0.15.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
 
-    <PackageReference Include="ModelContextProtocol" Version="0.7.0-preview.1" />
-    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="0.7.0-preview.1" />
+    <PackageReference Include="ModelContextProtocol" Version="2.0.0" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.0.0" />
 
     <!-- CodeIndex: C# Roslyn compiler-backed analysis -->
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.11.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
 
     <!-- CodeIndex: TypeScript compiler in-process via V8 -->
-    <PackageReference Include="Microsoft.ClearScript.V8" Version="7.4.5" />
-    <PackageReference Include="Microsoft.ClearScript.V8.Native.win-x64" Version="7.4.5" />
+    <PackageReference Include="Microsoft.ClearScript.V8" Version="$(ClearScriptVersion)" />
   </ItemGroup>
+
+  <!--
+    ClearScript ships its V8 build as one package per runtime identifier, so the reference has to be
+    chosen rather than fixed. Publishing for a RID takes that RID; a plain build or run takes the
+    host's, which is what makes `dotnet run` work on a contributor's machine whatever it is.
+
+    Only one is pulled in, on purpose: each native is tens of megabytes and a sidecar ships for a
+    single platform. Referencing all eight would put seven unusable copies of V8 in every build.
+  -->
+  <PropertyGroup>
+    <ClearScriptVersion>7.5.1</ClearScriptVersion>
+
+    <V8Rid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</V8Rid>
+    <V8Rid Condition="'$(V8Rid)' == ''">$(NETCoreSdkPortableRuntimeIdentifier)</V8Rid>
+
+    <!--
+      An explicit list rather than "assume a package exists for whatever RID we are on". An unlisted
+      RID (linux-musl, FreeBSD, some future architecture) still restores and builds — it simply has
+      no V8, and TypeScript indexing reports itself unavailable, instead of the build failing on a
+      package that was never published.
+    -->
+    <V8NativeAvailable>false</V8NativeAvailable>
+    <V8NativeAvailable Condition="
+        '$(V8Rid)' == 'win-x64'   or '$(V8Rid)' == 'win-x86'     or '$(V8Rid)' == 'win-arm64' or
+        '$(V8Rid)' == 'linux-x64' or '$(V8Rid)' == 'linux-arm64' or '$(V8Rid)' == 'linux-arm' or
+        '$(V8Rid)' == 'osx-x64'   or '$(V8Rid)' == 'osx-arm64'">true</V8NativeAvailable>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(V8NativeAvailable)' == 'true'">
+    <PackageReference Include="Microsoft.ClearScript.V8.Native.$(V8Rid)" Version="$(ClearScriptVersion)" />
+  </ItemGroup>
+
+  <Target Name="ReportMissingV8Native" BeforeTargets="Build" Condition="'$(V8NativeAvailable)' != 'true'">
+    <Message Importance="high"
+             Text="ClearScript V8 publishes no native for '$(V8Rid)'. TypeScript code intelligence will be unavailable in this build; everything else works." />
+  </Target>
 
   <ItemGroup>
     <None Update="appsettings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <Content Include="CodeIndex\TypeScript\bridge.js">
+    <Content Include="CodeIndex/TypeScript/bridge.js">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
 
-  <Target Name="NpmBuild" BeforeTargets="Build">
-    <Exec Command="npm install" WorkingDirectory="$(MSBuildProjectDirectory)\..\react-dashboard" />
-    <Exec Command="npm run build" WorkingDirectory="$(MSBuildProjectDirectory)\..\react-dashboard" />
+  <!--
+    The dashboard is part of the application's output, so it is built with it. Forward slashes
+    because this path is handed to a shell on three operating systems. ContinueOnError so that a
+    machine without Node can still build and test the server; the previous build already in
+    wwwroot is used, and `dotnet build -p:SkipDashboardBuild=true` skips the attempt entirely.
+  -->
+  <Target Name="NpmBuild" BeforeTargets="Build" Condition="'$(SkipDashboardBuild)' != 'true'">
+    <Exec Command="npm install" WorkingDirectory="$(MSBuildProjectDirectory)/../react-dashboard" ContinueOnError="true" />
+    <Exec Command="npm run build" WorkingDirectory="$(MSBuildProjectDirectory)/../react-dashboard" ContinueOnError="true" />
   </Target>
 
 </Project>

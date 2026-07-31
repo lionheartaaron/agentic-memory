@@ -148,7 +148,7 @@ public class EmbeddingTests : MemoryServiceTestBase
 
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
 
         Assert.Contains("\ud83d\ude80", retrieved.Title);
@@ -166,7 +166,7 @@ public class EmbeddingTests : MemoryServiceTestBase
 
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.NotEqual(Guid.Empty, retrieved.Id);
         Assert.Contains("Unpaired Surrogate Test", retrieved.Title);

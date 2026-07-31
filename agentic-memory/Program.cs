@@ -6,6 +6,9 @@ using AgenticMemory.Configuration;
 using AgenticMemory.Extensions;
 using AgenticMemory.Helpers;
 using AgenticMemory.Logging;
+using AgenticMemory.Middleware;
+using AgenticMemory.Persistence;
+using AgenticMemory.Persistence.Migrations;
 using AgenticMemory.Tools;
 
 namespace AgenticMemory;
@@ -24,26 +27,40 @@ internal class Program
             .SetBasePath(appBasePath)
             .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);
 
-        var settings = LoadAndResolveSettings(builder.Configuration, appBasePath, args);
+        var (settings, paths) = LoadAndResolveSettings(builder.Configuration, appBasePath, args);
 
         ConfigureKestrel(builder, settings);
         builder.Logging.ClearProviders();
         builder.Logging.AddProvider(new SpectreConsoleLoggerProvider());
 
-        EnsureDataDirectoryExists(settings);
+        // Reported here rather than with the rest of the banner: a model download can sit between
+        // the two for minutes, and "we moved your database" is the first thing a returning user
+        // should see, not something scrolled off the top by progress bars.
+        ConsoleHelpers.PrintMigrationReport(LegacyDataMigration.Run(paths, settings));
 
-        builder.Services.AddAgenticMemoryServices(settings);
+        // Two migrations, in the only order that works: the file is put in its final location first,
+        // then its contents are brought up to the current schema. Opening the database is done here,
+        // explicitly, rather than left to whichever service the container happened to resolve first —
+        // a schema migration is not something to discover halfway through building a container.
+        var database = OpenDatabase(settings);
+        ConsoleHelpers.PrintSchemaMigrationReport(database.Migration);
+
+        builder.Services.AddSingleton(paths);
+        builder.Services.AddAgenticMemoryServices(settings, database);
         ConfigureMcpServer(builder);
 
         var app = builder.Build();
+
+        // Before anything is routed, so no endpoint can be reached without passing it. A no-op when
+        // no key is configured.
+        app.UseApiKeyAuthentication(settings.Server);
 
         app.UseStaticFiles();
         app.MapMcp("/mcp");
         app.MapRestApiEndpoints();
         app.MapFallbackToFile("index.html");
 
-        PrintStartupInfo(app, settings);
-        app.MigrateProjectsToWorkspaces();
+        PrintStartupInfo(app, settings, paths);
         app.ReRegisterSavedWorkspaces();
 
         // Restore the persisted active project so the watcher can resume on startup
@@ -53,22 +70,84 @@ internal class Program
         await app.RunAsync();
     }
 
-    private static AppSettings LoadAndResolveSettings(ConfigurationManager configuration, string appBasePath, string[] args)
+    /// <summary>
+    /// Opens the database, which is also what runs any pending schema migration.
+    ///
+    /// A migration that cannot be completed ends the process instead of degrading: continuing would
+    /// mean this build writing to data it has already established it cannot read correctly. Exiting
+    /// non-zero with the reason on the console is also the only thing a host process can act on — an
+    /// Electron parent sees a sidecar that failed to start and why, rather than one that came up and
+    /// quietly served the wrong answers.
+    /// </summary>
+    private static SharedLiteDatabase OpenDatabase(AppSettings settings)
     {
+        var logger = new SpectreConsoleLoggerProvider().CreateLogger("Database");
+
+        try
+        {
+            return new SharedLiteDatabase(
+                settings.Storage.DatabasePath, settings.Maintenance.BackupPath, logger);
+        }
+        catch (Exception ex) when (
+            ex is DatabaseSchemaTooNewException or DatabaseMigrationFailedException)
+        {
+            ConsoleHelpers.PrintFatalDatabaseError(ex.Message);
+            Environment.Exit(1);
+            throw; // unreachable; keeps the compiler happy about the return path
+        }
+    }
+
+    /// <summary>
+    /// Binds configuration and makes every path absolute: per-user state under the data directory,
+    /// model weights beside the program. After this runs, no path in <see cref="AppSettings"/> is
+    /// relative — see <see cref="AppPaths"/> for where the line between the two falls and why it
+    /// matters when the server is shipped as a sidecar.
+    /// </summary>
+    private static (AppSettings Settings, AppPaths Paths) LoadAndResolveSettings(
+        ConfigurationManager configuration, string appBasePath, string[] args)
+    {
+        // First pass: the bundled file only, read purely to learn where the data directory is.
         var settings = new AppSettings();
         configuration.Bind(settings);
 
-        settings.Storage.DatabasePath = ResolvePath(settings.Storage.DatabasePath, appBasePath);
-        settings.Embeddings.ModelsPath = ResolvePath(settings.Embeddings.ModelsPath, appBasePath);
-        settings.Generation.ModelsPath = ResolvePath(settings.Generation.ModelsPath, appBasePath);
+        var paths = AppPaths.Resolve(
+            appBasePath, args, settings.Storage.DataDirectory, settings.Storage.ModelsDirectory);
+
+        paths.EnsureUsable();
+
+        // Second pass: an optional overlay in the data directory, which is where a packaged app can
+        // actually be edited — the bundled file is inside a read-only, update-replaced bundle. It
+        // cannot move the data directory, since resolving that is what found this file.
+        configuration.AddJsonFile(
+            Path.Combine(paths.DataDirectory, "appsettings.json"), optional: true, reloadOnChange: false);
+
+        settings = new AppSettings();
+        configuration.Bind(settings);
+
+        settings.Storage.DatabasePath =
+            paths.InData(settings.Storage.DatabasePath, StorageSettings.DefaultDatabaseFileName);
+        settings.Maintenance.BackupPath =
+            paths.InData(settings.Maintenance.BackupPath, MaintenanceSettings.DefaultRelativeBackupPath);
+
+        settings.Embeddings.ModelsPath =
+            paths.InModels(settings.Embeddings.ModelsPath, EmbeddingsSettings.DefaultRelativeModelsPath);
+        settings.Generation.ModelsPath =
+            paths.InModels(settings.Generation.ModelsPath, GenerationSettings.DefaultRelativeModelsPath);
+        settings.CodeIndex.TypeScriptModelsPath =
+            paths.InModels(settings.CodeIndex.TypeScriptModelsPath, CodeIndexSettings.DefaultRelativeTypeScriptPath);
 
         ApplyCommandLineOverrides(settings, args);
 
-        return settings;
-    }
+        // Last word on the API key, so a host that generates one per install can pass it without
+        // writing to a file. Deliberately not a command-line flag — see ServerSettings.ApiKey.
+        if (Environment.GetEnvironmentVariable(ServerSettings.ApiKeyVariable) is { } key
+            && !string.IsNullOrWhiteSpace(key))
+        {
+            settings.Server.ApiKey = key.Trim();
+        }
 
-    private static string ResolvePath(string path, string basePath) =>
-        Path.IsPathRooted(path) ? path : Path.GetFullPath(Path.Combine(basePath, path));
+        return (settings, paths);
+    }
 
     private static void ApplyCommandLineOverrides(AppSettings settings, string[] args)
     {
@@ -96,15 +175,6 @@ internal class Program
         });
     }
 
-    private static void EnsureDataDirectoryExists(AppSettings settings)
-    {
-        var dataDir = Path.GetDirectoryName(settings.Storage.DatabasePath);
-        if (!string.IsNullOrEmpty(dataDir) && !Directory.Exists(dataDir))
-        {
-            Directory.CreateDirectory(dataDir);
-        }
-    }
-
     private static void ConfigureMcpServer(WebApplicationBuilder builder)
     {
         builder.Services
@@ -113,7 +183,10 @@ internal class Program
                 options.ServerInfo = new()
                 {
                     Name = "agentic-memory",
-                    Version = "1.0.0"
+
+                    // The real build version, not a literal. A client that logs which server it
+                    // spoke to is only useful if the answer changes when the server does.
+                    Version = AppVersion.Current,
                 };
                 options.ServerInstructions = McpInstructions;
             })
@@ -145,7 +218,7 @@ internal class Program
         nothing. All tools act on the active workspace (or the only one registered).
         """;
 
-    private static void PrintStartupInfo(WebApplication app, AppSettings settings)
+    private static void PrintStartupInfo(WebApplication app, AppSettings settings, AppPaths paths)
     {
         var listeningOn = $"http://{settings.Server.BindAddress}:{settings.Server.Port}";
 
@@ -157,7 +230,8 @@ internal class Program
         var generativeService = app.Services.GetRequiredService<IGenerativeModelService>();
 
         var codeIndex = app.Services.GetService<CodeIndexService>();
-        ConsoleHelpers.PrintStartupBanner(settings, listeningOn, embeddingsActive, generativeService.IsAvailable, codeIndex);
+        ConsoleHelpers.PrintStartupBanner(
+            settings, paths, listeningOn, embeddingsActive, generativeService.IsAvailable, codeIndex);
     }
 }
 

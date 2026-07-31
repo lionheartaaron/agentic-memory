@@ -233,15 +233,20 @@ public sealed class ReferenceIndexWorker : DedicatedWorker<ReferenceJob>, IRefer
                     : bucket.Where(x => sym.SymbolDocId is null || x.TargetDocId is null
                                         || x.TargetDocId == sym.SymbolDocId).ToList();
 
-                // The displayed/graph usage sites are the cross-file ones (self-edges are noise). For a
-                // constructor those are the instantiation sites — "who constructs this".
+                // For a constructor the usage sites are the instantiation sites — "who constructs this".
                 var displayRefs = isCtor ? reachableRefs.Where(x => x.Role == "new") : reachableRefs;
 
                 // Keep the (site, referencing-record) pairs so we can roll up test-file usage.
+                //
+                // Same-file sites are retained. Dropping them made any symbol used only within its
+                // own file — a type referenced solely by its module's own function signatures, a
+                // helper called only by its neighbours — indistinguishable from dead code. The
+                // cross-file/self distinction is expressed by ExternalUseCount below instead, which
+                // is what the graph and fan-in derivation consume.
                 var sitePairs = displayRefs
                     .Select(refInfo => (refInfo, refRec: idToRecord.GetValueOrDefault(
                         LiteDbCodeIndexRepository.ComputeId(refInfo.FilePath))))
-                    .Where(x => x.refRec is not null && x.refRec.Id != record.Id)
+                    .Where(x => x.refRec is not null)
                     .ToList();
 
                 var usageSites = sitePairs
@@ -257,11 +262,14 @@ public sealed class ReferenceIndexWorker : DedicatedWorker<ReferenceJob>, IRefer
                     })
                     .ToList();
 
-                foreach (var site in usageSites) allConsumerIds.Add(site.FileId);
+                // A file is never its own consumer — self-edges would make every module depend on itself.
+                foreach (var site in usageSites)
+                    if (!string.Equals(site.FileId, record.Id, StringComparison.Ordinal))
+                        allConsumerIds.Add(site.FileId);
 
                 // P1 near-free rollups over UsedBy (dead-code + test linkage).
                 var testedBy = sitePairs
-                    .Where(x => x.refRec!.IsTestFile)
+                    .Where(x => x.refRec!.IsTestFile && x.refRec.Id != record.Id)
                     .Select(x => x.refRec!.Id)
                     .Distinct(StringComparer.Ordinal)
                     .ToList();
@@ -278,7 +286,7 @@ public sealed class ReferenceIndexWorker : DedicatedWorker<ReferenceJob>, IRefer
                     ProjectId             = record.ProjectId,
                     SubProjectId          = string.IsNullOrEmpty(record.SubProjectId) ? null : record.SubProjectId,
                     UsedBy                = usageSites,
-                    ExternalUseCount      = usageSites.Count,
+                    ExternalUseCount      = usageSites.Count(u => !string.Equals(u.FileId, record.Id, StringComparison.Ordinal)),
                     TestedByFileIds       = testedBy,
                     UpdatedAt             = DateTime.UtcNow,
                 }, ct).GetAwaiter().GetResult();
@@ -292,7 +300,9 @@ public sealed class ReferenceIndexWorker : DedicatedWorker<ReferenceJob>, IRefer
 
         // Derive fan-in / fan-out from what we just wrote.
         var mySymRefs    = _repository.GetDefinedInFileAsync(record.Id, ct).GetAwaiter().GetResult();
-        var usedByIds    = mySymRefs.SelectMany(r => r.UsedBy.Select(u => u.FileId)).Distinct().ToList();
+        var usedByIds    = mySymRefs.SelectMany(r => r.UsedBy.Select(u => u.FileId))
+                                    .Where(id => !string.Equals(id, record.Id, StringComparison.Ordinal))
+                                    .Distinct().ToList();
         var dependsOnRefs = _repository.GetUsedByFileAsync(record.Id, ct).GetAwaiter().GetResult();
         var dependsOnIds  = dependsOnRefs.Select(r => r.DefinedInFileId).Distinct()
                                          .Where(id => id != record.Id).ToList();

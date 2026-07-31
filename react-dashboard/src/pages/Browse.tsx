@@ -149,7 +149,7 @@ export default function Browse() {
 
   const items: Array<{ memory: Memory; score?: number }> =
     debouncedQuery.length > 1
-      ? (searchResults?.map((r) => ({ memory: r.memory, score: r.score })) ?? [])
+      ? (searchResults?.results.map((r) => ({ memory: r.memory, score: r.score })) ?? [])
       : (allMemories
           ?.filter(
             (m) =>

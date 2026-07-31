@@ -29,6 +29,25 @@ public class SymbolReferenceRecord
     public List<string> TestedByFileIds { get; set; } = []; // subset of UsedBy whose file IsTestFile
 
     public DateTime UpdatedAt { get; set; }
+
+    /// <summary>
+    /// Dead-code candidate: nothing anywhere references this definition.
+    ///
+    /// Only behavioural symbols qualify. Data-shaped members — properties, fields, enum members,
+    /// standalone variables and type aliases — are routinely reached through serialization,
+    /// reflection or dynamic access that no compiler-visible reference records, so an unreferenced
+    /// one is not evidence of dead code and flagging it produces noise the caller cannot act on.
+    /// </summary>
+    [BsonIgnore]
+    public bool IsOrphan => UsedBy.Count == 0 && IsDeadCodeCandidateKind(SymbolKind);
+
+    private static bool IsDeadCodeCandidateKind(string kind) => kind.ToLowerInvariant() switch
+    {
+        "property" or "field" or "variable" or "const" or "constant" or "enum-member" or "enummember"
+            or "parameter" or "type-alias" or "typealias" or "type" or "namespace" or "module"
+            or "import" or "export" or "accessor" or "getter" or "setter" => false,
+        _ => true,
+    };
 }
 
 /// <summary>

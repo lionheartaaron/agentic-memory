@@ -39,6 +39,9 @@ public sealed class CodeIndexFixture : IAsyncLifetime
     public string BackendRoot { get; private set; } = "";
     public string WebRoot { get; private set; } = "";
 
+    /// <summary>Sub-projects as discovered, so tests can build the workspace record the MCP tools read.</summary>
+    public IReadOnlyList<SubProjectRecord> SubProjects { get; private set; } = [];
+
     /// <summary>True when the TypeScript/V8 provider initialised and produced symbols for the seed.</summary>
     public bool TypeScriptAvailable { get; private set; }
 
@@ -77,6 +80,7 @@ public sealed class CodeIndexFixture : IAsyncLifetime
         // 1. Discover sub-projects (.csproj → C#, package.json → TS) exactly as the workspace flow does.
         var discovery = new WorkspaceDiscoveryService(NullLogger<WorkspaceDiscoveryService>.Instance);
         var subProjects = await discovery.DiscoverAsync(_tempRoot);
+        SubProjects = subProjects.ToList();
 
         foreach (var sub in subProjects)
         {
@@ -148,6 +152,25 @@ public sealed class CodeIndexFixture : IAsyncLifetime
         var rec  = await GetRecordAsync(relativeSuffix);
         var refs = await Repository.GetDefinedInFileAsync(rec.Id);
         return refs.FirstOrDefault(r => r.SymbolName == symbolName);
+    }
+
+    /// <summary>
+    /// The exact source text a "view source" request would return: lines <c>[Line..EndLine]</c> of the
+    /// defining file, verbatim. Reads from disk rather than from the index, so a stored span that
+    /// truncates or overshoots a declaration shows up as a wrong snippet rather than passing silently.
+    /// </summary>
+    public async Task<string> ReadSymbolSourceAsync(string relativeSuffix, string symbolName)
+    {
+        var record = await GetRecordAsync(relativeSuffix);
+        var symbol = await GetSymbolAsync(relativeSuffix, symbolName);
+
+        var lines = await File.ReadAllLinesAsync(record.FilePath);
+        if (lines.Length == 0) return "";
+
+        var start = Math.Clamp(symbol.Line, 1, lines.Length);
+        var end   = symbol.EndLine <= 0 ? start : Math.Clamp(symbol.EndLine, start, lines.Length);
+
+        return string.Join('\n', lines[(start - 1)..end]);
     }
 
     public Task<IReadOnlyList<DomainFactRecord>> BackendFactsAsync(string? kind = null) =>

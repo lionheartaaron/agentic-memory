@@ -22,12 +22,14 @@ public sealed class LanguageServiceHost
 {
     private readonly string _projectRoot;
     private readonly ScriptFileCache _cache;
+    private readonly ExcludedFolderMatcher _excluded;
     private string[]? _fileList;
 
-    internal LanguageServiceHost(string projectRoot, ScriptFileCache cache)
+    internal LanguageServiceHost(string projectRoot, ScriptFileCache cache, ExcludedFolderMatcher excluded)
     {
         _projectRoot = projectRoot;
         _cache = cache;
+        _excluded = excluded;
     }
 
     // ── ts.LanguageServiceHost methods (called via bridge from TypeScript inside V8) ─────
@@ -52,15 +54,17 @@ public sealed class LanguageServiceHost
     }
 
     /// <summary>
-    /// Returns ALL .ts/.tsx files in the project root up front. Per §3.3: the full file list must
-    /// be enumerated here so TypeScript builds one ts.Program spanning the whole tree. Returning
-    /// files on demand breaks cross-file type resolution.
+    /// Returns ALL .ts/.tsx/.jsx/.js files in the project root up front. Per §3.3: the full file
+    /// list must be enumerated here so TypeScript builds one ts.Program spanning the whole tree.
+    /// Returning files on demand breaks cross-file type resolution.
     /// </summary>
     public string[] GetScriptFileNames()
     {
         _fileList ??= Directory
             .EnumerateFiles(_projectRoot, "*.ts", SearchOption.AllDirectories)
             .Concat(Directory.EnumerateFiles(_projectRoot, "*.tsx", SearchOption.AllDirectories))
+            .Concat(Directory.EnumerateFiles(_projectRoot, "*.jsx", SearchOption.AllDirectories))
+            .Concat(Directory.EnumerateFiles(_projectRoot, "*.js",  SearchOption.AllDirectories))
             .Where(f => !IsInExcludedDir(f))
             .Select(f => f.Replace('\\', '/'))
             .ToArray();
@@ -122,9 +126,14 @@ public sealed class LanguageServiceHost
         return Directory.GetDirectories(path);
     }
 
-    // Returns 4 (TSX) or 3 (TS) — must be non-static so ClearScript exposes it via the instance wrapper
+    // Returns ts.ScriptKind: 1=JS, 2=JSX, 3=TS, 4=TSX — must be non-static so ClearScript exposes it via the instance wrapper
     public int GetScriptKind(string fileName)
-        => fileName.EndsWith(".tsx", StringComparison.OrdinalIgnoreCase) ? 4 : 3;
+    {
+        if (fileName.EndsWith(".tsx", StringComparison.OrdinalIgnoreCase)) return 4;
+        if (fileName.EndsWith(".jsx", StringComparison.OrdinalIgnoreCase)) return 2;
+        if (fileName.EndsWith(".js",  StringComparison.OrdinalIgnoreCase)) return 1;
+        return 3; // .ts
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -134,15 +143,7 @@ public sealed class LanguageServiceHost
         _fileList = null;
     }
 
-    private static bool IsInExcludedDir(string path)
-    {
-        foreach (var seg in path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
-        {
-            if (seg is "node_modules" or "obj" or "bin" or ".git" or ".expo" or "dist" or "build" or ".turbo")
-                return true;
-        }
-        return false;
-    }
+    private bool IsInExcludedDir(string path) => _excluded.IsExcluded(path, _projectRoot);
 }
 
 /// <summary>

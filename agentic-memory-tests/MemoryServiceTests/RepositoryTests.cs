@@ -16,7 +16,7 @@ public class RepositoryTests : MemoryServiceTestBase
 
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Equal("Test Memory", retrieved.Title);
         Assert.Equal("Test summary", retrieved.Summary);
@@ -32,7 +32,7 @@ public class RepositoryTests : MemoryServiceTestBase
         memory.Summary = "Updated summary";
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Equal("Updated Title", retrieved.Title);
         Assert.Equal("Updated summary", retrieved.Summary);
@@ -45,7 +45,7 @@ public class RepositoryTests : MemoryServiceTestBase
     [Fact]
     public async Task Repository_Get_ReturnsNullForNonexistent()
     {
-        var result = await Repository.GetAsync(Guid.NewGuid(), TestContext.Current.CancellationToken);
+        var result = await Repository.GetAsync(Guid.NewGuid(), Scope, TestContext.Current.CancellationToken);
         Assert.Null(result);
     }
 
@@ -58,7 +58,7 @@ public class RepositoryTests : MemoryServiceTestBase
             await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
         }
 
-        var all = await Repository.GetAllAsync(TestContext.Current.CancellationToken);
+        var all = await AdminStore.GetAllAsync(true, TestContext.Current.CancellationToken);
         Assert.Equal(5, all.Count);
     }
 
@@ -67,23 +67,43 @@ public class RepositoryTests : MemoryServiceTestBase
     #region Delete Tests
 
     [Fact]
-    public async Task Repository_Delete_RemovesMemory()
+    public async Task Repository_Forget_StopsRecallButKeepsTombstone()
     {
-        var memory = CreateTestMemory("To Delete", "Will be deleted");
+        var memory = CreateTestMemory("To Forget", "Will be forgotten");
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var deleted = await Repository.DeleteAsync(memory.Id, TestContext.Current.CancellationToken);
-        Assert.True(deleted);
+        var forgotten = await Repository.ForgetAsync(memory.Id, Scope, "test", TestContext.Current.CancellationToken);
+        Assert.True(forgotten);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        // No longer recallable...
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.Null(retrieved);
+
+        // ...but the row still exists, so an accidental forget is recoverable.
+        var raw = await AdminStore.GetByIdUnscopedAsync(memory.Id, TestContext.Current.CancellationToken);
+        Assert.NotNull(raw);
+        Assert.Equal(MemoryState.Forgotten, raw.State);
     }
 
     [Fact]
-    public async Task Repository_Delete_ReturnsFalseForNonexistent()
+    public async Task Repository_Restore_BringsBackForgottenMemory()
     {
-        var deleted = await Repository.DeleteAsync(Guid.NewGuid(), TestContext.Current.CancellationToken);
-        Assert.False(deleted);
+        var memory = CreateTestMemory("Oops", "Forgotten by mistake");
+        await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
+        await Repository.ForgetAsync(memory.Id, Scope, "test", TestContext.Current.CancellationToken);
+
+        Assert.True(await Repository.RestoreAsync(memory.Id, Scope, "test", TestContext.Current.CancellationToken));
+
+        var restored = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
+        Assert.NotNull(restored);
+        Assert.Equal(MemoryState.Active, restored.State);
+    }
+
+    [Fact]
+    public async Task Repository_Forget_ReturnsFalseForNonexistent()
+    {
+        var forgotten = await Repository.ForgetAsync(Guid.NewGuid(), Scope, "test", TestContext.Current.CancellationToken);
+        Assert.False(forgotten);
     }
 
     #endregion
@@ -97,7 +117,9 @@ public class RepositoryTests : MemoryServiceTestBase
         await Repository.SaveAsync(CreateTestMemory("Work 2", "Another work", tags: ["work", "project"]), TestContext.Current.CancellationToken);
         await Repository.SaveAsync(CreateTestMemory("Personal", "Personal note", tags: ["personal"]), TestContext.Current.CancellationToken);
 
-        var workMemories = await Repository.SearchByTagsAsync(["work"], 10, TestContext.Current.CancellationToken);
+        var workMemories = await Repository.QueryAsync(
+            Scope, new MemoryQueryOptions { Tags = ["work"], Limit = 10 }, TestContext.Current.CancellationToken);
+
         Assert.Equal(2, workMemories.Count);
         Assert.All(workMemories, m => Assert.Contains("work", m.Tags));
     }
@@ -111,8 +133,22 @@ public class RepositoryTests : MemoryServiceTestBase
             await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
         }
 
-        var results = await Repository.SearchByTextAsync("Memory", 5, TestContext.Current.CancellationToken);
+        var results = await SearchService.SearchAsync("Memory", 5, null, TestContext.Current.CancellationToken);
         Assert.True(results.Count <= 5);
+        Assert.NotEmpty(results);
+    }
+
+    [Fact]
+    public async Task Repository_Search_FindsTextInContent()
+    {
+        // Content was previously stored but never indexed, so it was unsearchable.
+        await Repository.SaveAsync(
+            CreateTestMemory("Trip notes", "A short note", "we ate tonkotsu ramen in Fukuoka"),
+            TestContext.Current.CancellationToken);
+
+        var results = await SearchService.SearchAsync("tonkotsu", 5, null, TestContext.Current.CancellationToken);
+
+        Assert.Contains(results, r => r.Memory.Title == "Trip notes");
     }
 
     #endregion
@@ -127,7 +163,7 @@ public class RepositoryTests : MemoryServiceTestBase
             await Repository.SaveAsync(CreateTestMemory($"Memory {i}", $"Summary {i}"), TestContext.Current.CancellationToken);
         }
 
-        var stats = await Repository.GetStatsAsync(TestContext.Current.CancellationToken);
+        var stats = await Repository.GetStatsAsync(Scope, TestContext.Current.CancellationToken);
         Assert.Equal(3, stats.TotalNodes);
         Assert.True(stats.AverageStrength > 0);
     }
@@ -142,13 +178,13 @@ public class RepositoryTests : MemoryServiceTestBase
         var memory = CreateTestMemory("Reinforce Test", "Testing reinforcement");
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var beforeReinforce = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var beforeReinforce = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(beforeReinforce);
         var initialAccessCount = beforeReinforce.AccessCount;
 
         await Repository.ReinforceAsync(memory.Id, TestContext.Current.CancellationToken);
 
-        var afterReinforce = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var afterReinforce = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(afterReinforce);
         Assert.True(afterReinforce.AccessCount > initialAccessCount);
     }
@@ -183,7 +219,7 @@ public class RepositoryTests : MemoryServiceTestBase
 
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
 
         if (EmbeddingService != null)
@@ -205,7 +241,7 @@ public class RepositoryTests : MemoryServiceTestBase
             await Repository.ReinforceAsync(memory.Id, TestContext.Current.CancellationToken);
         }
 
-        var final = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var final = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(final);
         Assert.Equal(5, final.AccessCount);
     }
@@ -220,7 +256,7 @@ public class RepositoryTests : MemoryServiceTestBase
         memory.IsArchived = true;
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.True(retrieved.IsArchived);
     }
@@ -283,7 +319,7 @@ public class RepositoryTests : MemoryServiceTestBase
 
         Assert.Equal(20, ids.Distinct().Count());
 
-        var stats = await Repository.GetStatsAsync(TestContext.Current.CancellationToken);
+        var stats = await Repository.GetStatsAsync(Scope, TestContext.Current.CancellationToken);
         Assert.Equal(20, stats.TotalNodes);
     }
 
@@ -302,7 +338,7 @@ public class RepositoryTests : MemoryServiceTestBase
         {
             for (int i = 0; i < 5; i++)
             {
-                await Repository.GetAsync(id, TestContext.Current.CancellationToken);
+                await Repository.GetAsync(id, Scope, TestContext.Current.CancellationToken);
             }
         });
 
@@ -314,7 +350,7 @@ public class RepositoryTests : MemoryServiceTestBase
 
         await Task.WhenAll(readTasks.Concat(writeTasks));
 
-        var stats = await Repository.GetStatsAsync(TestContext.Current.CancellationToken);
+        var stats = await Repository.GetStatsAsync(Scope, TestContext.Current.CancellationToken);
         Assert.Equal(20, stats.TotalNodes);
     }
 
@@ -330,7 +366,7 @@ public class RepositoryTests : MemoryServiceTestBase
 
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Equal(50000, retrieved.Content.Length);
     }
@@ -345,7 +381,7 @@ public class RepositoryTests : MemoryServiceTestBase
 
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Contains("<>&", retrieved.Title);
         Assert.Contains("\n", retrieved.Summary);
@@ -360,7 +396,7 @@ public class RepositoryTests : MemoryServiceTestBase
 
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.True(string.IsNullOrEmpty(retrieved.Title), "Title should be empty or null");
         Assert.True(string.IsNullOrEmpty(retrieved.Summary), "Summary should be empty or null");
@@ -374,7 +410,7 @@ public class RepositoryTests : MemoryServiceTestBase
 
         await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
 
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Equal(100, retrieved.Tags.Count);
     }
@@ -388,15 +424,15 @@ public class RepositoryTests : MemoryServiceTestBase
         await Repository.SaveAsync(memory1, TestContext.Current.CancellationToken);
         await Repository.SaveAsync(memory2, TestContext.Current.CancellationToken);
 
-        var retrieved1 = await Repository.GetAsync(memory1.Id, TestContext.Current.CancellationToken);
-        var retrieved2 = await Repository.GetAsync(memory2.Id, TestContext.Current.CancellationToken);
+        var retrieved1 = await Repository.GetAsync(memory1.Id, Scope, TestContext.Current.CancellationToken);
+        var retrieved2 = await Repository.GetAsync(memory2.Id, Scope, TestContext.Current.CancellationToken);
 
         Assert.NotNull(retrieved1);
         Assert.NotNull(retrieved2);
     }
 
     [Fact]
-    public async Task Repository_WeakMemories_CanBeQueried()
+    public async Task Repository_WeakMemories_AreCountedButNeverRemoved()
     {
         var strongMemory = CreateTestMemory("Strong Memory", "High strength");
         strongMemory.BaseStrength = 1.0;
@@ -407,9 +443,14 @@ public class RepositoryTests : MemoryServiceTestBase
         weakMemory.LastAccessedAt = DateTime.UtcNow.AddDays(-30);
         await Repository.SaveAsync(weakMemory, TestContext.Current.CancellationToken);
 
-        var weakMemories = await Repository.GetWeakMemoriesAsync(0.5, 10, TestContext.Current.CancellationToken);
+        var stats = await Repository.GetStatsAsync(Scope, TestContext.Current.CancellationToken);
 
-        Assert.NotEmpty(weakMemories);
+        // Weakness is reported as a health signal only. It no longer decides retention.
+        Assert.True(stats.WeakMemoriesCount >= 1);
+        Assert.Equal(2, stats.ActiveNodes);
+
+        var stillThere = await Repository.GetAsync(weakMemory.Id, Scope, TestContext.Current.CancellationToken);
+        Assert.NotNull(stillThere);
     }
 
     [Fact]
@@ -419,13 +460,37 @@ public class RepositoryTests : MemoryServiceTestBase
         {
             var memory = CreateTestMemory($"Temp Memory {i}", $"Temporary content {i}");
             await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
-            await Repository.DeleteAsync(memory.Id, TestContext.Current.CancellationToken);
+            await Repository.ForgetAsync(memory.Id, Scope, "test", TestContext.Current.CancellationToken);
         }
 
-        await Repository.CompactAsync(TestContext.Current.CancellationToken);
+        // Forgetting tombstones; only the retention purge removes rows, and only past the window.
+        var beforePurge = await Repository.GetStatsAsync(Scope, TestContext.Current.CancellationToken);
+        Assert.Equal(10, beforePurge.ForgottenNodes);
 
-        var stats = await Repository.GetStatsAsync(TestContext.Current.CancellationToken);
+        var purged = await AdminStore.PurgeForgottenAsync(
+            TimeSpan.Zero, "test", TestContext.Current.CancellationToken);
+        Assert.Equal(10, purged);
+
+        await AdminStore.CompactAsync(TestContext.Current.CancellationToken);
+
+        var stats = await Repository.GetStatsAsync(Scope, TestContext.Current.CancellationToken);
         Assert.Equal(0, stats.TotalNodes);
+    }
+
+    [Fact]
+    public async Task Purge_KeepsAuditTrailAfterRowIsGone()
+    {
+        var memory = CreateTestMemory("Erase me", "Sensitive detail");
+        await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
+        await Repository.ForgetAsync(memory.Id, Scope, "test", TestContext.Current.CancellationToken);
+        await AdminStore.PurgeForgottenAsync(TimeSpan.Zero, "test", TestContext.Current.CancellationToken);
+
+        Assert.Null(await AdminStore.GetByIdUnscopedAsync(memory.Id, TestContext.Current.CancellationToken));
+
+        // "Why is this gone?" stays answerable after the data itself is destroyed.
+        var events = await EventLog.GetForMemoryAsync(memory.Id, TestContext.Current.CancellationToken);
+        Assert.Contains(events, e => e.Type == MemoryEventType.Forgotten);
+        Assert.Contains(events, e => e.Type == MemoryEventType.Purged);
     }
 
     #endregion

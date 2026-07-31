@@ -1,7 +1,12 @@
 import type {
   Memory,
-  ScoredMemory,
+  MemoryRetrievalResult,
+  MemoryConflict,
+  MemoryEvent,
   RepositoryStats,
+  BackupSnapshot,
+  StoragePaths,
+  DatabaseInfo,
   HealthResponse,
   SystemStatus,
   CreateMemoryRequest,
@@ -24,11 +29,70 @@ import type {
   SemanticSymbolHit,
 } from './types'
 
+/** Builds a query string, omitting undefined/empty values. */
+function qs(params: Record<string, string | number | boolean | undefined>): string {
+  const entries = Object.entries(params).filter(
+    ([, v]) => v !== undefined && v !== '',
+  ) as [string, string | number | boolean][]
+
+  if (!entries.length) return ''
+  return '?' + entries.map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&')
+}
+
+const API_KEY_STORAGE = 'agenticMemoryApiKey'
+
+/**
+ * The server's API key, when it has one configured.
+ *
+ * Kept in localStorage rather than baked into the bundle: the dashboard is static and identical for
+ * every install, so anything compiled in would ship the secret to everyone. A browser also cannot
+ * attach a header to its own page load, which is why the static assets are unauthenticated and only
+ * the `/api` calls below carry the key.
+ */
+export function getApiKey(): string {
+  try {
+    return localStorage.getItem(API_KEY_STORAGE) ?? ''
+  } catch {
+    return '' // private browsing, or storage disabled
+  }
+}
+
+export function setApiKey(key: string): void {
+  try {
+    if (key) localStorage.setItem(API_KEY_STORAGE, key)
+    else localStorage.removeItem(API_KEY_STORAGE)
+  } catch {
+    /* nothing useful to do; requests will 401 and say so */
+  }
+}
+
+/** Thrown when the server requires a key and did not get a valid one. */
+export class UnauthorizedError extends Error {
+  constructor(message = 'This server requires an API key.') {
+    super(message)
+    this.name = 'UnauthorizedError'
+  }
+}
+
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
+  const key = getApiKey()
+
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(key ? { 'X-API-Key': key } : {}),
+      ...init?.headers,
+    },
     ...init,
   })
+
+  // Distinguished from a generic failure so the UI can prompt for a key rather than reporting
+  // the server as broken.
+  if (res.status === 401) {
+    const body = await res.json().catch(() => null)
+    throw new UnauthorizedError(body?.error)
+  }
+
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
@@ -59,15 +123,53 @@ export const api = {
 
   delete: (id: string) => req<void>(`/api/memory/${id}`, { method: 'DELETE' }),
 
-  search: (query: string, topN = 20, tags?: string[]) =>
-    req<ScoredMemory[]>('/api/memory/search', {
+  search: (
+    query: string,
+    topN = 20,
+    tags?: string[],
+    userId?: string,
+    companionId?: string,
+    opts?: { asOf?: string; noveltyBias?: number },
+  ) =>
+    req<MemoryRetrievalResult>('/api/memory/search', {
       method: 'POST',
       body: JSON.stringify({
         query,
         topN,
         tags: tags?.length ? tags : undefined,
+        userId,
+        companionId,
+        asOf: opts?.asOf,
+        noveltyBias: opts?.noveltyBias,
       }),
     }),
+
+  /** Where the database, snapshots and models actually are on disk. */
+  paths: () => req<StoragePaths>('/api/admin/paths'),
+
+  /** Schema version, app version, and every migration this database has been through. */
+  database: () => req<DatabaseInfo>('/api/admin/database'),
+
+  backups: () => req<BackupSnapshot[]>('/api/admin/backups'),
+
+  createBackup: () => req<BackupSnapshot>('/api/admin/backups', { method: 'POST' }),
+
+  conflicts: (userId?: string, companionId?: string) =>
+    req<MemoryConflict[]>(
+      `/api/memory/conflicts${qs({ userId, companionId })}`),
+
+  resolveConflict: (id: string, winnerId?: string, dismiss = false) =>
+    req<void>(`/api/memory/conflicts/${id}/resolve`, {
+      method: 'POST',
+      body: JSON.stringify({ winnerId, dismiss }),
+    }),
+
+  history: (id: string) => req<MemoryEvent[]>(`/api/memory/${id}/history`),
+
+  restore: (id: string) => req<void>(`/api/memory/${id}/restore`, { method: 'POST' }),
+
+  slotHistory: (predicate: string, subject = 'user', userId?: string, companionId?: string) =>
+    req<Memory[]>(`/api/memory/slot${qs({ predicate, subject, userId, companionId })}`),
 
   fileContext: (filePath: string) =>
     req<{ context: string }>(`/api/file/context?path=${encodeURIComponent(filePath)}`),

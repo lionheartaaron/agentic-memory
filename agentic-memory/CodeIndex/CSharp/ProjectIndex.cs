@@ -52,7 +52,13 @@ internal sealed class ProjectIndex : IDisposable
     internal CSharpCompilation? Compilation => _compilation;
     internal bool IsIndexBuilt => _indexBuilt;
 
-    internal ProjectIndex(string root) => _root = root;
+    internal ProjectIndex(string root, ExcludedFolderMatcher excluded)
+    {
+        _root = root;
+        _excluded = excluded;
+    }
+
+    private readonly ExcludedFolderMatcher _excluded;
 
     // ── Build ─────────────────────────────────────────────────────────────────
 
@@ -471,15 +477,7 @@ internal sealed class ProjectIndex : IDisposable
     private static string VersionOf(string source)
         => source.Length.ToString("X8") + "-" + ((uint)source.GetHashCode()).ToString("X8");
 
-    private static bool IsInExcludedDir(string path)
-    {
-        foreach (var seg in path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
-        {
-            if (seg is "obj" or "bin" or ".git" or "node_modules" or ".vs" or ".vscode")
-                return true;
-        }
-        return false;
-    }
+    private bool IsInExcludedDir(string path) => _excluded.IsExcluded(path, _root);
 
     public void Dispose() { }
 }

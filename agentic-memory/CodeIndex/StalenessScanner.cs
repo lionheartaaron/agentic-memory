@@ -13,6 +13,7 @@ public sealed class StalenessScanner
     private readonly ISummaryQueue _summaryQueue;
     private readonly IReferenceQueue _referenceQueue;
     private readonly CodeIndexSettings _settings;
+    private readonly ExcludedFolderMatcher _excluded;
     private readonly ILogger<StalenessScanner> _logger;
 
     public StalenessScanner(
@@ -28,6 +29,7 @@ public sealed class StalenessScanner
         _summaryQueue   = summaryQueue;
         _referenceQueue = referenceQueue;
         _settings       = settings;
+        _excluded       = new ExcludedFolderMatcher(settings.ExcludePatterns);
         _logger         = logger;
     }
 
@@ -205,7 +207,7 @@ public sealed class StalenessScanner
     {
         try
         {
-            var manifests = ManifestExtractor.Extract(root, projectId, subProjectId, DateTime.UtcNow);
+            var manifests = ManifestExtractor.Extract(root, projectId, subProjectId, DateTime.UtcNow, _settings.ExcludePatterns);
             await _repository.UpsertProjectManifestsAsync(projectId, manifests, ct);
             _logger.LogInformation("Captured {Count} project manifest(s) for {ProjectId}", manifests.Count, projectId);
         }
@@ -241,29 +243,9 @@ public sealed class StalenessScanner
         {
             if (count >= _settings.MaxFilesPerProject) break;
             if (!extensions.Contains(Path.GetExtension(file))) continue;
-            if (IsExcluded(file, root)) continue;
+            if (_excluded.IsExcluded(file, root)) continue;
             count++;
             yield return file;
         }
-    }
-
-    private bool IsExcluded(string filePath, string root)
-    {
-        var relative = Path.GetRelativePath(root, filePath);
-        var segments = relative.Split(
-            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
-            StringSplitOptions.RemoveEmptyEntries);
-
-        // Only check directory segments — the file name itself is never excluded
-        for (var i = 0; i < segments.Length - 1; i++)
-        {
-            foreach (var pattern in _settings.ExcludePatterns)
-            {
-                var keyPart = pattern.Replace("**/", "").Replace("/**", "").Replace("**", "");
-                if (segments[i].Equals(keyPart, StringComparison.OrdinalIgnoreCase))
-                    return true;
-            }
-        }
-        return false;
     }
 }

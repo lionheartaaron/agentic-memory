@@ -752,6 +752,7 @@ public class CodeIndexTools
             Implementations: implementations,
             Callers:         callers,
             ReferencesCount: reference.UsedBy.Count,
+            IsOrphan:        reference.IsOrphan,
             Summary:         summary,
             Id:              reference.Id);
 
@@ -1039,7 +1040,7 @@ internal sealed record DependencyDto(string Name, string Path);
 internal sealed record SymbolContextDto(
     string Symbol, string Subproject, string Kind, DefinitionDto Definition,
     IReadOnlyList<ImplementationDto> Implementations, IReadOnlyList<CallerDto> Callers,
-    int ReferencesCount, string? Summary, string Id);
+    int ReferencesCount, bool IsOrphan, string? Summary, string Id);
 
 internal sealed record DefinitionDto(string File, int Line, string? Signature);
 internal sealed record ImplementationDto(string Name, string File, int Line);

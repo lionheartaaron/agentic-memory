@@ -30,8 +30,16 @@ public sealed class CSharpRoslynProvider : ICodeIntelligenceProvider, IBatchRefe
     private readonly ConcurrentDictionary<string, ProjectIndex> _projects
         = new(StringComparer.OrdinalIgnoreCase);
     private readonly ILogger<CSharpRoslynProvider> _logger;
+    private readonly ExcludedFolderMatcher _excluded;
 
-    public CSharpRoslynProvider(ILogger<CSharpRoslynProvider> logger) => _logger = logger;
+    public CSharpRoslynProvider(
+        ILogger<CSharpRoslynProvider> logger,
+        Configuration.CodeIndexSettings? settings = null)
+    {
+        _logger = logger;
+        _excluded = new ExcludedFolderMatcher(
+            (settings ?? new Configuration.CodeIndexSettings()).ExcludePatterns);
+    }
 
     public string ProviderType => "dotnet-csharp";
 
@@ -72,7 +80,7 @@ public sealed class CSharpRoslynProvider : ICodeIntelligenceProvider, IBatchRefe
             return;
         }
 
-        var index = new ProjectIndex(projectRoot);
+        var index = new ProjectIndex(projectRoot, _excluded);
         try
         {
             await index.BuildAsync(ct);

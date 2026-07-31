@@ -1,6 +1,8 @@
 using AgenticMemory.Brain.Models;
 using AgenticMemory.CodeIndex;
+using AgenticMemory.Persistence.Migrations;
 using LiteDB;
+using Microsoft.Extensions.Logging;
 
 namespace AgenticMemory.Persistence;
 
@@ -22,9 +24,16 @@ public sealed class SharedLiteDatabase : IDisposable
     public LiteDatabase Database { get; }
     public string DatabasePath  { get; }
 
+    /// <summary>What the schema migration did on this open. See <see cref="DatabaseMigrator"/>.</summary>
+    public DatabaseMigrationReport Migration { get; }
+
     private bool _disposed;
 
-    public SharedLiteDatabase(string databasePath)
+    /// <param name="backupDirectory">
+    /// Where to put the snapshot taken before a schema migration. Null skips it — acceptable for a
+    /// throwaway database, not for a user's.
+    /// </param>
+    public SharedLiteDatabase(string databasePath, string? backupDirectory = null, ILogger? logger = null)
     {
         DatabasePath = databasePath;
 
@@ -41,6 +50,23 @@ public sealed class SharedLiteDatabase : IDisposable
             Filename   = databasePath,
             Connection = ConnectionType.Direct,
         }, mapper);
+
+        // WHY UTC_DATE: LiteDB stores dates as UTC ticks but, by default, converts them to *local*
+        // time on read. Every timestamp in this codebase is written as DateTime.UtcNow, so on any
+        // machine not running at UTC they came back skewed by the local bias — quietly breaking
+        // every comparison against DateTime.UtcNow: expiry checks, decay and recency windows,
+        // cold-storage cutoffs, and the retention purge for forgotten memories.
+        //
+        // The stored bytes were always correct, so enabling this fixes reads with no data migration.
+        Database.Pragma("UTC_DATE", true);
+
+        // Here rather than in a repository constructor, which is where this used to live. Repositories
+        // are resolved lazily and in whatever order the container decides, so "migrate on first use"
+        // only holds for the one type that remembered to ask — every other collection was reachable
+        // before its schema had been brought up to date. Doing it at the point the file is opened is
+        // the only place that is true for all of them, and it is after the UTC_DATE pragma, so a step
+        // comparing timestamps sees the same values the rest of the application will.
+        Migration = DatabaseMigrator.Run(Database, databasePath, backupDirectory, logger);
     }
 
     public void Dispose()

@@ -86,6 +86,25 @@ public static class TrigramFuzzyMatcher
     }
 
     /// <summary>
+    /// Overlap coefficient: the share of the <em>smaller</em> set that also appears in the larger one.
+    ///
+    /// Jaccard is the wrong measure for matching a short query against a whole memory. A three-word
+    /// query has perhaps twenty trigrams and the memory it belongs to several hundred, so even a
+    /// perfect match scores around 0.05 on Jaccard — indistinguishable from two unrelated English
+    /// sentences, which is why the previous typo threshold had to be set so low that it admitted the
+    /// entire store. Dividing by the smaller set makes the score mean "how much of the query is
+    /// present", which is the actual question.
+    /// </summary>
+    public static float CalculateOverlap(HashSet<string> trigramsA, HashSet<string> trigramsB)
+    {
+        if (trigramsA.Count == 0 || trigramsB.Count == 0)
+            return 0f;
+
+        var intersection = trigramsA.Intersect(trigramsB, StringComparer.OrdinalIgnoreCase).Count();
+        return (float)intersection / Math.Min(trigramsA.Count, trigramsB.Count);
+    }
+
+    /// <summary>
     /// Check if similarity exceeds a threshold
     /// </summary>
     public static bool IsSimilar(string a, string b, float threshold = 0.3f)

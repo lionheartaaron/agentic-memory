@@ -1,25 +1,69 @@
+export type MemoryVisibility = 'Global' | 'Scoped'
+export type MemoryState = 'Active' | 'Superseded' | 'Archived' | 'Forgotten' | 'Merged'
+export type MemoryType =
+  | 'Semantic' | 'Identity' | 'Preference' | 'Persona' | 'Episodic' | 'Affective' | 'Ephemeral'
+export type MemorySource = 'UserStated' | 'Imported' | 'SystemDerived' | 'CompanionInferred'
+export type Sensitivity = 'Normal' | 'Sensitive' | 'Restricted'
+export type RetrievalConfidence = 'None' | 'Low' | 'Medium' | 'High'
+
 export interface Memory {
   id: string
+  version: number
+
+  // Scope — the privacy boundary.
+  userId: string
+  visibility: MemoryVisibility
+  companionIds: string[]
+
+  // Subject and slot — drive conflict resolution.
+  subjectRef: string
+  predicate?: string
+  valueKey?: string
+
+  type: MemoryType
+  sensitivity: Sensitivity
+
   title: string
   summary: string
   content: string
   contentNormalized: string
+  searchText: string
+  verbatimQuote?: string
   tags: string[]
+
+  // Provenance.
+  source: MemorySource
+  confidence: number
+  conversationId?: string
+  messageId?: string
+
   createdAt: string
+  ingestedAt: string
+  eventTime?: string
   lastAccessedAt: string
-  baseStrength: number
-  decayRate: number
-  accessCount: number
-  isArchived: boolean
-  isCurrent: boolean
-  isPinned: boolean
-  importance: number
-  linkedNodeIds: string[]
-  supersededBy?: string
-  supersededIds: string[]
   validFrom: string
   validUntil?: string
   expiresAt?: string
+
+  state: MemoryState
+  /** Derived from `state`; retained for compatibility. */
+  isArchived: boolean
+  isCurrent: boolean
+  isExpired: boolean
+
+  baseStrength: number
+  decayRate: number
+  accessCount: number
+  isPinned: boolean
+  importance: number
+
+  linkedNodeIds: string[]
+  supersededBy?: string
+  supersededIds: string[]
+  mergedInto?: string
+
+  embeddingModel?: string
+  embeddingDim: number
 }
 
 export interface ScoredMemory {
@@ -28,11 +72,125 @@ export interface ScoredMemory {
   fuzzyScore: number
   strengthScore: number
   recencyScore: number
-  semanticScore: number
+  /** Null when this memory's vector was not comparable to the query's. */
+  semanticScore: number | null
+  matchedChannels: string[]
+  isCoreContext: boolean
+  /** Turns in which THIS companion has already drawn on the memory. 0 = new to her. */
+  timesSurfacedToCompanion: number
+  lastSurfacedToCompanionAt?: string
+}
+
+export type ConflictKind =
+  | 'ValueReplaced' | 'SoftPreferenceChange' | 'ImmutableViolation'
+  | 'CrossScopeContradiction' | 'ProvenanceDowngrade' | 'PolarityContradiction'
+
+export interface MemoryConflict {
+  id: string
+  userId: string
+  newMemoryId: string
+  existingMemoryId: string
+  subjectRef: string
+  predicate?: string
+  kind: ConflictKind
+  status: 'Open' | 'Resolved' | 'Dismissed'
+  detectedAt: string
+  resolvedAt?: string
+  winnerId?: string
+  description: string
+  companionId?: string
+}
+
+export interface MemoryEvent {
+  id: string
+  sequence: number
+  userId: string
+  memoryId: string
+  type: string
+  actor: string
+  timestamp: string
+  relatedMemoryId?: string
+  memoryTitle?: string
+  detail?: string
+}
+
+/** Envelope returned by POST /api/memory/search. */
+export interface MemoryRetrievalResult {
+  results: ScoredMemory[]
+  coreContext: ScoredMemory[]
+  conflicts: MemoryConflict[]
+  confidence: RetrievalConfidence
+  candidatesConsidered: number
+  semanticSearchUsed: boolean
+  /** Non-zero means a reindex is needed. */
+  incomparableEmbeddings: number
+}
+
+/** A point-in-time copy of the store, taken before anything irreversible. */
+export interface BackupSnapshot {
+  path: string
+  reason: string
+  createdAt: string
+  sizeBytes: number
+}
+
+/**
+ * Where the server keeps things. `dataDirectory` is per-user and survives an application update;
+ * `modelsDirectory` sits with the binary and is replaced by it.
+ */
+export interface StoragePaths {
+  dataDirectory: string
+  databasePath: string
+  backupPath: string
+  databaseBytes: number | null
+  modelsDirectory: string
+  embeddingsPath: string
+  generativePath: string
+  programDirectory: string
+  /** How the data directory was chosen: CommandLine | Environment | Configuration | Portable | PlatformDefault. */
+  origin: string
+}
+
+export interface MigrationHistoryEntry {
+  fromVersion: number
+  toVersion: number
+  name: string
+  documentsTouched: number
+  appliedAt: string
+  /** The application version that ran it — which release changed the data. */
+  appVersion: string
+}
+
+/**
+ * The database's account of itself. `schemaVersion` describes the shape of the stored data and
+ * `appVersion` the build that is running; they move independently, so a host deciding whether an
+ * older build may safely open this file has to compare `schemaVersion` against
+ * `supportedSchemaVersion`, not the app versions.
+ */
+export interface DatabaseInfo {
+  schemaVersion: number
+  supportedSchemaVersion: number
+  appVersion: string
+
+  createdAt: string | null
+  createdByAppVersion: string | null
+  lastOpenedAt: string | null
+  lastOpenedByAppVersion: string | null
+
+  migratedOnThisStart: boolean
+  migratedFromVersion: number
+  snapshotPath: string | null
+
+  history: MigrationHistoryEntry[]
 }
 
 export interface RepositoryStats {
   totalNodes: number
+  activeNodes: number
+  supersededNodes: number
+  archivedNodes: number
+  forgottenNodes: number
+  openConflicts: number
   averageStrength: number
   weakMemoriesCount: number
   oldestMemory?: string

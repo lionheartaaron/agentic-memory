@@ -1,0 +1,27 @@
+<Project>
+
+  <!--
+    Settings shared by every project in the repository.
+
+    These live here rather than being repeated per-project because the application and its test
+    assembly must compile to the same thing. They previously did not: the application pinned
+    PlatformTarget to x64 while the test project defaulted to AnyCPU, which is an architecture
+    mismatch between an assembly and the assembly testing it. The .NET CLI tolerates it because
+    it hosts everything in a 64-bit process anyway; Visual Studio reports it, and a 32-bit or
+    arm64 host would fail outright.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!--
+      AnyCPU, deliberately. Nothing here requires a fixed bitness — the native dependencies
+      (ONNX Runtime, ClearScript V8) resolve their own per-architecture binaries at restore or
+      load time. Pinning x64 bought nothing and made the build unusable on arm64, which now
+      includes every Apple Silicon Mac and a growing share of Windows machines.
+    -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+  </PropertyGroup>
+
+</Project>

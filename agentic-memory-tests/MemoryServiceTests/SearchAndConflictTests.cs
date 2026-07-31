@@ -163,7 +163,7 @@ public class SearchAndConflictTests : MemoryServiceTestBase
         Assert.NotNull(result);
         Assert.NotEqual(Guid.Empty, result.Memory.Id);
 
-        var retrieved = await Repository.GetAsync(result.Memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(result.Memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Contains("\ud83d\ude80", retrieved.Title);
         Assert.Contains("smile", retrieved.Summary);
@@ -182,7 +182,7 @@ public class SearchAndConflictTests : MemoryServiceTestBase
         Assert.NotNull(result);
         Assert.NotEqual(Guid.Empty, result.Memory.Id);
 
-        var retrieved = await Repository.GetAsync(result.Memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(result.Memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Contains("Unpaired Surrogate Conflict Test", retrieved.Title);
         Assert.Contains("should not crash", retrieved.Content);
@@ -232,14 +232,14 @@ public class SearchAndConflictTests : MemoryServiceTestBase
             // Verify each superseded memory is archived in the database
             foreach (var superseded in result2.SupersededMemories)
             {
-                var fromDb = await Repository.GetAsync(superseded.Id, TestContext.Current.CancellationToken);
+                var fromDb = await Repository.GetAsync(superseded.Id, Scope, TestContext.Current.CancellationToken);
                 Assert.NotNull(fromDb);
                 Assert.True(fromDb.IsArchived, $"Superseded memory '{fromDb.Title}' should be archived");
                 Assert.Equal(updated.Id, fromDb.SupersededBy);
             }
             
             // The new memory should track what it superseded
-            var newMemory = await Repository.GetAsync(updated.Id, TestContext.Current.CancellationToken);
+            var newMemory = await Repository.GetAsync(updated.Id, Scope, TestContext.Current.CancellationToken);
             Assert.NotNull(newMemory);
             Assert.NotEmpty(newMemory.SupersededIds);
         }
@@ -303,8 +303,8 @@ public class SearchAndConflictTests : MemoryServiceTestBase
             $"Expected coexist or new, got: {result.Action}");
         
         // Both memories should exist
-        var basics = await Repository.GetAsync(pythonBasics.Id, TestContext.Current.CancellationToken);
-        var advanced = await Repository.GetAsync(pythonAdvanced.Id, TestContext.Current.CancellationToken);
+        var basics = await Repository.GetAsync(pythonBasics.Id, Scope, TestContext.Current.CancellationToken);
+        var advanced = await Repository.GetAsync(pythonAdvanced.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(basics);
         Assert.NotNull(advanced);
         Assert.False(basics.IsArchived);
@@ -341,7 +341,7 @@ public class SearchAndConflictTests : MemoryServiceTestBase
             $"Expected conflict resolution action, got: {result2.Action}");
 
         // Verify the current information is accessible
-        var currentMemory = await Repository.GetAsync(result2.Memory.Id, TestContext.Current.CancellationToken);
+        var currentMemory = await Repository.GetAsync(result2.Memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(currentMemory);
         Assert.Contains("Jane Doe", currentMemory.Summary);
     }
@@ -373,7 +373,7 @@ public class SearchAndConflictTests : MemoryServiceTestBase
             $"Expected reinforce or supersede, got: {result.Action}");
 
         // The result memory should have the longer content
-        var finalMemory = await Repository.GetAsync(result.Memory.Id, TestContext.Current.CancellationToken);
+        var finalMemory = await Repository.GetAsync(result.Memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(finalMemory);
         Assert.Contains("microservices", finalMemory.Content);
     }
@@ -408,7 +408,7 @@ public class SearchAndConflictTests : MemoryServiceTestBase
         Assert.NotEqual(Guid.Empty, result.Memory.Id);
 
         // Get all memories with similar content
-        var allMemories = await Repository.GetAllAsync(TestContext.Current.CancellationToken);
+        var allMemories = await AdminStore.GetAllAsync(true, TestContext.Current.CancellationToken);
         var apiVersionMemories = allMemories.Where(m => m.Title.Contains("API Version")).ToList();
         
         // Should have at least 1 current (non-archived) memory
@@ -446,8 +446,8 @@ public class SearchAndConflictTests : MemoryServiceTestBase
         Assert.Equal(StoreAction.StoredNew, result.Action);
         
         // Both should be current and unarchived
-        var cookingMemory = await Repository.GetAsync(cooking.Id, TestContext.Current.CancellationToken);
-        var programmingMemory = await Repository.GetAsync(programming.Id, TestContext.Current.CancellationToken);
+        var cookingMemory = await Repository.GetAsync(cooking.Id, Scope, TestContext.Current.CancellationToken);
+        var programmingMemory = await Repository.GetAsync(programming.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(cookingMemory);
         Assert.NotNull(programmingMemory);
         Assert.False(cookingMemory.IsArchived);
@@ -484,14 +484,14 @@ public class SearchAndConflictTests : MemoryServiceTestBase
         // If supersede happened, check the chain
         if (result.Action == StoreAction.StoredWithSupersede)
         {
-            var archivedOriginal = await Repository.GetAsync(original.Id, TestContext.Current.CancellationToken);
+            var archivedOriginal = await Repository.GetAsync(original.Id, Scope, TestContext.Current.CancellationToken);
             Assert.NotNull(archivedOriginal);
             Assert.True(archivedOriginal.IsArchived);
             Assert.NotNull(archivedOriginal.ValidUntil);
             Assert.Equal(updated.Id, archivedOriginal.SupersededBy);
             
             // New memory should track what it superseded
-            var currentMemory = await Repository.GetAsync(updated.Id, TestContext.Current.CancellationToken);
+            var currentMemory = await Repository.GetAsync(updated.Id, Scope, TestContext.Current.CancellationToken);
             Assert.NotNull(currentMemory);
             Assert.Contains(original.Id, currentMemory.SupersededIds);
         }
@@ -509,7 +509,7 @@ public class SearchAndConflictTests : MemoryServiceTestBase
         var result1 = await ConflictStorage.StoreAsync(memory, TestContext.Current.CancellationToken);
         await Task.Delay(100, TestContext.Current.CancellationToken);
 
-        var initialMemory = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var initialMemory = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         var initialAccessCount = initialMemory?.AccessCount ?? 0;
         var initialStrength = initialMemory?.BaseStrength ?? 0;
 
@@ -524,7 +524,7 @@ public class SearchAndConflictTests : MemoryServiceTestBase
         // Assert: If reinforced, access count or strength should increase
         if (result2.Action == StoreAction.ReinforcedExisting)
         {
-            var reinforcedMemory = await Repository.GetAsync(result2.Memory.Id, TestContext.Current.CancellationToken);
+            var reinforcedMemory = await Repository.GetAsync(result2.Memory.Id, Scope, TestContext.Current.CancellationToken);
             Assert.NotNull(reinforcedMemory);
             
             // Either access count or base strength should have increased
@@ -559,7 +559,7 @@ public class SearchAndConflictTests : MemoryServiceTestBase
         Assert.NotEmpty(searchResults);
 
         // 3. Retrieve
-        var retrieved = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var retrieved = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Equal("Integration Test", retrieved.Title);
 
@@ -568,17 +568,17 @@ public class SearchAndConflictTests : MemoryServiceTestBase
         retrieved.Tags.Add("updated");
         await Repository.SaveAsync(retrieved, TestContext.Current.CancellationToken);
 
-        var updated = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
+        var updated = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
         Assert.NotNull(updated);
         Assert.Equal("Updated Integration Test", updated.Title);
         Assert.Contains("updated", updated.Tags);
 
-        // 5. Delete
-        var deleted = await Repository.DeleteAsync(memory.Id, TestContext.Current.CancellationToken);
-        Assert.True(deleted);
+        // 5. Forget
+        var forgotten = await Repository.ForgetAsync(memory.Id, Scope, "test", TestContext.Current.CancellationToken);
+        Assert.True(forgotten);
 
-        var afterDelete = await Repository.GetAsync(memory.Id, TestContext.Current.CancellationToken);
-        Assert.Null(afterDelete);
+        var afterForget = await Repository.GetAsync(memory.Id, Scope, TestContext.Current.CancellationToken);
+        Assert.Null(afterForget);
     }
 
     [Fact]
@@ -592,13 +592,14 @@ public class SearchAndConflictTests : MemoryServiceTestBase
             await Repository.SaveAsync(memory, TestContext.Current.CancellationToken);
         }
 
-        var stats = await Repository.GetStatsAsync(TestContext.Current.CancellationToken);
+        var stats = await Repository.GetStatsAsync(Scope, TestContext.Current.CancellationToken);
         Assert.Equal(50, stats.TotalNodes);
 
-        var group0 = await Repository.SearchByTagsAsync(["group0"], 20, TestContext.Current.CancellationToken);
+        var group0 = await Repository.QueryAsync(
+            Scope, new MemoryQueryOptions { Tags = ["group0"], Limit = 20 }, TestContext.Current.CancellationToken);
         Assert.Equal(10, group0.Count);
 
-        var all = await Repository.GetAllAsync(TestContext.Current.CancellationToken);
+        var all = await AdminStore.GetAllAsync(true, TestContext.Current.CancellationToken);
         Assert.Equal(50, all.Count);
     }
 

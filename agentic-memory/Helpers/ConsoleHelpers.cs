@@ -1,13 +1,86 @@
 using AgenticMemory.CodeIndex;
 using AgenticMemory.Configuration;
+using AgenticMemory.Persistence.Migrations;
 using Spectre.Console;
 
 namespace AgenticMemory.Helpers;
 
 public static class ConsoleHelpers
 {
+    /// <summary>
+    /// Reports anything relocated out of the program directory on this start.
+    ///
+    /// Printed before the banner and unconditionally, not at debug level: a database moving is a
+    /// thing the user should be told about once, in plain sight, rather than discover later.
+    /// </summary>
+    public static void PrintMigrationReport(LegacyDataMigration.Result migration)
+    {
+        if (!migration.DidAnything && migration.Conflicts.Count == 0 && migration.Failed.Count == 0)
+            return;
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule(":package: [bold blue]Moved to your user data folder[/]").RuleStyle("blue dim").LeftJustified());
+
+        foreach (var moved in migration.Moved)
+            AnsiConsole.MarkupLine($"  :check_mark_button: [grey]{Markup.Escape(moved)}[/]");
+
+        foreach (var conflict in migration.Conflicts)
+            AnsiConsole.MarkupLine($"  :warning:  [yellow]{Markup.Escape(conflict)}[/]");
+
+        foreach (var failed in migration.Failed)
+            AnsiConsole.MarkupLine($"  :warning:  [yellow]{Markup.Escape(failed)}[/]");
+
+        AnsiConsole.WriteLine();
+    }
+
+    /// <summary>
+    /// Reports a schema upgrade, on the same principle as the file move above: it happened to the
+    /// user's data, so it is said out loud once rather than left in a log nobody reads. Silent when
+    /// nothing changed, which is every start after the one that upgrades.
+    /// </summary>
+    public static void PrintSchemaMigrationReport(DatabaseMigrationReport migration)
+    {
+        if (!migration.Ran) return;
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(
+            new Rule($":card_index_dividers: [bold blue]Database upgraded to schema v{migration.ToVersion}[/]")
+                .RuleStyle("blue dim")
+                .LeftJustified());
+
+        foreach (var step in migration.Applied)
+            AnsiConsole.MarkupLine(
+                $"  :check_mark_button: [grey]v{step.FromVersion} → v{step.ToVersion}  " +
+                $"{Markup.Escape(step.Name)}[/] [grey dim]· {step.DocumentsTouched} document(s)[/]");
+
+        if (migration.BackupPath is not null)
+            AnsiConsole.MarkupLine(
+                $"  :floppy_disk: [grey dim]Snapshot before upgrade: {Markup.Escape(migration.BackupPath)}[/]");
+        else
+            AnsiConsole.MarkupLine(
+                "  :warning:  [yellow]No snapshot could be taken before the upgrade.[/]");
+
+        AnsiConsole.WriteLine();
+    }
+
+    /// <summary>
+    /// The last thing printed before the process gives up. Deliberately loud and deliberately
+    /// wordy — this is read by someone whose data did not open, and the message carries what to do.
+    /// </summary>
+    public static void PrintFatalDatabaseError(string message)
+    {
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(
+            new Panel(new Markup($"[white]{Markup.Escape(message)}[/]"))
+                .Header(":cross_mark: [bold red]Cannot open the memory database[/]")
+                .BorderColor(Color.Red)
+                .Expand());
+        AnsiConsole.WriteLine();
+    }
+
     public static void PrintStartupBanner(
         AppSettings settings,
+        AppPaths paths,
         string listeningOn,
         bool embeddingsActive,
         bool generativeAvailable,
@@ -15,14 +88,17 @@ public static class ConsoleHelpers
     {
         AnsiConsole.WriteLine();
         AnsiConsole.Write(
-            new Rule(":brain: [bold blue]Agentic Memory Server[/] [grey dim](MCP SDK)[/]")
+            new Rule($":brain: [bold blue]Agentic Memory Server[/] [grey dim]v{AppVersion.Current} (MCP SDK)[/]")
                 .RuleStyle("blue dim")
                 .LeftJustified());
         AnsiConsole.WriteLine();
 
         // ── Core services ──────────────────────────────────────────────────────
         AnsiConsole.MarkupLine($"  :globe_with_meridians:  [grey]Listening on[/]     [bold white]{Markup.Escape(listeningOn)}[/]");
-        AnsiConsole.MarkupLine($"  :floppy_disk:  [grey]Database[/]         [dim]{Markup.Escape(settings.Storage.DatabasePath)}[/]");
+        AnsiConsole.MarkupLine($"  :locked:  [grey]Auth[/]             {AuthStatus(settings.Server)}");
+        AnsiConsole.MarkupLine($"  :floppy_disk:  [grey]Database[/]         [dim]{Markup.Escape(settings.Storage.DatabasePath)}[/] [grey dim]· schema v{DatabaseSchema.Current}[/]");
+        AnsiConsole.MarkupLine($"  :file_folder:  [grey]Data[/]             [dim]{Markup.Escape(paths.DataDirectory)}[/] [grey dim]· {OriginLabel(paths.Origin)}[/]");
+        AnsiConsole.MarkupLine($"  :card_file_box:  [grey]Models[/]           [dim]{Markup.Escape(paths.ModelsDirectory)}[/]");
 
         // Embeddings — show model name and vector dimensions when active
         var embeddingDetail = embeddingsActive
@@ -110,6 +186,32 @@ public static class ConsoleHelpers
         AnsiConsole.Write(new Rule(":fire: [green]Ready[/]").RuleStyle("green dim"));
         AnsiConsole.WriteLine();
     }
+
+    /// <summary>
+    /// Says plainly when the store is unauthenticated, and louder when it is also reachable off this
+    /// machine. Someone running a companion app should not have to read the configuration to find
+    /// out that their memories are on the network.
+    /// </summary>
+    private static string AuthStatus(ServerSettings server)
+    {
+        if (server.RequiresAuthentication)
+            return $":check_mark_button: [green]API key required[/] [grey dim]· {Markup.Escape(server.ApiKeyHeader)}[/]";
+
+        var loopbackOnly = server.BindAddress is "127.0.0.1" or "::1" or "localhost";
+
+        return loopbackOnly
+            ? ":unlocked: [grey]None[/] [grey dim]· this machine only[/]"
+            : ":warning:  [yellow]None — reachable from the whole network[/] [grey dim]· set Server:ApiKey[/]";
+    }
+
+    private static string OriginLabel(PathOrigin origin) => origin switch
+    {
+        PathOrigin.CommandLine     => "--data-dir",
+        PathOrigin.Environment     => AppPaths.DataDirectoryVariable,
+        PathOrigin.Configuration   => "Storage:DataDirectory",
+        PathOrigin.Portable        => $"portable ({AppPaths.PortableMarkerFile})",
+        _                          => "per-user default",
+    };
 
     private static string ProviderLabel(ICodeIntelligenceProvider provider, CodeIndexSettings settings)
     {

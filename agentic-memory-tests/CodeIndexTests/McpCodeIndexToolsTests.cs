@@ -44,12 +44,15 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
 
     private static JsonElement Parse(string json) => JsonDocument.Parse(json).RootElement;
 
+    /// <summary>So a hung tool call is cancelled with the run rather than blocking it.</summary>
+    private static CancellationToken Ct => TestContext.Current.CancellationToken;
+
     // ── get_subproject_context ─────────────────────────────────────────────────────
 
     [Fact]
     public async Task SubprojectContext_lists_subprojects_with_manifest_and_language()
     {
-        var json = await BuildTools().GetSubprojectContext();
+        var json = await BuildTools().GetSubprojectContext(cancellationToken: Ct);
         var root = Parse(json);
         Assert.Equal(JsonValueKind.Array, root.ValueKind);
         Assert.True(root.GetArrayLength() >= 1);
@@ -67,7 +70,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     public async Task SubprojectContext_resolves_an_entry_point_for_the_web_app()
     {
         RequireTypeScript();
-        var root = Parse(await BuildTools().GetSubprojectContext());
+        var root = Parse(await BuildTools().GetSubprojectContext(cancellationToken: Ct));
         var web = root.EnumerateArray().First(e => e.GetProperty("name").GetString() == WebName);
         // The TS seed has App.tsx (a convention entry point) — it must be surfaced.
         var entry = web.TryGetProperty("entry_point", out var ep) ? ep.GetString() : null;
@@ -80,7 +83,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     {
         var kv = new InMemoryKv(); // no "workspaces" key
         var tools = new CodeIndexTools(kv, Fixture.Repository, NullEmbeddingService.Instance, new ActiveProjectService(kv));
-        var result = await tools.GetSubprojectContext();
+        var result = await tools.GetSubprojectContext(cancellationToken: Ct);
         Assert.Contains("No workspace", result, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -92,7 +95,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
         var b = new WorkspaceRecord("b", "Beta",  Fixture.WorkspaceRoot, "now", []);
         kv.Set("workspaces", JsonSerializer.Serialize(new List<WorkspaceRecord> { a, b }));
         var tools = new CodeIndexTools(kv, Fixture.Repository, NullEmbeddingService.Instance, new ActiveProjectService(kv));
-        var result = await tools.GetSubprojectContext();
+        var result = await tools.GetSubprojectContext(cancellationToken: Ct);
         Assert.Contains("Multiple workspaces", result, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -101,7 +104,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     [Fact]
     public async Task FileContext_returns_symbols_exports_and_line_count()
     {
-        var root = Parse(await BuildTools().GetFileContext("Domain.cs", BackendName));
+        var root = Parse(await BuildTools().GetFileContext("Domain.cs", BackendName, cancellationToken: Ct));
 
         Assert.EndsWith("Domain.cs", root.GetProperty("path").GetString()!.Replace('\\', '/'));
         Assert.Equal("csharp", root.GetProperty("language").GetString());
@@ -123,14 +126,14 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     [Fact]
     public async Task FileContext_resolves_by_bare_filename_without_a_subproject()
     {
-        var root = Parse(await BuildTools().GetFileContext("Domain.cs"));
+        var root = Parse(await BuildTools().GetFileContext("Domain.cs", cancellationToken: Ct));
         Assert.EndsWith("Domain.cs", root.GetProperty("path").GetString()!.Replace('\\', '/'));
     }
 
     [Fact]
     public async Task FileContext_reports_a_missing_file_clearly()
     {
-        var result = await BuildTools().GetFileContext("NoSuchFile.cs", BackendName);
+        var result = await BuildTools().GetFileContext("NoSuchFile.cs", BackendName, cancellationToken: Ct);
         Assert.Contains("No indexed file", result, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -138,7 +141,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     public async Task FileContext_surfaces_typescript_class_and_interface_members()
     {
         RequireTypeScript();
-        var root = Parse(await BuildTools().GetFileContext("models.ts", WebName));
+        var root = Parse(await BuildTools().GetFileContext("models.ts", WebName, cancellationToken: Ct));
         var names = root.GetProperty("symbols").EnumerateArray()
             .Select(s => s.GetProperty("name").GetString()).ToList();
         Assert.Contains("User", names);
@@ -150,7 +153,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     [Fact]
     public async Task SymbolContext_returns_definition_callers_and_reference_count()
     {
-        var root = Parse(await BuildTools().GetSymbolContext("Calculator", BackendName));
+        var root = Parse(await BuildTools().GetSymbolContext("Calculator", BackendName, cancellationToken: Ct));
 
         Assert.Equal("Calculator", root.GetProperty("symbol").GetString());
         Assert.Equal("class", root.GetProperty("kind").GetString());
@@ -163,7 +166,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     [Fact]
     public async Task SymbolContext_lists_callers_of_a_method()
     {
-        var root = Parse(await BuildTools().GetSymbolContext("Add", BackendName));
+        var root = Parse(await BuildTools().GetSymbolContext("Add", BackendName, cancellationToken: Ct));
         var callers = root.GetProperty("callers").EnumerateArray()
             .Select(c => c.GetProperty("symbol").GetString()).ToList();
         // Consumer.Run calls calc.Add(...) — it must appear as a caller.
@@ -173,7 +176,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     [Fact]
     public async Task SymbolContext_resolves_implementations_from_type_relations()
     {
-        var root = Parse(await BuildTools().GetSymbolContext("Animal", BackendName));
+        var root = Parse(await BuildTools().GetSymbolContext("Animal", BackendName, cancellationToken: Ct));
         var impls = root.GetProperty("implementations").EnumerateArray()
             .Select(i => i.GetProperty("name").GetString()).ToList();
         Assert.Contains("Dog", impls); // class Dog : Animal
@@ -183,14 +186,14 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     public async Task SymbolContext_prefers_the_exact_name_over_near_names()
     {
         // "Order" must resolve to the Order class, never OrderService / GetOrder.
-        var root = Parse(await BuildTools().GetSymbolContext("Order", BackendName));
+        var root = Parse(await BuildTools().GetSymbolContext("Order", BackendName, cancellationToken: Ct));
         Assert.Equal("Order", root.GetProperty("symbol").GetString());
     }
 
     [Fact]
     public async Task SymbolContext_reports_an_unknown_symbol_clearly()
     {
-        var result = await BuildTools().GetSymbolContext("NotARealSymbol", BackendName);
+        var result = await BuildTools().GetSymbolContext("NotARealSymbol", BackendName, cancellationToken: Ct);
         Assert.Contains("No symbol named", result, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -198,7 +201,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     public async Task SymbolContext_resolves_a_typescript_interface()
     {
         RequireTypeScript();
-        var root = Parse(await BuildTools().GetSymbolContext("User", WebName));
+        var root = Parse(await BuildTools().GetSymbolContext("User", WebName, cancellationToken: Ct));
         Assert.Equal("User", root.GetProperty("symbol").GetString());
         Assert.Equal("interface", root.GetProperty("kind").GetString());
     }
@@ -208,7 +211,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     [Fact]
     public async Task SymbolSourcecode_returns_the_full_definition_span()
     {
-        var root = Parse(await BuildTools().GetSymbolSourcecode("Calculator", BackendName));
+        var root = Parse(await BuildTools().GetSymbolSourcecode("Calculator", BackendName, cancellationToken: Ct));
 
         Assert.EndsWith("Domain.cs", root.GetProperty("file").GetString()!.Replace('\\', '/'));
         var start = root.GetProperty("line_start").GetInt32();
@@ -223,7 +226,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     [Fact]
     public async Task SymbolSourcecode_reports_an_unknown_symbol_clearly()
     {
-        var result = await BuildTools().GetSymbolSourcecode("NotARealSymbol", BackendName);
+        var result = await BuildTools().GetSymbolSourcecode("NotARealSymbol", BackendName, cancellationToken: Ct);
         Assert.Contains("No symbol named", result, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -231,7 +234,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     public async Task SymbolSourcecode_returns_a_typescript_function_body()
     {
         RequireTypeScript();
-        var root = Parse(await BuildTools().GetSymbolSourcecode("makeUser", WebName));
+        var root = Parse(await BuildTools().GetSymbolSourcecode("makeUser", WebName, cancellationToken: Ct));
         var source = root.GetProperty("source").GetString()!;
         Assert.Contains("makeUser", source);
     }
@@ -242,7 +245,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     public async Task SearchCode_finds_a_file_by_keyword()
     {
         // Embeddings are disabled in the fixture → exercises the lexical lane.
-        var root = Parse(await BuildTools().SearchCode("Calculator", BackendName));
+        var root = Parse(await BuildTools().SearchCode("Calculator", BackendName, cancellationToken: Ct));
         Assert.Equal(JsonValueKind.Array, root.ValueKind);
         var paths = root.EnumerateArray()
             .Select(h => h.GetProperty("path").GetString()!.Replace('\\', '/')).ToList();
@@ -252,7 +255,7 @@ public class McpCodeIndexToolsTests(CodeIndexFixture fixture) : TypeScriptTestBa
     [Fact]
     public async Task SearchCode_rejects_an_unknown_subproject()
     {
-        var result = await BuildTools().SearchCode("anything", "no-such-subproject");
+        var result = await BuildTools().SearchCode("anything", "no-such-subproject", cancellationToken: Ct);
         Assert.Contains("No sub-project", result, StringComparison.OrdinalIgnoreCase);
     }
 }

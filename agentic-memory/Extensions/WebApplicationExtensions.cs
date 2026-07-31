@@ -1,7 +1,13 @@
 using AgenticMemory.Brain.Interfaces;
+using AgenticMemory.Brain.Models;
+using AgenticMemory.Brain.Retrieval;
+using AgenticMemory.Brain.Slots;
+using AgenticMemory.Brain.Storage;
 using AgenticMemory.CodeIndex;
 using AgenticMemory.Configuration;
 using AgenticMemory.Models;
+using AgenticMemory.Persistence;
+using AgenticMemory.Persistence.Migrations;
 using Spectre.Console;
 
 namespace AgenticMemory.Extensions;
@@ -38,41 +44,77 @@ public static class WebApplicationExtensions
             Results.Ok(new { status = "healthy", timestamp = DateTime.UtcNow }));
     }
 
+    /// <summary>
+    /// Builds the scope for a request. Every memory endpoint runs inside one; there is no
+    /// unscoped path through this API.
+    /// </summary>
+    private static MemoryScope ScopeFrom(string? userId, string? companionId) =>
+        string.IsNullOrWhiteSpace(companionId)
+            ? MemoryScope.AllFor(userId)
+            : MemoryScope.For(userId, companionId);
+
     private static void MapMemoryEndpoints(this WebApplication app)
     {
-        app.MapGet("/api/memory", async (IMemoryRepository repository, bool? includeArchived, CancellationToken ct) =>
+        app.MapGet("/api/memory", async (
+            IMemoryRepository repository,
+            bool? includeArchived, string? userId, string? companionId,
+            CancellationToken ct) =>
         {
-            var all = await repository.GetAllAsync(ct);
-            var filtered = includeArchived == true
-                ? all
-                : all.Where(m => !m.IsArchived);
-            return Results.Ok(filtered.OrderByDescending(m => m.CreatedAt));
+            var memories = await repository.QueryAsync(
+                ScopeFrom(userId, companionId),
+                new MemoryQueryOptions { IncludeNonCurrent = includeArchived == true },
+                ct);
+
+            return Results.Ok(memories.OrderByDescending(m => m.CreatedAt));
         });
 
-        app.MapGet("/api/memory/{id:guid}", async (Guid id, IMemoryRepository repository, CancellationToken ct) =>
+        app.MapGet("/api/memory/{id:guid}", async (
+            Guid id, IMemoryRepository repository, string? userId, string? companionId, CancellationToken ct) =>
         {
-            var memory = await repository.GetAsync(id, ct);
+            var memory = await repository.GetAsync(id, ScopeFrom(userId, companionId), ct);
             return memory is null ? Results.NotFound() : Results.Ok(memory);
         });
 
-        app.MapPost("/api/memory", async (MemoryCreateRequest request, IConflictAwareStorage storage, CancellationToken ct) =>
+        app.MapPost("/api/memory", async (
+            MemoryCreateRequest request, IConflictAwareStorage storage, CancellationToken ct) =>
         {
-            var entity = new Brain.Models.MemoryNodeEntity
+            var wantsPrivate = request.Visibility is not null
+                && (request.Visibility.Equals("private", StringComparison.OrdinalIgnoreCase)
+                 || request.Visibility.Equals("scoped", StringComparison.OrdinalIgnoreCase));
+
+            if (wantsPrivate && string.IsNullOrWhiteSpace(request.CompanionId))
+                return Results.BadRequest(new { error = "companionId is required when visibility is 'private'." });
+
+            var entity = new MemoryNodeEntity
             {
-                Title = request.Title,
-                Summary = request.Summary,
-                Content = request.Content ?? "",
-                Tags = request.Tags?.ToList() ?? [],
-                Importance = request.Importance ?? 0.5
+                UserId       = MemoryScope.NormalizeUser(request.UserId),
+                Title        = request.Title,
+                Summary      = request.Summary,
+                Content      = request.Content ?? "",
+                Tags         = request.Tags?.ToList() ?? [],
+                Importance   = request.Importance ?? 0.5,
+                Visibility   = wantsPrivate ? MemoryVisibility.Scoped : MemoryVisibility.Global,
+                CompanionIds = wantsPrivate ? [MemoryScope.NormalizeId(request.CompanionId)!] : [],
+                SubjectRef   = SubjectRefs.Normalize(request.Subject),
+                Predicate    = SlotRegistry.Normalize(request.Predicate),
+                ValueKey     = MemoryTextIndexer.BuildValueKey(request.Value ?? request.Summary),
+                IsPinned     = request.Pinned ?? false,
+                Type         = Enum.TryParse<MemoryType>(request.Type, true, out var t) ? t : MemoryType.Semantic,
+                Source       = Enum.TryParse<MemorySource>(request.Source?.Replace("_", ""), true, out var s)
+                                   ? s : MemorySource.UserStated,
             };
 
-            var result = await storage.StoreAsync(entity, ct);
+            var scope  = MemoryScope.For(request.UserId, request.CompanionId);
+            var result = await storage.StoreAsync(entity, scope, "api:POST /api/memory", ct);
             return Results.Created($"/api/memory/{result.Memory.Id}", result);
         });
 
-        app.MapPut("/api/memory/{id:guid}", async (Guid id, MemoryUpdateRequest request, IMemoryRepository repository, CancellationToken ct) =>
+        app.MapPut("/api/memory/{id:guid}", async (
+            Guid id, MemoryUpdateRequest request, IMemoryRepository repository,
+            string? userId, string? companionId, CancellationToken ct) =>
         {
-            var existing = await repository.GetAsync(id, ct);
+            var scope = ScopeFrom(userId, companionId);
+            var existing = await repository.GetAsync(id, scope, ct);
             if (existing is null) return Results.NotFound();
 
             if (request.Title is not null) existing.Title = request.Title;
@@ -80,43 +122,131 @@ public static class WebApplicationExtensions
             if (request.Content is not null) existing.Content = request.Content;
             if (request.Tags is not null) existing.Tags = request.Tags.ToList();
 
-            await repository.SaveAsync(existing, ct);
+            try
+            {
+                await repository.SaveAsync(existing, existing.Version, "api:PUT /api/memory", ct);
+            }
+            catch (MemoryConcurrencyException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+
             return Results.Ok(existing);
         });
 
-        app.MapDelete("/api/memory/{id:guid}", async (Guid id, IMemoryRepository repository, CancellationToken ct) =>
+        // Soft delete. Physical removal happens only via the retention purge, and the audit event
+        // outlives the row.
+        app.MapDelete("/api/memory/{id:guid}", async (
+            Guid id, IMemoryRepository repository, string? userId, string? companionId, CancellationToken ct) =>
         {
-            var deleted = await repository.DeleteAsync(id, ct);
-            return deleted ? Results.NoContent() : Results.NotFound();
+            var ok = await repository.ForgetAsync(id, ScopeFrom(userId, companionId), "api:DELETE /api/memory", ct);
+            return ok ? Results.NoContent() : Results.NotFound();
         });
+
+        app.MapPost("/api/memory/{id:guid}/restore", async (
+            Guid id, IMemoryRepository repository, string? userId, string? companionId, CancellationToken ct) =>
+        {
+            var ok = await repository.RestoreAsync(id, ScopeFrom(userId, companionId), "api:restore", ct);
+            return ok ? Results.NoContent() : Results.NotFound();
+        });
+
+        app.MapGet("/api/memory/{id:guid}/history", async (
+            Guid id, IMemoryEventLog eventLog, CancellationToken ct) =>
+            Results.Ok(await eventLog.GetForMemoryAsync(id, ct)));
+
+        app.MapGet("/api/memory/slot", async (
+            IMemoryRepository repository, string predicate, string? subject, string? userId, string? companionId,
+            CancellationToken ct) =>
+        {
+            var history = await repository.GetBySlotAsync(
+                ScopeFrom(userId, companionId), subject ?? SubjectRefs.User, predicate, includeHistory: true, ct);
+            return Results.Ok(history);
+        });
+
+        // ── Conflicts ─────────────────────────────────────────────────────────────────────────
+
+        app.MapGet("/api/memory/conflicts", async (
+            IMemoryRepository repository, string? userId, string? companionId, bool? openOnly, CancellationToken ct) =>
+            Results.Ok(await repository.GetConflictsAsync(ScopeFrom(userId, companionId), openOnly ?? true, ct)));
+
+        app.MapPost("/api/memory/conflicts/{id:guid}/resolve", async (
+            Guid id, ConflictResolveRequest request, IMemoryRepository repository, CancellationToken ct) =>
+        {
+            var ok = await repository.ResolveConflictAsync(
+                id, ScopeFrom(request.UserId, request.CompanionId),
+                request.WinnerId, request.Dismiss, "api:resolve-conflict", ct);
+
+            return ok ? Results.NoContent() : Results.NotFound();
+        });
+
+        app.MapGet("/api/memory/slots", (SlotRegistry slots) =>
+            Results.Ok(slots.All.OrderBy(s => s.Predicate)));
     }
 
     private static void MapSearchEndpoints(this WebApplication app)
     {
-        app.MapPost("/api/memory/search", async (SearchRequest request, ISearchService searchService, CancellationToken ct) =>
+        app.MapPost("/api/memory/search", async (
+            SearchRequest request, ISearchService searchService, CancellationToken ct) =>
         {
-            var results = await searchService.SearchAsync(request.Query, request.TopN ?? 5, request.Tags, ct);
-            return Results.Ok(results);
+            var result = await searchService.RetrieveAsync(new RetrievalRequest
+            {
+                Query              = request.Query,
+                Scope              = ScopeFrom(request.UserId, request.CompanionId),
+                TopN               = request.TopN ?? 5,
+                Tags               = request.Tags,
+                SubjectRef         = request.Subject,
+                Predicate          = request.Predicate,
+                IncludeCoreContext = request.IncludeCoreContext,
+                AsOf               = request.AsOf,
+                NoveltyBias        = Math.Clamp(request.NoveltyBias, 0, 1),
+            }, ct);
+
+            // The dashboard binds the flat result list; the richer envelope is additive.
+            return Results.Ok(new
+            {
+                results     = result.Results,
+                coreContext = result.CoreContext,
+                conflicts   = result.Conflicts,
+                confidence  = result.Confidence.ToString(),
+                candidatesConsidered   = result.CandidatesConsidered,
+                semanticSearchUsed     = result.SemanticSearchUsed,
+                incomparableEmbeddings = result.IncomparableEmbeddings,
+            });
         });
+    }
+
+    private static long? FileLength(string path)
+    {
+        try { return File.Exists(path) ? new FileInfo(path).Length : null; }
+        catch { return null; }
     }
 
     private static void MapAdminEndpoints(this WebApplication app)
     {
-        app.MapGet("/api/admin/stats", async (IMemoryRepository repository, CancellationToken ct) =>
+        // Unscoped aggregate: administrative by definition, so it goes through the admin store
+        // rather than the scoped repository.
+        app.MapGet("/api/admin/stats", async (
+            IMemoryAdminStore adminStore, string? userId, IMemoryRepository repository, CancellationToken ct) =>
         {
-            var stats = await repository.GetStatsAsync(ct);
+            var stats = string.IsNullOrWhiteSpace(userId)
+                ? await adminStore.GetGlobalStatsAsync(ct)
+                : await repository.GetStatsAsync(MemoryScope.AllFor(userId), ct);
+
             return Results.Ok(stats);
         });
+
+        app.MapGet("/api/admin/users", async (IMemoryAdminStore adminStore, CancellationToken ct) =>
+            Results.Ok(await adminStore.GetUserIdsAsync(ct)));
 
         // ── Maintenance ───────────────────────────────────────────────────────
 
         app.MapGet("/api/admin/maintenance-stats", async (
-            IMemoryRepository memRepo,
+            IMemoryAdminStore memRepo,
             ICodeIndexRepository codeRepo,
             IKeyValueStore kv,
             CancellationToken ct) =>
         {
-            var memStats = await memRepo.GetStatsAsync(ct);
+            var memStats = await memRepo.GetGlobalStatsAsync(ct);
             var workspaces = LoadWorkspaces(kv);
             var codeTotal = 0;
             foreach (var ws in workspaces)
@@ -151,13 +281,76 @@ public static class WebApplicationExtensions
         });
 
         app.MapDelete("/api/admin/memories", async (
-            IMemoryRepository memRepo,
+            IMemoryAdminStore memRepo,
+            IMemoryBackupService backups,
             CancellationToken ct) =>
         {
-            var all = await memRepo.GetAllAsync(ct);
-            foreach (var m in all)
-                await memRepo.DeleteAsync(m.Id, ct);
-            return Results.NoContent();
+            // Wiping every memory is the single most destructive thing this API can do. It gets a
+            // snapshot whatever the caller intended, and the path comes back so the caller knows
+            // recovery is possible.
+            var snapshot = await backups.CreateSnapshotAsync("admin-delete-all-memories", ct);
+            var deleted  = await memRepo.DeleteAllAsync(ct);
+
+            return Results.Ok(new { deleted, snapshot = snapshot?.Path });
+        });
+
+        // Where everything actually lives. An embedding host needs this to show the user their data
+        // folder, to size it, and to back it up; and when something looks missing, it is the first
+        // question worth answering.
+        app.MapGet("/api/admin/paths", (AppPaths paths, AppSettings settings, IMemoryBackupService backups) =>
+            Results.Ok(new
+            {
+                // Per-user, and the only thing that has to survive an application update.
+                dataDirectory = paths.DataDirectory,
+                databasePath  = settings.Storage.DatabasePath,
+                backupPath    = backups.BackupDirectory,
+                databaseBytes = FileLength(settings.Storage.DatabasePath),
+
+                // Shipped with the build and shared by every user on the machine.
+                modelsDirectory = paths.ModelsDirectory,
+                embeddingsPath  = settings.Embeddings.ModelsPath,
+                generativePath  = settings.Generation.ModelsPath,
+
+                programDirectory = paths.ProgramDirectory,
+                origin           = paths.Origin.ToString(),
+            }));
+
+        // What the database says about itself. The two versions are reported separately because they
+        // answer separate questions: "which build is running" and "what shape is the data in". A host
+        // deciding whether it is safe to launch an older sidecar needs the second one.
+        app.MapGet("/api/admin/database", (SharedLiteDatabase database) =>
+        {
+            var stamp = DatabaseStamp.Read(database.Database);
+
+            return Results.Ok(new
+            {
+                schemaVersion          = stamp?.SchemaVersion ?? DatabaseSchema.Current,
+                supportedSchemaVersion = DatabaseSchema.Current,
+                appVersion             = AppVersion.Current,
+
+                createdAt              = stamp?.CreatedAt,
+                createdByAppVersion    = stamp?.CreatedByAppVersion,
+                lastOpenedAt           = stamp?.LastOpenedAt,
+                lastOpenedByAppVersion = stamp?.LastOpenedByAppVersion,
+
+                // What this particular start did, and where the snapshot went if it upgraded.
+                migratedOnThisStart = database.Migration.Ran,
+                migratedFromVersion = database.Migration.FromVersion,
+                snapshotPath        = database.Migration.BackupPath,
+
+                history = stamp?.History ?? [],
+            });
+        });
+
+        app.MapGet("/api/admin/backups", (IMemoryBackupService backups) =>
+            Results.Ok(backups.ListSnapshots()));
+
+        app.MapPost("/api/admin/backups", async (IMemoryBackupService backups, CancellationToken ct) =>
+        {
+            var snapshot = await backups.CreateSnapshotAsync("manual", ct);
+            return snapshot is null
+                ? Results.Problem("Snapshot failed or backups are disabled.")
+                : Results.Ok(snapshot);
         });
 
         app.MapDelete("/api/admin/workspaces", (IKeyValueStore kv) =>
@@ -167,7 +360,8 @@ public static class WebApplicationExtensions
         });
 
         app.MapPost("/api/admin/full-reset", async (
-            IMemoryRepository memRepo,
+            IMemoryAdminStore memRepo,
+            IMemoryBackupService backups,
             ICodeIndexRepository codeRepo,
             ActiveProjectService activeProject,
             WorkerStatusTracker tracker,
@@ -187,10 +381,9 @@ public static class WebApplicationExtensions
             referenceQueue.Clear();
             tracker.Reset();
 
-            // Clear memories
-            var all = await memRepo.GetAllAsync(ct);
-            foreach (var m in all)
-                await memRepo.DeleteAsync(m.Id, ct);
+            // Clear memories, after a snapshot — this endpoint is unrecoverable otherwise.
+            await backups.CreateSnapshotAsync("admin-full-reset", ct);
+            await memRepo.DeleteAllAsync(ct);
 
             // Clear workspaces
             kv.Delete(WorkspacesStoreKey);
@@ -512,47 +705,9 @@ public static class WebApplicationExtensions
         return string.Join(' ', words[..maxWords]) + ".";
     }
 
-    /// <summary>
-    /// One-time startup migration — converts the old "projects" KV key to the new "workspaces" format.
-    /// Old LiteDB CodeIndexRecords are valid with SubProjectId="" and need no touching.
-    /// </summary>
-    public static void MigrateProjectsToWorkspaces(this WebApplication app)
-    {
-        var kv = app.Services.GetRequiredService<IKeyValueStore>();
-
-        if (kv.Get(WorkspacesStoreKey) is not null) return; // already migrated
-
-        var projectsJson = kv.Get(ProjectsStoreKey);
-        if (projectsJson is null) return;
-
-        try
-        {
-            using var doc = System.Text.Json.JsonDocument.Parse(projectsJson);
-            var migrated = new List<WorkspaceRecord>();
-
-            foreach (var el in doc.RootElement.EnumerateArray())
-            {
-                var id       = el.GetProperty("Id").GetString()!;
-                var name     = el.GetProperty("Name").GetString()!;
-                var rootPath = el.GetProperty("RootPath").GetString()!;
-                var created  = el.TryGetProperty("CreatedAt", out var ca)
-                    ? ca.GetString()!
-                    : DateTime.UtcNow.ToString("O");
-
-                migrated.Add(new WorkspaceRecord(id, name, rootPath, created, []));
-            }
-
-            SaveWorkspaces(kv, migrated);
-            AnsiConsole.MarkupLine(
-                "  [blue dim]inf[/] [grey dim]Migration[/] Migrated [white]{0}[/] project(s) → workspaces",
-                migrated.Count);
-        }
-        catch (Exception ex)
-        {
-            AnsiConsole.MarkupLine(
-                "  [yellow]wrn[/] [grey dim]Migration[/] Could not migrate: {0}", ex.Message);
-        }
-    }
+    // The projects → workspaces reshape used to live here as an unversioned startup fixup. It is now
+    // schema step v3 — see ProjectsToWorkspacesStep — so it is recorded in the database, ordered
+    // against other schema changes, and covered by the pre-migration snapshot.
 
     /// <summary>
     /// Re-registers all workspaces previously saved via POST /api/workspaces with CodeIndexService.

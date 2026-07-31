@@ -12,6 +12,7 @@ public sealed class NullEmbeddingService : IEmbeddingService
     private NullEmbeddingService() { }
 
     public int Dimensions => 0;
+    public string ModelId => "none";
     public bool IsAvailable => false;
 
     public Task<float[]> GetEmbeddingAsync(string text, CancellationToken cancellationToken = default)

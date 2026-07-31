@@ -13,7 +13,16 @@ public record MemoryCreateRequest(
     string Summary,
     string? Content = null,
     string[]? Tags = null,
-    double? Importance = null);
+    double? Importance = null,
+    string? UserId = null,
+    string? CompanionId = null,
+    string? Visibility = null,
+    string? Subject = null,
+    string? Predicate = null,
+    string? Value = null,
+    string? Type = null,
+    string? Source = null,
+    bool? Pinned = null);
 
 /// <summary>
 /// Request model for updating an existing memory.
@@ -37,7 +46,25 @@ public record MemoryUpdateRequest(
 public record SearchRequest(
     string Query,
     int? TopN = null,
-    string[]? Tags = null);
+    string[]? Tags = null,
+    string? UserId = null,
+    string? CompanionId = null,
+    string? Subject = null,
+    string? Predicate = null,
+    bool IncludeCoreContext = false,
+
+    /// <summary>Answer as of a past instant on the valid-time axis, including facts since replaced.</summary>
+    DateTime? AsOf = null,
+
+    /// <summary>0-1 preference for memories this companion has not already brought up.</summary>
+    double NoveltyBias = 0);
+
+/// <summary>Resolve a recorded contradiction.</summary>
+public record ConflictResolveRequest(
+    Guid? WinnerId = null,
+    bool Dismiss = false,
+    string? UserId = null,
+    string? CompanionId = null);
 
 /// <summary>
 /// Request model for local generative inference.

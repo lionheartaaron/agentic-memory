@@ -16,15 +16,18 @@ public static class ManifestExtractor
         IgnoreInaccessible    = true,
     };
 
-    private static readonly string[] ExcludedDirs = ["node_modules", "bin", "obj", ".git", "dist", "build", ".expo", ".turbo"];
-
     public static IReadOnlyList<ProjectManifestRecord> Extract(
-        string root, string projectId, string? subProjectId, DateTime nowUtc)
+        string root, string projectId, string? subProjectId, DateTime nowUtc,
+        IReadOnlyList<string>? excludePatterns = null)
     {
         var results = new List<ProjectManifestRecord>();
         if (!Directory.Exists(root)) return results;
 
-        foreach (var path in EnumerateManifests(root))
+        // Callers without settings access get the configured defaults
+        var excluded = new ExcludedFolderMatcher(
+            excludePatterns ?? new Configuration.CodeIndexSettings().ExcludePatterns);
+
+        foreach (var path in EnumerateManifests(root, excluded))
         {
             var rec = path switch
             {
@@ -45,7 +48,7 @@ public static class ManifestExtractor
         return results;
     }
 
-    private static IEnumerable<string> EnumerateManifests(string root)
+    private static IEnumerable<string> EnumerateManifests(string root, ExcludedFolderMatcher excluded)
     {
         IEnumerable<string> all;
         try
@@ -59,20 +62,10 @@ public static class ManifestExtractor
         int count = 0;
         foreach (var f in all)
         {
-            if (IsExcluded(f, root)) continue;
+            if (excluded.IsExcluded(f, root)) continue;
             if (count++ >= 100) yield break;
             yield return f;
         }
-    }
-
-    private static bool IsExcluded(string path, string root)
-    {
-        var rel = Path.GetRelativePath(root, path);
-        foreach (var seg in rel.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
-                     StringSplitOptions.RemoveEmptyEntries))
-            if (ExcludedDirs.Contains(seg, StringComparer.OrdinalIgnoreCase))
-                return true;
-        return false;
     }
 
     private static ProjectManifestRecord? ParseCsproj(string path)

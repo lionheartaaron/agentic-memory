@@ -16,6 +16,7 @@ public sealed class ProjectFileWatcher : BackgroundService
     private readonly WorkerStatusTracker _statusTracker;
     private readonly IKeyValueStore _kv;
     private readonly CodeIndexSettings _settings;
+    private readonly ExcludedFolderMatcher _excluded;
     private readonly ILogger<ProjectFileWatcher> _logger;
 
     private FileSystemWatcher? _fsWatcher;
@@ -44,6 +45,7 @@ public sealed class ProjectFileWatcher : BackgroundService
         _statusTracker = statusTracker;
         _kv = kv;
         _settings = settings;
+        _excluded = new ExcludedFolderMatcher(settings.ExcludePatterns);
         _logger = logger;
     }
 
@@ -142,6 +144,10 @@ public sealed class ProjectFileWatcher : BackgroundService
     {
         if (!_settings.IndexedExtensions.Contains(
                 Path.GetExtension(filePath), StringComparer.OrdinalIgnoreCase)) return;
+
+        // Honor the configured ignore list on live events too — without this an `npm install`
+        // floods the queue with node_modules files the initial scan would never have picked up.
+        if (_excluded.IsExcluded(filePath, workspaceRoot)) return;
 
         lock (_debounceMap)
         {

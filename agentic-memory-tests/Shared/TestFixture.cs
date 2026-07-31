@@ -1,7 +1,10 @@
 using AgenticMemory.Brain.Conflict;
 using AgenticMemory.Brain.Embeddings;
 using AgenticMemory.Brain.Interfaces;
+using AgenticMemory.Brain.Maintenance;
+using AgenticMemory.Brain.Retrieval;
 using AgenticMemory.Brain.Search;
+using AgenticMemory.Brain.Slots;
 using AgenticMemory.Brain.Storage;
 using AgenticMemory.Configuration;
 using AgenticMemory.Persistence;
@@ -23,9 +26,17 @@ public class TestFixture : IAsyncDisposable
     public string TestModelsPath { get; }
     public SharedLiteDatabase? SharedDb { get; private set; }
     public IMemoryRepository Repository { get; private set; } = null!;
+    public IMemoryAdminStore AdminStore { get; private set; } = null!;
+    public IMemoryEventLog EventLog { get; private set; } = null!;
+    public LiteDbMemoryRepository Store { get; private set; } = null!;
     public IEmbeddingService? EmbeddingService { get; private set; }
     public ISearchService SearchService { get; private set; } = null!;
     public IConflictAwareStorage ConflictStorage { get; private set; } = null!;
+    public IMaintenanceService Maintenance { get; private set; } = null!;
+    public IMemoryBackupService Backups { get; private set; } = null!;
+    public MaintenanceSettings MaintenanceSettings { get; private set; } = null!;
+    public string BackupPath { get; }
+    public SlotRegistry Slots { get; } = new();
     public ILoggerFactory LoggerFactory { get; private set; } = null!;
 
     public TestFixture()
@@ -33,6 +44,9 @@ public class TestFixture : IAsyncDisposable
         var testId = Guid.NewGuid().ToString("N")[..8];
         TestDbPath = Path.Combine(Path.GetTempPath(), "agentic-memory-tests", $"test-{testId}.db");
         TestModelsPath = Path.Combine(Path.GetTempPath(), "agentic-memory-tests", "models");
+        // Per-test backup directory: a shared one would let snapshots from parallel tests be
+        // counted by each other's retention assertions.
+        BackupPath = Path.Combine(Path.GetTempPath(), "agentic-memory-tests", $"backups-{testId}");
     }
 
     public async Task InitializeAsync()
@@ -60,7 +74,10 @@ public class TestFixture : IAsyncDisposable
 
         // Initialize repository via shared DB singleton (Direct mode)
         SharedDb   = new SharedLiteDatabase(TestDbPath);
-        Repository = new LiteDbMemoryRepository(SharedDb);
+        EventLog   = new LiteDbMemoryEventLog(SharedDb);
+        Store      = new LiteDbMemoryRepository(SharedDb, EventLog);
+        Repository = Store;
+        AdminStore = Store;
 
         // Initialize embedding service
         var embeddingsSettings = new EmbeddingsSettings
@@ -94,16 +111,33 @@ public class TestFixture : IAsyncDisposable
         SearchService = new MemorySearchEngine(
             Repository,
             EmbeddingService,
+            new RetrievalSettings(),
+            new MemoryVectorCache(),
+            new MemoryLexicalCache(),
             LoggerFactory.CreateLogger<MemorySearchEngine>());
 
         // Initialize conflict-aware storage
-        var conflictSettings = new ConflictSettings();
         ConflictStorage = new ConflictAwareStorageService(
             Repository,
-            SearchService,
             EmbeddingService,
-            conflictSettings,
+            new ConflictSettings(),
+            Slots,
             LoggerFactory.CreateLogger<ConflictAwareStorageService>());
+
+        MaintenanceSettings = new MaintenanceSettings { BackupPath = BackupPath };
+
+        Backups = new LiteDbBackupService(
+            SharedDb,
+            MaintenanceSettings,
+            LoggerFactory.CreateLogger<LiteDbBackupService>());
+
+        Maintenance = new MaintenanceService(
+            Repository,
+            AdminStore,
+            EmbeddingService,
+            MaintenanceSettings,
+            Backups,
+            LoggerFactory.CreateLogger<MaintenanceService>());
     }
 
     private async Task EnsureModelsDownloadedAsync()
@@ -176,6 +210,9 @@ public class TestFixture : IAsyncDisposable
             var journalPath = TestDbPath + "-journal";
             if (File.Exists(journalPath))
                 File.Delete(journalPath);
+
+            if (Directory.Exists(BackupPath))
+                Directory.Delete(BackupPath, recursive: true);
         }
         catch
         {
