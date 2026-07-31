@@ -75,8 +75,8 @@ migration step moves the schema version by itself, so there is no number to edit
    ```bash
    git checkout main
    git pull origin main
-   git tag -a v1.3.0 -m "v1.3.0"
-   git push origin v1.3.0
+   git tag -a v1.3.2 -m "v1.3.2"
+   git push origin v1.3.2
    ```
    Pushing the tag triggers [`release.yml`](.github/workflows/release.yml), which builds the
    server for all six platform targets, packages each one as an installer and an archive, and
