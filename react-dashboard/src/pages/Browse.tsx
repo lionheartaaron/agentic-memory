@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
-import { Search, Plus, X, Tag, Pin, Clock, Zap } from 'lucide-react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Search, Plus, X, Tag, Pin, Clock, Zap, History, RotateCcw, Loader2 } from 'lucide-react'
 import { api } from '../api'
 import { getCurrentStrength, strengthColor, strengthBg, timeAgo } from '../utils'
+import { STATE_LABELS, label } from '../types'
 import type { Memory } from '../types'
 import CreateMemoryModal from '../components/CreateMemoryModal'
 
@@ -16,13 +17,10 @@ function useDebounce<T>(value: T, delay: number): T {
   return debounced
 }
 
-function MemoryCard({ memory, score }: { memory: Memory; score?: number }) {
+function CardBody({ memory, score }: { memory: Memory; score?: number }) {
   const strength = getCurrentStrength(memory)
   return (
-    <Link
-      to={`/memories/${memory.id}`}
-      className="flex flex-col bg-zinc-900 border border-zinc-800 rounded-xl p-4 hover:border-zinc-600 hover:bg-zinc-800/30 transition-all group"
-    >
+    <>
       <div className="flex items-start gap-2 mb-2">
         {memory.isPinned && (
           <Pin className="w-3 h-3 text-indigo-400 mt-0.5 flex-shrink-0" />
@@ -84,6 +82,74 @@ function MemoryCard({ memory, score }: { memory: Memory; score?: number }) {
           )}
         </div>
       </div>
+    </>
+  )
+}
+
+/**
+ * A memory that is no longer current.
+ *
+ * Superseded and archived memories can still be opened: a scoped read keeps them precisely so that
+ * history and restore have something to work with. A forgotten one cannot, by design, so its card
+ * does not pretend to link anywhere. Restore lives here either way, because this list behind the
+ * include-archived filter is the only view a forgotten memory appears in at all.
+ */
+function InactiveCard({ memory }: { memory: Memory }) {
+  const queryClient = useQueryClient()
+
+  const restore = useMutation({
+    mutationFn: () => api.restore(memory.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['memories'] })
+      queryClient.invalidateQueries({ queryKey: ['stats'] })
+    },
+  })
+
+  return (
+    <div className="flex flex-col bg-zinc-900/50 border border-zinc-800/70 border-dashed rounded-xl p-4">
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <span className="px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 text-[10px] uppercase tracking-wider">
+          {label(STATE_LABELS, memory.state)}
+        </span>
+        <button
+          onClick={() => restore.mutate()}
+          disabled={restore.isPending}
+          className="flex items-center gap-1 text-[10px] text-indigo-400 hover:text-indigo-300 transition-colors disabled:opacity-40"
+        >
+          {restore.isPending
+            ? <Loader2 className="w-3 h-3 animate-spin" />
+            : <RotateCcw className="w-3 h-3" />}
+          Restore
+        </button>
+      </div>
+
+      {/* 3 is Forgotten, the one state a scoped read will not return. */}
+      {memory.state === 3 ? (
+        <div className="opacity-60">
+          <CardBody memory={memory} />
+        </div>
+      ) : (
+        <Link to={`/memories/${memory.id}`} className="opacity-60 hover:opacity-100 transition-opacity group">
+          <CardBody memory={memory} />
+        </Link>
+      )}
+
+      {restore.isError && (
+        <p className="text-[10px] text-red-400 mt-2">{(restore.error as Error).message}</p>
+      )}
+    </div>
+  )
+}
+
+function MemoryCard({ memory, score }: { memory: Memory; score?: number }) {
+  if (memory.state !== 0) return <InactiveCard memory={memory} />
+
+  return (
+    <Link
+      to={`/memories/${memory.id}`}
+      className="flex flex-col bg-zinc-900 border border-zinc-800 rounded-xl p-4 hover:border-zinc-600 hover:bg-zinc-800/30 transition-all group"
+    >
+      <CardBody memory={memory} score={score} />
     </Link>
   )
 }
@@ -107,18 +173,28 @@ export default function Browse() {
   const [query, setQuery] = useState('')
   const [selectedTags, setSelectedTags] = useState<string[]>([])
   const [showCreate, setShowCreate] = useState(false)
+  const [includeArchived, setIncludeArchived] = useState(false)
+  const [asOf, setAsOf] = useState('')
   const debouncedQuery = useDebounce(query, 300)
   const searchInputRef = useRef<HTMLInputElement>(null)
 
+  // datetime-local gives a local wall-clock string; the API wants an instant.
+  const asOfIso = asOf ? new Date(asOf).toISOString() : undefined
+
   const { data: allMemories, isLoading: listLoading } = useQuery({
-    queryKey: ['memories'],
-    queryFn: () => api.list(),
+    queryKey: ['memories', includeArchived],
+    queryFn: () => api.list(includeArchived),
   })
 
   const { data: searchResults, isFetching: searching } = useQuery({
-    queryKey: ['search', debouncedQuery, selectedTags],
+    queryKey: ['search', debouncedQuery, selectedTags, asOfIso],
     queryFn: () =>
-      api.search(debouncedQuery, 50, selectedTags.length ? selectedTags : undefined),
+      api.search(
+        debouncedQuery, 50,
+        selectedTags.length ? selectedTags : undefined,
+        undefined, undefined,
+        { asOf: asOfIso },
+      ),
     enabled: debouncedQuery.length > 1,
   })
 
@@ -147,15 +223,15 @@ export default function Browse() {
 
   const allTags = [...new Set(allMemories?.flatMap((m) => m.tags) ?? [])].sort()
 
-  const items: Array<{ memory: Memory; score?: number }> =
-    debouncedQuery.length > 1
-      ? (searchResults?.results.map((r) => ({ memory: r.memory, score: r.score })) ?? [])
-      : (allMemories
-          ?.filter(
-            (m) =>
-              !selectedTags.length || selectedTags.every((t) => m.tags.includes(t)),
-          )
-          .map((m) => ({ memory: m })) ?? [])
+  const isSearching = debouncedQuery.length > 1
+
+  const items: Array<{ memory: Memory; score?: number }> = isSearching
+    ? (searchResults?.results.map((r) => ({ memory: r.memory, score: r.score })) ?? [])
+    : (allMemories
+        ?.filter(
+          (m) => !selectedTags.length || selectedTags.every((t) => m.tags.includes(t)),
+        )
+        .map((m) => ({ memory: m })) ?? [])
 
   const toggleTag = (tag: string) =>
     setSelectedTags((prev) =>
@@ -173,7 +249,12 @@ export default function Browse() {
           <p className="text-sm text-zinc-500 mt-0.5">
             {isLoading
               ? 'Loading…'
-              : `${items.length} ${debouncedQuery.length > 1 ? 'results' : 'memories'}`}
+              : `${items.length} ${isSearching ? 'results' : 'memories'}`}
+            {isSearching && searchResults && (
+              <span className="text-zinc-600">
+                {' '}· confidence {searchResults.confidence.toLowerCase()}
+              </span>
+            )}
           </p>
         </div>
         <button
@@ -209,6 +290,50 @@ export default function Browse() {
             <div className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
           )}
         </div>
+
+        <div className="flex items-center gap-4 flex-wrap">
+          {/*
+            Point-in-time recall. Memories are bitemporal, so this asks what the store would have
+            answered on that date rather than filtering today's answer by age: a fact learned last
+            week about something true last year is included, and one superseded since is not.
+            Applies to search only, since listing has no time axis.
+          */}
+          <label className="flex items-center gap-2 text-xs text-zinc-500">
+            <History className="w-3.5 h-3.5 text-zinc-600" />
+            As of
+            <input
+              type="datetime-local"
+              value={asOf}
+              onChange={(e) => setAsOf(e.target.value)}
+              className="px-2 py-1 bg-zinc-900 border border-zinc-800 rounded-lg text-xs text-zinc-300 focus:outline-none focus:border-indigo-500 [color-scheme:dark]"
+            />
+            {asOf && (
+              <button
+                onClick={() => setAsOf('')}
+                className="text-zinc-600 hover:text-zinc-400 transition-colors"
+                title="Back to now"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </label>
+
+          <label className="flex items-center gap-2 text-xs text-zinc-500 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={includeArchived}
+              onChange={(e) => setIncludeArchived(e.target.checked)}
+              className="accent-indigo-500"
+            />
+            Include archived and forgotten
+          </label>
+        </div>
+
+        {asOf && !isSearching && (
+          <p className="text-xs text-amber-500/80">
+            As-of applies to search. Type a query to use it.
+          </p>
+        )}
 
         {allTags.length > 0 && (
           <div className="flex items-center gap-2 flex-wrap">
@@ -254,8 +379,8 @@ export default function Browse() {
       ) : (
         <div className="py-24 text-center">
           <p className="text-zinc-600 text-sm">
-            {debouncedQuery.length > 1
-              ? `No results for "${debouncedQuery}"`
+            {isSearching
+              ? `No results for "${debouncedQuery}"${asOf ? ' at that moment' : ''}`
               : 'No memories yet'}
           </p>
           {!debouncedQuery && (

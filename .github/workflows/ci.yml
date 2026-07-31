@@ -1,0 +1,120 @@
+name: CI
+
+# Runs the full test suite on every push and pull request, on all three platforms the
+# server ships for, and publishes the results as a GitHub check run (pass/fail per test,
+# annotations on failures). The React dashboard is built separately — it is part of the
+# product but no .NET test touches it.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true # a superseded push/PR shouldn't burn runner time on a stale commit
+
+permissions:
+  contents: read # default for every job; the test job adds checks: write to publish results
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  NODE_VERSION: '22.x'
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  test:
+    # All three platforms, because "cross platform" is a claim this repository makes in its
+    # README and its csproj: everything builds AnyCPU, ClearScript's V8 native is selected per
+    # runtime identifier, and AppPaths resolves a different per-user data folder on each OS.
+    # Only a matrix actually checks any of that.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            Directory.Build.props
+            agentic-memory/agentic-memory.csproj
+            agentic-memory-tests/agentic-memory-tests.csproj
+
+      - name: Restore
+        run: dotnet restore agentic-memory-tests/agentic-memory-tests.csproj
+
+      # SkipDashboardBuild because the test project references the server project, which would
+      # otherwise run `npm install && npm run build` here. The dashboard is built and typechecked
+      # by its own job below; no test reads wwwroot.
+      - name: Build
+        run: >
+          dotnet build agentic-memory-tests/agentic-memory-tests.csproj
+          -c Release --no-restore -p:SkipDashboardBuild=true
+
+      # TestFixture downloads the embedding model (~90 MB, all-MiniLM-L6-v2 from Hugging Face)
+      # into the system temp folder the first time it initialises, and throws if that fails — so
+      # a Hugging Face outage shows up here as failing memory tests rather than skipped ones.
+      # Nothing else in the suite needs the network.
+      - name: Test
+        run: >
+          dotnet test agentic-memory-tests/agentic-memory-tests.csproj
+          -c Release --no-build -p:SkipDashboardBuild=true
+          --logger "trx;LogFileName=test-results-${{ matrix.os }}.trx"
+          --results-directory TestResults
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: Test Results (${{ matrix.os }})
+          path: TestResults/*.trx
+          reporter: dotnet-trx
+          list-suites: all
+          list-tests: failed
+          fail-on-error: true
+
+      - name: Upload test results (trx)
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-results-trx-${{ matrix.os }}
+          path: TestResults/*.trx
+          if-no-files-found: error
+
+  dashboard:
+    # wwwroot/ is gitignored, so the dashboard is compiled from source on every build and there
+    # is no checked-in copy to fall back on. The MSBuild target that builds it during a normal
+    # `dotnet build` is deliberately ContinueOnError, so a broken dashboard does not stop a
+    # contributor working on the server — which means this job is the only thing that catches a
+    # type error or a broken bundle before it reaches a release.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: react-dashboard/package-lock.json
+
+      - name: Install
+        working-directory: react-dashboard
+        run: npm ci
+
+      # `npm run build` is `tsc -b && vite build`, so this is the typecheck as well as the bundle.
+      - name: Build
+        working-directory: react-dashboard
+        run: npm run build
+
+      - name: Confirm the bundle landed in wwwroot
+        run: test -f agentic-memory/wwwroot/index.html

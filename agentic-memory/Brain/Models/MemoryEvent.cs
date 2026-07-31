@@ -83,6 +83,42 @@ public enum ConflictStatus
 }
 
 /// <summary>
+/// What actually happened when a caller tried to settle a contradiction.
+///
+/// This used to be a <c>bool</c>, which could only say "found" or "not found" and so had to treat
+/// a nonsense request as a success. Every failure below is a caller mistake that was previously
+/// indistinguishable from a correct resolution.
+/// </summary>
+public enum ConflictResolution
+{
+    /// <summary>A winner was chosen. The other side is now superseded.</summary>
+    Resolved = 0,
+
+    /// <summary>Both sides stand; the contradiction is no longer flagged.</summary>
+    Dismissed = 1,
+
+    /// <summary>No such conflict for this user.</summary>
+    NotFound = 2,
+
+    /// <summary>
+    /// The winner named is not one of the two memories in the conflict. Refused, because the code
+    /// that picks the loser is "whichever side is not the winner": an id belonging to neither would
+    /// have superseded the new memory in favour of something unrelated and reported success.
+    /// </summary>
+    WinnerNotInConflict = 3,
+
+    /// <summary>Neither a winner nor a dismissal. There is nothing to record.</summary>
+    NoChoice = 4,
+
+    /// <summary>
+    /// Already resolved or dismissed. Settling it twice would supersede the first winner in favour
+    /// of the second, leaving both sides superseded and no memory current for the slot. Restore the
+    /// side that should have won instead.
+    /// </summary>
+    AlreadySettled = 5,
+}
+
+/// <summary>
 /// A detected contradiction that was deliberately <em>not</em> resolved automatically.
 ///
 /// Surfacing these is a feature rather than a failure: "Wait — I thought you were still at Acme?"
@@ -117,3 +153,41 @@ public sealed class MemoryConflict
     /// <summary>Companion that observed the conflict, when it arose in a scoped context.</summary>
     public string? CompanionId { get; set; }
 }
+
+/// <summary>
+/// One of the two memories a contradiction is between, reduced to what a decision needs.
+///
+/// Not the whole memory: choosing a side does not require the embedding or the access counters,
+/// and a conflict list that carried them would be mostly noise for a caller paying by the token.
+/// </summary>
+/// <param name="State">
+/// Which side is still current. A side already superseded by something else usually settles the
+/// question on its own.
+/// </param>
+/// <param name="Source">Where it came from. A user statement outranks a companion's inference.</param>
+public sealed record ConflictSide(
+    Guid Id,
+    string Title,
+    string Summary,
+    string? ValueKey,
+    MemoryState State,
+    MemorySource Source,
+    double Confidence,
+    DateTime CreatedAt,
+    DateTime ValidFrom,
+    bool IsPinned);
+
+/// <summary>
+/// A contradiction together with both memories it is about.
+///
+/// The conflict record alone names its two sides by id, which is enough to resolve one and not
+/// nearly enough to decide how. Anything asked to choose would have to fetch both separately, and
+/// a forgotten side cannot be fetched at all, so this exists to make "show me the contradiction"
+/// and "let me choose" the same call.
+/// </summary>
+/// <param name="Existing">The memory already held. Null when the scope may not see it.</param>
+/// <param name="New">The memory that arrived and contradicted it.</param>
+public sealed record ConflictDetail(
+    MemoryConflict Conflict,
+    ConflictSide? Existing,
+    ConflictSide? New);

@@ -1,7 +1,8 @@
 import type {
   Memory,
   MemoryRetrievalResult,
-  MemoryConflict,
+  ConflictDetail,
+  ConflictResolveResult,
   MemoryEvent,
   RepositoryStats,
   BackupSnapshot,
@@ -40,6 +41,40 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
 }
 
 const API_KEY_STORAGE = 'agenticMemoryApiKey'
+const USER_ID_STORAGE = 'agenticMemoryUserId'
+
+/**
+ * Whose memories the dashboard is looking at.
+ *
+ * Every memory endpoint is scoped, and a request that names no user falls back to the one called
+ * "default". On a store an agent writes to under its own user id, that shows an empty dashboard
+ * with no indication anything is being hidden: the memories are there, the question was just asked
+ * about somebody else. Held here and applied to every scoped call, rather than threaded through
+ * each page, so nothing can forget to send it.
+ *
+ * Empty means the default user, which is the right answer for a single-user store.
+ */
+export function getUserId(): string {
+  try {
+    return localStorage.getItem(USER_ID_STORAGE) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+export function setUserId(id: string): void {
+  try {
+    if (id) localStorage.setItem(USER_ID_STORAGE, id)
+    else localStorage.removeItem(USER_ID_STORAGE)
+  } catch {
+    /* nothing useful to do */
+  }
+}
+
+/** The current scope as query parameters, dropped entirely when it is the default user. */
+function scope(extra: Record<string, string | number | boolean | undefined> = {}) {
+  return qs({ userId: getUserId() || undefined, ...extra })
+}
 
 /**
  * The server's API key, when it has one configured.
@@ -93,7 +128,13 @@ async function req<T>(url: string, init?: RequestInit): Promise<T> {
     throw new UnauthorizedError(body?.error)
   }
 
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  if (!res.ok) {
+    // The endpoints that reject a request explain why in the body. "400 Bad Request" on its own
+    // tells a user nothing they can act on, and these messages exist precisely to be acted on.
+    const body = await res.json().catch(() => null)
+    throw new Error(body?.error ?? `${res.status} ${res.statusText}`)
+  }
+
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
 }
@@ -105,9 +146,9 @@ export const api = {
   generateStatus: () => req<{ available: boolean }>('/api/generate/status'),
 
   list: (includeArchived = false) =>
-    req<Memory[]>(`/api/memory${includeArchived ? '?includeArchived=true' : ''}`),
+    req<Memory[]>(`/api/memory${scope({ includeArchived: includeArchived || undefined })}`),
 
-  get: (id: string) => req<Memory>(`/api/memory/${id}`),
+  get: (id: string) => req<Memory>(`/api/memory/${id}${scope()}`),
 
   create: (data: CreateMemoryRequest) =>
     req<StoreResult>('/api/memory', {
@@ -121,7 +162,7 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  delete: (id: string) => req<void>(`/api/memory/${id}`, { method: 'DELETE' }),
+  delete: (id: string) => req<void>(`/api/memory/${id}${scope()}`, { method: 'DELETE' }),
 
   search: (
     query: string,
@@ -137,7 +178,7 @@ export const api = {
         query,
         topN,
         tags: tags?.length ? tags : undefined,
-        userId,
+        userId: userId ?? (getUserId() || undefined),
         companionId,
         asOf: opts?.asOf,
         noveltyBias: opts?.noveltyBias,
@@ -154,22 +195,29 @@ export const api = {
 
   createBackup: () => req<BackupSnapshot>('/api/admin/backups', { method: 'POST' }),
 
-  conflicts: (userId?: string, companionId?: string) =>
-    req<MemoryConflict[]>(
-      `/api/memory/conflicts${qs({ userId, companionId })}`),
+  /** `openOnly` defaults to true server-side, so the settled ones need asking for. */
+  conflicts: (openOnly = true, companionId?: string) =>
+    req<ConflictDetail[]>(`/api/memory/conflicts${scope({ openOnly, companionId })}`),
 
+  conflict: (id: string) => req<ConflictDetail>(`/api/memory/conflicts/${id}${scope()}`),
+
+  // The scope goes in the body here, not the query string, because that is where
+  // ConflictResolveRequest carries it. Sending it is not optional: without it the lookup runs
+  // against the default user and a conflict belonging to anyone else comes back 404.
   resolveConflict: (id: string, winnerId?: string, dismiss = false) =>
-    req<void>(`/api/memory/conflicts/${id}/resolve`, {
+    req<ConflictResolveResult>(`/api/memory/conflicts/${id}/resolve`, {
       method: 'POST',
-      body: JSON.stringify({ winnerId, dismiss }),
+      body: JSON.stringify({ winnerId, dismiss, userId: getUserId() || undefined }),
     }),
 
+  /** Unscoped on the server: the event log is keyed by memory id alone. */
   history: (id: string) => req<MemoryEvent[]>(`/api/memory/${id}/history`),
 
-  restore: (id: string) => req<void>(`/api/memory/${id}/restore`, { method: 'POST' }),
+  restore: (id: string) =>
+    req<void>(`/api/memory/${id}/restore${scope()}`, { method: 'POST' }),
 
-  slotHistory: (predicate: string, subject = 'user', userId?: string, companionId?: string) =>
-    req<Memory[]>(`/api/memory/slot${qs({ predicate, subject, userId, companionId })}`),
+  slotHistory: (predicate: string, subject = 'user', companionId?: string) =>
+    req<Memory[]>(`/api/memory/slot${scope({ predicate, subject, companionId })}`),
 
   fileContext: (filePath: string) =>
     req<{ context: string }>(`/api/file/context?path=${encodeURIComponent(filePath)}`),
@@ -231,6 +279,9 @@ export const api = {
   },
 
   admin: {
+    /** Every user id the store has memories for. Feeds the scope selector. */
+    users: () => req<string[]>('/api/admin/users'),
+
     maintenanceStats: () =>
       req<{ memories: number; codeIndexFiles: number; workspaces: number; dbSizeBytes: number }>(
         '/api/admin/maintenance-stats'

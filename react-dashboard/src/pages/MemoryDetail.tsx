@@ -1,10 +1,137 @@
 import { useState } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ChevronLeft, Save, Trash2, Pin, ExternalLink } from 'lucide-react'
+import { ChevronLeft, Save, Trash2, Pin, ExternalLink, History, Layers } from 'lucide-react'
 import { api } from '../api'
 import { getCurrentStrength, strengthColor, strengthBg, timeAgo } from '../utils'
-import type { UpdateMemoryRequest } from '../types'
+import {
+  EVENT_TYPE_LABELS, STATE_LABELS, TYPE_LABELS, SOURCE_LABELS, VISIBILITY_LABELS, label,
+} from '../types'
+import type { UpdateMemoryRequest, Memory } from '../types'
+
+/** Events that changed what the memory is, rather than merely recording that it was read. */
+const STRUCTURAL_EVENTS = new Set([2, 3, 4, 5, 6, 7, 8, 9])
+
+/**
+ * Everything that has happened to this memory.
+ *
+ * The event log outlives the row it describes, which is what makes a forget reversible and a purge
+ * auditable, so this is the one view that can still explain a memory nothing else can return.
+ */
+function EventHistory({ memoryId }: { memoryId: string }) {
+  const { data: events, isLoading } = useQuery({
+    queryKey: ['memory-history', memoryId],
+    queryFn: () => api.history(memoryId),
+  })
+
+  if (isLoading) {
+    return <div className="h-16 bg-zinc-800/40 rounded animate-pulse" />
+  }
+
+  if (!events?.length) return null
+
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+      <span className="text-xs text-zinc-500 uppercase tracking-wider flex items-center gap-2 mb-3">
+        <History className="w-3.5 h-3.5" />
+        History ({events.length})
+      </span>
+
+      <div className="space-y-2.5">
+        {[...events].reverse().map((event) => (
+          <div key={event.id} className="flex gap-2.5">
+            <div
+              className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1.5 ${
+                STRUCTURAL_EVENTS.has(event.type) ? 'bg-amber-400' : 'bg-zinc-600'
+              }`}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-xs text-zinc-300">
+                  {label(EVENT_TYPE_LABELS, event.type)}
+                </span>
+                <span className="text-[10px] text-zinc-600 flex-shrink-0">
+                  {timeAgo(event.timestamp)}
+                </span>
+              </div>
+              <p className="text-[10px] text-zinc-600 font-mono truncate">{event.actor}</p>
+              {event.detail && (
+                <p className="text-[10px] text-zinc-500 mt-0.5">{event.detail}</p>
+              )}
+              {event.relatedMemoryId && (
+                <Link
+                  to={`/memories/${event.relatedMemoryId}`}
+                  className="text-[10px] text-indigo-400 hover:text-indigo-300 font-mono"
+                >
+                  {event.relatedMemoryId.slice(0, 8)}…
+                </Link>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * How this structured fact has changed over time.
+ *
+ * Only meaningful for a memory that occupies a slot: `subject.predicate` is the identity that
+ * supersession is decided on, so the slot's history is the answer to "what did we believe about
+ * this, and when did that change".
+ */
+function SlotHistory({ memory }: { memory: Memory }) {
+  const { data: versions, isLoading } = useQuery({
+    queryKey: ['slot-history', memory.subjectRef, memory.predicate],
+    queryFn: () => api.slotHistory(memory.predicate!, memory.subjectRef),
+    enabled: !!memory.predicate,
+  })
+
+  if (!memory.predicate || isLoading || !versions || versions.length < 2) return null
+
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+      <span className="text-xs text-zinc-500 uppercase tracking-wider flex items-center gap-2 mb-1">
+        <Layers className="w-3.5 h-3.5" />
+        Slot history
+      </span>
+      <p className="text-[10px] text-zinc-600 font-mono mb-3">
+        {memory.subjectRef}.{memory.predicate}
+      </p>
+
+      <div className="space-y-2">
+        {versions.map((version) => {
+          const isThis = version.id === memory.id
+          return (
+            <Link
+              key={version.id}
+              to={`/memories/${version.id}`}
+              className={`block px-2.5 py-2 rounded-lg border transition-colors ${
+                isThis
+                  ? 'border-indigo-500/40 bg-indigo-500/5'
+                  : 'border-zinc-800 hover:border-zinc-700'
+              }`}
+            >
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-xs text-zinc-300 truncate">{version.title}</span>
+                <span className="text-[10px] text-zinc-600 flex-shrink-0">
+                  {label(STATE_LABELS, version.state)}
+                </span>
+              </div>
+              <div className="flex items-baseline justify-between gap-2 mt-0.5">
+                <span className="text-[10px] text-zinc-600">
+                  {version.valueKey ?? 'no value key'}
+                </span>
+                <span className="text-[10px] text-zinc-600">{timeAgo(version.validFrom)}</span>
+              </div>
+            </Link>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
 
 export default function MemoryDetail() {
   const { id } = useParams<{ id: string }>()
@@ -89,7 +216,12 @@ export default function MemoryDetail() {
     : (edits.tags ?? memory.tags)
 
   const metaRows: Array<{ label: string; value: string }> = [
+    { label: 'State', value: label(STATE_LABELS, memory.state) },
+    { label: 'Type', value: label(TYPE_LABELS, memory.type) },
+    { label: 'Visibility', value: label(VISIBILITY_LABELS, memory.visibility) },
+    { label: 'Source', value: label(SOURCE_LABELS, memory.source) },
     { label: 'Created', value: new Date(memory.createdAt).toLocaleString() },
+    { label: 'Valid from', value: timeAgo(memory.validFrom) },
     { label: 'Last accessed', value: timeAgo(memory.lastAccessedAt) },
     { label: 'Access count', value: `${memory.accessCount}×` },
     { label: 'Importance', value: memory.importance.toFixed(2) },
@@ -298,6 +430,10 @@ export default function MemoryDetail() {
               </Link>
             </div>
           )}
+
+          <SlotHistory memory={memory} />
+
+          <EventHistory memoryId={memory.id} />
 
           {/* ID */}
           <div className="px-3 py-2 bg-zinc-900 border border-zinc-800 rounded-lg">

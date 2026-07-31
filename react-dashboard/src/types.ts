@@ -1,10 +1,51 @@
-export type MemoryVisibility = 'Global' | 'Scoped'
-export type MemoryState = 'Active' | 'Superseded' | 'Archived' | 'Forgotten' | 'Merged'
-export type MemoryType =
-  | 'Semantic' | 'Identity' | 'Preference' | 'Persona' | 'Episodic' | 'Affective' | 'Ephemeral'
-export type MemorySource = 'UserStated' | 'Imported' | 'SystemDerived' | 'CompanionInferred'
-export type Sensitivity = 'Normal' | 'Sensitive' | 'Restricted'
+/*
+ * Enum-valued fields arrive as integers, not names.
+ *
+ * System.Text.Json writes a C# enum as its numeric value unless a converter says otherwise, and the
+ * server registers none. `RetrievalConfidence` is the single exception, projected to a string before
+ * it leaves the API. These were declared as string unions, which type-checks perfectly and matches
+ * nothing at runtime: every `state === 'Archived'` was dead code against a payload carrying `2`.
+ *
+ * The label arrays are indexed by the value, so a new member added on the server shows as
+ * `undefined` here rather than as the wrong name.
+ */
+export type MemoryVisibility = 0 | 1
+export const VISIBILITY_LABELS = ['Global', 'Scoped'] as const
+
+export type MemoryState = 0 | 1 | 2 | 3 | 4
+export const STATE_LABELS = ['Active', 'Superseded', 'Archived', 'Forgotten', 'Merged'] as const
+
+export type MemoryType = 0 | 1 | 2 | 3 | 4 | 5 | 6
+export const TYPE_LABELS = [
+  'Semantic', 'Identity', 'Preference', 'Persona', 'Episodic', 'Affective', 'Ephemeral',
+] as const
+
+export type MemorySource = 0 | 1 | 2 | 3
+export const SOURCE_LABELS = [
+  'User stated', 'Imported', 'System derived', 'Companion inferred',
+] as const
+
+export type Sensitivity = 0 | 1 | 2
+export const SENSITIVITY_LABELS = ['Normal', 'Sensitive', 'Restricted'] as const
+
+export type MemoryEventType = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
+export const EVENT_TYPE_LABELS = [
+  'Created', 'Updated', 'Superseded', 'Archived', 'Restored',
+  'Forgotten', 'Merged', 'Expired', 'Conflict recorded', 'Purged',
+] as const
+
+export type StoreAction = 0 | 1 | 2 | 3 | 4
+export const STORE_ACTION_LABELS = [
+  'Stored', 'Stored with supersede', 'Reinforced existing', 'Stored alongside', 'Stored with conflict',
+] as const
+
+/** The exception: a string on the wire. */
 export type RetrievalConfidence = 'None' | 'Low' | 'Medium' | 'High'
+
+/** Reads a label array safely, so an unknown value shows as itself rather than as `undefined`. */
+export function label(labels: readonly string[], value: number): string {
+  return labels[value] ?? `#${value}`
+}
 
 export interface Memory {
   id: string
@@ -81,9 +122,24 @@ export interface ScoredMemory {
   lastSurfacedToCompanionAt?: string
 }
 
-export type ConflictKind =
-  | 'ValueReplaced' | 'SoftPreferenceChange' | 'ImmutableViolation'
-  | 'CrossScopeContradiction' | 'ProvenanceDowngrade' | 'PolarityContradiction'
+export type ConflictKind = 0 | 1 | 2 | 3 | 4 | 5
+export const CONFLICT_KIND_LABELS = [
+  'Value replaced', 'Soft preference change', 'Immutable violation',
+  'Cross-scope contradiction', 'Provenance downgrade', 'Polarity contradiction',
+] as const
+
+/** Why each kind exists, for the one place a person has to make the call. */
+export const CONFLICT_KIND_HELP: readonly string[] = [
+  'Same singular slot, a different value. The newer one won.',
+  'A soft preference changed. Both were kept; worth asking about.',
+  'Something declared immutable, such as a birthday or legal name, was contradicted.',
+  'A companion-scoped memory contradicts one that every companion shares. Resolving it the wrong way erases knowledge from all the others.',
+  'A less trusted source tried to overwrite a more trusted one.',
+  'One statement asserts what the other denies.',
+]
+
+export type ConflictStatus = 0 | 1 | 2
+export const CONFLICT_STATUS_LABELS = ['Open', 'Resolved', 'Dismissed'] as const
 
 export interface MemoryConflict {
   id: string
@@ -93,7 +149,7 @@ export interface MemoryConflict {
   subjectRef: string
   predicate?: string
   kind: ConflictKind
-  status: 'Open' | 'Resolved' | 'Dismissed'
+  status: ConflictStatus
   detectedAt: string
   resolvedAt?: string
   winnerId?: string
@@ -101,12 +157,46 @@ export interface MemoryConflict {
   companionId?: string
 }
 
+/** One side of a contradiction, reduced to what a decision needs. */
+export interface ConflictSide {
+  id: string
+  title: string
+  summary: string
+  valueKey: string | null
+  state: MemoryState
+  source: MemorySource
+  confidence: number
+  createdAt: string
+  validFrom: string
+  isPinned: boolean
+}
+
+/**
+ * A contradiction together with both memories it is about.
+ *
+ * Both sides come back with the conflict rather than being fetched by id afterwards. A forgotten
+ * memory is deliberately unfetchable, so a side in that state could not be shown at all otherwise,
+ * and "choose between this and something we will not show you" is not a question anyone can answer.
+ * A side the current scope may not see is null.
+ */
+export interface ConflictDetail {
+  conflict: MemoryConflict
+  existing: ConflictSide | null
+  new: ConflictSide | null
+}
+
+/** What `resolve` actually did. Names match the server's ConflictResolution. */
+export interface ConflictResolveResult {
+  outcome: 'Resolved' | 'Dismissed'
+  winnerId: string | null
+}
+
 export interface MemoryEvent {
   id: string
   sequence: number
   userId: string
   memoryId: string
-  type: string
+  type: MemoryEventType
   actor: string
   timestamp: string
   relatedMemoryId?: string
@@ -251,7 +341,7 @@ export interface UpdateMemoryRequest {
 
 export interface StoreResult {
   memory: Memory
-  action: string
+  action: StoreAction
 }
 
 // ── Workspace / Sub-project ───────────────────────────────────────────────────

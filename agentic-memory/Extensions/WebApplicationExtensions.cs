@@ -165,18 +165,56 @@ public static class WebApplicationExtensions
 
         // ── Conflicts ─────────────────────────────────────────────────────────────────────────
 
+        // Each conflict carries both memories it is about. Returning only their ids would make
+        // choosing a side a fetch per side, and a forgotten side cannot be fetched at all.
         app.MapGet("/api/memory/conflicts", async (
             IMemoryRepository repository, string? userId, string? companionId, bool? openOnly, CancellationToken ct) =>
-            Results.Ok(await repository.GetConflictsAsync(ScopeFrom(userId, companionId), openOnly ?? true, ct)));
+            Results.Ok(await repository.GetConflictDetailsAsync(
+                ScopeFrom(userId, companionId), openOnly ?? true, ct)));
+
+        app.MapGet("/api/memory/conflicts/{id:guid}", async (
+            Guid id, IMemoryRepository repository, string? userId, string? companionId, CancellationToken ct) =>
+        {
+            var detail = await repository.GetConflictAsync(id, ScopeFrom(userId, companionId), ct);
+            return detail is null ? Results.NotFound() : Results.Ok(detail);
+        });
 
         app.MapPost("/api/memory/conflicts/{id:guid}/resolve", async (
             Guid id, ConflictResolveRequest request, IMemoryRepository repository, CancellationToken ct) =>
         {
-            var ok = await repository.ResolveConflictAsync(
+            var outcome = await repository.ResolveConflictAsync(
                 id, ScopeFrom(request.UserId, request.CompanionId),
                 request.WinnerId, request.Dismiss, "api:resolve-conflict", ct);
 
-            return ok ? Results.NoContent() : Results.NotFound();
+            // Every rejection below is a caller mistake with a different fix, so each says which.
+            // The old signature could only answer "found" or "not found", which meant a winner that
+            // belonged to neither side was reported as a successful resolution.
+            return outcome switch
+            {
+                ConflictResolution.Resolved  => Results.Ok(new { outcome = "Resolved",  winnerId = request.WinnerId }),
+                ConflictResolution.Dismissed => Results.Ok(new { outcome = "Dismissed", winnerId = (Guid?)null }),
+
+                ConflictResolution.NotFound => Results.NotFound(),
+
+                ConflictResolution.WinnerNotInConflict => Results.BadRequest(new
+                {
+                    error = "winnerId must be one of the two memories in this conflict.",
+                    outcome = outcome.ToString(),
+                }),
+                ConflictResolution.NoChoice => Results.BadRequest(new
+                {
+                    error = "Give a winnerId, or dismiss=true to keep both.",
+                    outcome = outcome.ToString(),
+                }),
+                ConflictResolution.AlreadySettled => Results.Conflict(new
+                {
+                    error = "This conflict has already been settled. Restore the memory that should "
+                          + "have won rather than resolving it a second time.",
+                    outcome = outcome.ToString(),
+                }),
+
+                _ => Results.BadRequest(new { outcome = outcome.ToString() }),
+            };
         });
 
         app.MapGet("/api/memory/slots", (SlotRegistry slots) =>

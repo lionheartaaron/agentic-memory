@@ -239,7 +239,7 @@ public class ConflictResolutionTests : MemoryServiceTestBase
 
         var conflict = Assert.Single(result.Conflicts);
 
-        Assert.True(await Repository.ResolveConflictAsync(
+        Assert.Equal(ConflictResolution.Resolved, await Repository.ResolveConflictAsync(
             conflict.Id, MemoryScope.AllFor(User), curry.Id, dismissed: false, "test", Ct));
 
         Assert.Equal(MemoryState.Superseded, (await AdminStore.GetByIdUnscopedAsync(ramen.Id, Ct))!.State);
@@ -312,5 +312,164 @@ public class ConflictResolutionTests : MemoryServiceTestBase
         var registry = new SlotRegistry();
         Assert.Equal(SlotCardinality.MultiValued, registry.Resolve("something_nobody_registered").Cardinality);
         Assert.Equal(SlotCardinality.MultiValued, registry.Resolve(null).Cardinality);
+    }
+
+    // ── Resolving with a choice ───────────────────────────────────────────────────────────────
+    //
+    // ResolveConflictAsync used to return bool, so the only thing it could report was whether the
+    // conflict existed. Every case below was previously indistinguishable from a correct
+    // resolution, and the first one silently corrupted the store.
+
+    /// <summary>Stores two contradicting facts and returns the conflict between them.</summary>
+    private async Task<(MemoryConflict Conflict, MemoryNodeEntity Old, MemoryNodeEntity New)> Contradiction()
+    {
+        var older = Fact("Employer", "Acme", predicate: "employer", value: "acme");
+        await ConflictStorage.StoreAsync(older, MemoryScope.AllFor(User), "test", Ct);
+
+        var newer = Fact("Employer", "Globex", predicate: "employer", value: "globex",
+            source: MemorySource.CompanionInferred);
+        var result = await ConflictStorage.StoreAsync(newer, MemoryScope.AllFor(User), "test", Ct);
+
+        return (Assert.Single(result.Conflicts), older, newer);
+    }
+
+    /// <summary>
+    /// The one that mattered. The loser is "whichever side is not the winner", so an id belonging
+    /// to neither made the *new* memory the loser and superseded it in favour of a memory that was
+    /// never part of the conflict. It returned true.
+    /// </summary>
+    [Fact]
+    public async Task AWinnerThatIsNotInTheConflict_ChangesNothing()
+    {
+        var (conflict, old, @new) = await Contradiction();
+        var bystander = Fact("Unrelated", "The user has a cat");
+        await ConflictStorage.StoreAsync(bystander, MemoryScope.AllFor(User), "test", Ct);
+
+        var outcome = await Repository.ResolveConflictAsync(
+            conflict.Id, MemoryScope.AllFor(User), bystander.Id, dismissed: false, "test", Ct);
+
+        Assert.Equal(ConflictResolution.WinnerNotInConflict, outcome);
+
+        Assert.Equal(MemoryState.Active, (await AdminStore.GetByIdUnscopedAsync(old.Id, Ct))!.State);
+        Assert.Equal(MemoryState.Active, (await AdminStore.GetByIdUnscopedAsync(@new.Id, Ct))!.State);
+        Assert.Equal(MemoryState.Active, (await AdminStore.GetByIdUnscopedAsync(bystander.Id, Ct))!.State);
+
+        // Still open, so the decision it was actually waiting for can still be made.
+        Assert.Single(await Repository.GetConflictsAsync(MemoryScope.AllFor(User), openOnly: true, Ct));
+    }
+
+    [Fact]
+    public async Task ResolvingWithNeitherAWinnerNorADismissal_ChangesNothing()
+    {
+        var (conflict, old, @new) = await Contradiction();
+
+        var outcome = await Repository.ResolveConflictAsync(
+            conflict.Id, MemoryScope.AllFor(User), winnerId: null, dismissed: false, "test", Ct);
+
+        Assert.Equal(ConflictResolution.NoChoice, outcome);
+        Assert.Equal(MemoryState.Active, (await AdminStore.GetByIdUnscopedAsync(old.Id, Ct))!.State);
+        Assert.Equal(MemoryState.Active, (await AdminStore.GetByIdUnscopedAsync(@new.Id, Ct))!.State);
+        Assert.Single(await Repository.GetConflictsAsync(MemoryScope.AllFor(User), openOnly: true, Ct));
+    }
+
+    /// <summary>
+    /// Settling twice with opposite winners would supersede both sides, leaving the slot with
+    /// nothing current. The second attempt is refused instead.
+    /// </summary>
+    [Fact]
+    public async Task SettlingTheSameConflictTwice_IsRefusedAndLeavesTheFirstWinnerStanding()
+    {
+        var (conflict, old, @new) = await Contradiction();
+
+        Assert.Equal(ConflictResolution.Resolved, await Repository.ResolveConflictAsync(
+            conflict.Id, MemoryScope.AllFor(User), @new.Id, dismissed: false, "test", Ct));
+
+        var second = await Repository.ResolveConflictAsync(
+            conflict.Id, MemoryScope.AllFor(User), old.Id, dismissed: false, "test", Ct);
+
+        Assert.Equal(ConflictResolution.AlreadySettled, second);
+        Assert.Equal(MemoryState.Active, (await AdminStore.GetByIdUnscopedAsync(@new.Id, Ct))!.State);
+        Assert.Equal(MemoryState.Superseded, (await AdminStore.GetByIdUnscopedAsync(old.Id, Ct))!.State);
+    }
+
+    [Fact]
+    public async Task AConflictBelongingToAnotherUser_IsNotFound()
+    {
+        var (conflict, _, @new) = await Contradiction();
+
+        var outcome = await Repository.ResolveConflictAsync(
+            conflict.Id, MemoryScope.AllFor("someone-else"), @new.Id, dismissed: false, "test", Ct);
+
+        Assert.Equal(ConflictResolution.NotFound, outcome);
+        Assert.Single(await Repository.GetConflictsAsync(MemoryScope.AllFor(User), openOnly: true, Ct));
+    }
+
+    [Fact]
+    public async Task DismissingRecordsNoWinner()
+    {
+        var (conflict, _, _) = await Contradiction();
+
+        Assert.Equal(ConflictResolution.Dismissed, await Repository.ResolveConflictAsync(
+            conflict.Id, MemoryScope.AllFor(User), winnerId: null, dismissed: true, "test", Ct));
+
+        var settled = Assert.Single(
+            await Repository.GetConflictsAsync(MemoryScope.AllFor(User), openOnly: false, Ct));
+
+        Assert.Equal(ConflictStatus.Dismissed, settled.Status);
+        Assert.Null(settled.WinnerId);
+    }
+
+    // ── Seeing what is being chosen between ───────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ConflictDetail_CarriesBothSidesWithEnoughToChooseBetweenThem()
+    {
+        var (conflict, old, @new) = await Contradiction();
+
+        var detail = Assert.Single(
+            await Repository.GetConflictDetailsAsync(MemoryScope.AllFor(User), openOnly: true, Ct));
+
+        Assert.Equal(conflict.Id, detail.Conflict.Id);
+        Assert.NotNull(detail.Existing);
+        Assert.NotNull(detail.New);
+
+        Assert.Equal(old.Id, detail.Existing!.Id);
+        Assert.Equal(@new.Id, detail.New!.Id);
+
+        // The fields a decision actually turns on: which value, still current, and how trusted.
+        Assert.Equal("acme", detail.Existing.ValueKey);
+        Assert.Equal("globex", detail.New.ValueKey);
+        Assert.Equal(MemoryState.Active, detail.Existing.State);
+        Assert.Equal(MemorySource.UserStated, detail.Existing.Source);
+        Assert.Equal(MemorySource.CompanionInferred, detail.New.Source);
+    }
+
+    /// <summary>
+    /// A forgotten memory is deliberately unfetchable by id, so a caller told only "new: X,
+    /// existing: Y" could not read one side at all. The detail projection reads the collection
+    /// directly for exactly this reason.
+    /// </summary>
+    [Fact]
+    public async Task AForgottenSideIsStillShown()
+    {
+        var (conflict, old, _) = await Contradiction();
+
+        await Repository.ForgetAsync(old.Id, MemoryScope.AllFor(User), "test", Ct);
+        Assert.Null(await Repository.GetAsync(old.Id, MemoryScope.AllFor(User), Ct));
+
+        var detail = await Repository.GetConflictAsync(conflict.Id, MemoryScope.AllFor(User), Ct);
+
+        Assert.NotNull(detail);
+        Assert.NotNull(detail!.Existing);
+        Assert.Equal(MemoryState.Forgotten, detail.Existing!.State);
+    }
+
+    [Fact]
+    public async Task GetConflict_IsScopedToItsOwner()
+    {
+        var (conflict, _, _) = await Contradiction();
+
+        Assert.NotNull(await Repository.GetConflictAsync(conflict.Id, MemoryScope.AllFor(User), Ct));
+        Assert.Null(await Repository.GetConflictAsync(conflict.Id, MemoryScope.AllFor("someone-else"), Ct));
     }
 }

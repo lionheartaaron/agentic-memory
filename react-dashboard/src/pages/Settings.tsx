@@ -3,8 +3,10 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Settings2, Database, Brain, FolderGit2, Trash2,
   Loader2, AlertTriangle, CheckCircle2, RotateCcw,
+  KeyRound, HardDrive, Archive,
 } from 'lucide-react'
-import { api } from '../api'
+import { api, getApiKey, setApiKey } from '../api'
+import { timeAgo } from '../utils'
 
 function fmtBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
@@ -17,6 +19,265 @@ function StatChip({ label, value }: { label: string; value: string | number }) {
     <div className="flex flex-col gap-0.5">
       <span className="text-[10px] text-zinc-500 uppercase tracking-wider">{label}</span>
       <span className="text-sm font-semibold text-zinc-200 tabular-nums">{value}</span>
+    </div>
+  )
+}
+
+/**
+ * The dashboard's copy of the server's API key.
+ *
+ * Held per browser rather than compiled into the bundle, which is static and identical for every
+ * install: a key baked in there would be the same secret on every machine that ever downloaded it.
+ * The gate in ApiKeyGate asks for one when the server rejects a call; this is where it can be
+ * changed or removed afterwards.
+ */
+function AccessSection() {
+  const queryClient = useQueryClient()
+  const [key, setKey] = useState(getApiKey())
+  const [saved, setSaved] = useState(false)
+
+  const stored = getApiKey()
+
+  function apply(next: string) {
+    setApiKey(next)
+    setKey(next)
+    // Everything already fetched was fetched under the old key, including anything that failed.
+    queryClient.resetQueries()
+    setSaved(true)
+    setTimeout(() => setSaved(false), 3000)
+  }
+
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 space-y-3">
+      <h2 className="text-xs font-medium text-zinc-400 uppercase tracking-wider flex items-center gap-2">
+        <KeyRound className="w-3.5 h-3.5 text-zinc-500" />
+        Access
+      </h2>
+
+      <p className="text-xs text-zinc-500 leading-relaxed">
+        {stored
+          ? 'A key is stored in this browser and sent with every request.'
+          : 'No key stored. One is only needed when the server has Server:ApiKey set.'}
+      </p>
+
+      <div className="flex items-center gap-2">
+        <input
+          type="password"
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          placeholder="API key"
+          autoComplete="off"
+          className="flex-1 min-w-0 px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-lg text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-600"
+        />
+
+        <button
+          onClick={() => apply(key.trim())}
+          disabled={key.trim() === stored}
+          className="px-3 py-2 text-xs font-medium rounded-lg bg-zinc-100 text-zinc-900 hover:bg-white transition-colors disabled:opacity-40 disabled:hover:bg-zinc-100"
+        >
+          Save
+        </button>
+
+        {stored && (
+          <button
+            onClick={() => apply('')}
+            className="px-3 py-2 text-xs text-zinc-400 hover:text-zinc-200 transition-colors"
+          >
+            Clear
+          </button>
+        )}
+      </div>
+
+      {saved && (
+        <p className="flex items-center gap-1.5 text-xs text-green-400">
+          <CheckCircle2 className="w-3.5 h-3.5" /> Saved for this browser.
+        </p>
+      )}
+    </div>
+  )
+}
+
+function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex items-baseline justify-between gap-4 py-1.5 border-b border-zinc-800/60 last:border-0">
+      <span className="text-xs text-zinc-500 flex-shrink-0">{label}</span>
+      <span className="text-xs text-zinc-300 text-right break-all">{value}</span>
+    </div>
+  )
+}
+
+/**
+ * What the database says about itself.
+ *
+ * The schema version and the app version move independently, so both are shown: an operator asking
+ * "can I safely put the previous build back on this file" is asking about the first one, and
+ * nothing about the second one answers it.
+ */
+function DatabaseSection() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['database-info'],
+    queryFn: api.database,
+  })
+
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 space-y-3">
+      <h2 className="text-xs font-medium text-zinc-400 uppercase tracking-wider flex items-center gap-2">
+        <HardDrive className="w-3.5 h-3.5 text-zinc-500" />
+        Database
+      </h2>
+
+      {isLoading && (
+        <div className="flex items-center gap-2 text-zinc-600 text-sm">
+          <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading…
+        </div>
+      )}
+
+      {data && (
+        <>
+          {data.migratedOnThisStart && (
+            <div className="flex items-start gap-2 px-3 py-2 bg-blue-950/30 border border-blue-900/50 rounded-lg">
+              <RotateCcw className="w-3.5 h-3.5 text-blue-400 flex-shrink-0 mt-0.5" />
+              <div className="text-xs text-blue-300">
+                Migrated from schema v{data.migratedFromVersion} to v{data.schemaVersion} on this
+                start.
+                {data.snapshotPath && (
+                  <span className="block text-blue-400/70 mt-0.5 break-all">
+                    Snapshot: {data.snapshotPath}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div>
+            <InfoRow
+              label="Schema version"
+              value={
+                <>
+                  v{data.schemaVersion}
+                  <span className="text-zinc-600"> · this build supports v{data.supportedSchemaVersion}</span>
+                </>
+              }
+            />
+            <InfoRow label="App version" value={data.appVersion} />
+            <InfoRow
+              label="Created"
+              value={
+                data.createdAt
+                  ? `${timeAgo(data.createdAt)}${data.createdByAppVersion ? ` · by v${data.createdByAppVersion}` : ''}`
+                  : 'unknown'
+              }
+            />
+            <InfoRow
+              label="Last opened"
+              value={
+                data.lastOpenedAt
+                  ? `${timeAgo(data.lastOpenedAt)}${data.lastOpenedByAppVersion ? ` · by v${data.lastOpenedByAppVersion}` : ''}`
+                  : 'unknown'
+              }
+            />
+          </div>
+
+          {data.history.length > 0 && (
+            <div className="space-y-1.5 pt-1">
+              <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Migration history</p>
+              {data.history.map((entry, i) => (
+                <div
+                  key={`${entry.toVersion}-${i}`}
+                  className="flex items-baseline justify-between gap-3 text-xs"
+                >
+                  <span className="text-zinc-400 truncate">
+                    <span className="text-zinc-600 tabular-nums">
+                      v{entry.fromVersion}→v{entry.toVersion}
+                    </span>{' '}
+                    {entry.name}
+                  </span>
+                  <span className="text-zinc-600 flex-shrink-0 tabular-nums">
+                    {entry.documentsTouched} docs · v{entry.appVersion}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Snapshots of the whole store.
+ *
+ * One is taken automatically before anything irreversible, and since migrations are forward-only
+ * this is also the entire recovery story for a database an older build can no longer open. Listing
+ * them matters as much as being able to make one: a snapshot nobody can find is not a backup.
+ */
+function BackupsSection() {
+  const queryClient = useQueryClient()
+
+  const { data: snapshots, isLoading } = useQuery({
+    queryKey: ['backups'],
+    queryFn: api.backups,
+  })
+
+  const create = useMutation({
+    mutationFn: api.createBackup,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['backups'] }),
+  })
+
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-xs font-medium text-zinc-400 uppercase tracking-wider flex items-center gap-2">
+          <Archive className="w-3.5 h-3.5 text-zinc-500" />
+          Snapshots
+        </h2>
+
+        <button
+          onClick={() => create.mutate()}
+          disabled={create.isPending}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-zinc-700 text-zinc-300 hover:bg-zinc-800 transition-colors disabled:opacity-40"
+        >
+          {create.isPending
+            ? <Loader2 className="w-3 h-3 animate-spin" />
+            : <Archive className="w-3 h-3" />}
+          Take one now
+        </button>
+      </div>
+
+      {create.isError && (
+        <p className="text-xs text-red-400">
+          {(create.error as Error).message}. Snapshots are disabled when
+          Maintenance:BackupBeforeDestructiveOperations is false.
+        </p>
+      )}
+
+      {isLoading ? (
+        <div className="flex items-center gap-2 text-zinc-600 text-sm">
+          <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading…
+        </div>
+      ) : snapshots && snapshots.length > 0 ? (
+        <div className="space-y-1">
+          {snapshots.map((s) => (
+            <div key={s.path} className="flex items-baseline justify-between gap-3 py-1 text-xs">
+              <span className="text-zinc-300 truncate" title={s.path}>
+                {s.path.split(/[\\/]/).pop()}
+              </span>
+              <span className="text-zinc-600 flex-shrink-0 tabular-nums">
+                {fmtBytes(s.sizeBytes)} · {timeAgo(s.createdAt)}
+              </span>
+            </div>
+          ))}
+          <p className="text-[10px] text-zinc-600 pt-2">
+            Kept in the backup directory under the data folder. Restoring one is a file copy while
+            the server is stopped; there is no in-app restore, on purpose.
+          </p>
+        </div>
+      ) : (
+        <p className="text-xs text-zinc-600">
+          None yet. One is taken automatically before a destructive operation or a schema migration.
+        </p>
+      )}
     </div>
   )
 }
@@ -190,6 +451,12 @@ export default function Settings() {
           </div>
         )}
       </div>
+
+      <AccessSection />
+
+      <DatabaseSection />
+
+      <BackupsSection />
 
       {/* Maintenance */}
       <div className="space-y-3">

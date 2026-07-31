@@ -20,9 +20,26 @@ internal class Program
         Console.OutputEncoding = Encoding.UTF8;
 
         var appBasePath = AppContext.BaseDirectory;
-        var builder = WebApplication.CreateSlimBuilder(args);
 
-        builder.Environment.ContentRootPath = appBasePath;
+        // The content root is handed to the builder rather than assigned to builder.Environment
+        // afterwards. Assigning it after construction updates the path but leaves the web-root
+        // file provider pointing wherever the host first resolved it, so wwwroot silently stops
+        // being served: the REST API and MCP keep working and the dashboard 404s. It reproduces
+        // by starting the published binary through a relative path — which is exactly how a
+        // parent process tends to launch a sidecar.
+        var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
+        {
+            Args = args,
+            ContentRootPath = appBasePath,
+        });
+
+        // A published build has a real wwwroot beside the binary. A development build does not: the
+        // Web SDK leaves the dashboard where Vite wrote it and emits a manifest in the output folder
+        // that maps it back. The slim builder is the one host builder that does not read that
+        // manifest, so without this the dashboard 404s under `dotnet run` while the API answers
+        // normally. In a published build there is no manifest and this does nothing.
+        builder.WebHost.UseStaticWebAssets();
+
         builder.Configuration
             .SetBasePath(appBasePath)
             .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);

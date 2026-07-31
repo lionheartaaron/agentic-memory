@@ -1,0 +1,324 @@
+name: Release
+
+# Push a tag like "v1.3.0" to build and publish the server for every platform it runs on:
+# Windows, Linux and macOS, each on x64 and arm64. Every asset is a self-contained folder —
+# the .NET runtime is inside it — so a host machine needs nothing installed.
+#
+# What is NOT in the assets: model weights. The embedding model (~90 MB) downloads on first
+# run; the generative model (~5 GB) only if Generation is enabled. See RELEASING.md.
+#
+# macOS builds are ad-hoc signed, not Developer ID signed or notarized, so Gatekeeper still
+# requires a right-click > Open (or `xattr -cr`) the first time.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never cancel a release build/upload mid-flight
+
+permissions:
+  contents: read # default for every job; only the release job elevates to write
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  NODE_VERSION: '22.x'
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  verify-tag:
+    # A `v*` tag is just a ref — git doesn't tie it to any branch, so pushing one from a
+    # feature branch or develop would trigger this workflow just the same. Gitflow here
+    # always tags main (see RELEASING.md), so refuse to build/publish anything if the
+    # tagged commit isn't actually reachable from main: catches a tag cut from the wrong
+    # branch before it ships instead of after.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # need full history for the ancestry check below, not just the tag commit
+
+      - name: Confirm tag points at a commit on main
+        run: |
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME (commit $GITHUB_SHA) is not reachable from main. Releases must be tagged from main — see RELEASING.md."
+            exit 1
+          fi
+
+      # The version isn't only stamped on the binaries. AppVersion reads it at runtime and the
+      # migrator writes it into the database on every open — CreatedByAppVersion and the
+      # migration history are permanent records of which build touched a user's data. A tag
+      # that disagrees with the csproj would put a wrong answer in a file we can't go back and
+      # correct, so it fails the release rather than being quietly overridden by -p:Version.
+      - name: Confirm the checked-in version matches the tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CORE="${TAG_VERSION%%-*}"          # v1.3.0-rc.1 -> 1.3.0, so pre-release tags still match
+          CSPROJ=agentic-memory/agentic-memory.csproj
+          FILE_VERSION=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' "$CSPROJ" | head -n1)
+          if [ "$FILE_VERSION" != "$CORE" ]; then
+            echo "::error::<Version> in $CSPROJ is '$FILE_VERSION' but the tag is '$GITHUB_REF_NAME' (expected '$CORE'). Bump the csproj on main before tagging — see RELEASING.md."
+            exit 1
+          fi
+          echo "Version $FILE_VERSION matches tag $GITHUB_REF_NAME"
+
+  dashboard:
+    # Built once, on one machine, and handed to all six publish jobs. wwwroot/ is gitignored, so
+    # something has to build it; doing it here rather than six times means every platform ships a
+    # byte-identical UI, npm runs once instead of once per runner, and a broken dashboard stops
+    # the release at the cheapest possible point. Note the server's own NpmBuild target is
+    # ContinueOnError — good for a contributor without Node, useless as a release gate.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: react-dashboard/package-lock.json
+
+      - name: Build the dashboard
+        working-directory: react-dashboard
+        run: |
+          npm ci
+          npm run build
+
+      - name: Confirm the bundle landed in wwwroot
+        run: test -f agentic-memory/wwwroot/index.html
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dashboard
+          if-no-files-found: error
+          path: agentic-memory/wwwroot
+
+  publish:
+    needs: [verify-tag, dashboard]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `native: true` means the runner can execute what it just built, so the smoke test
+          # runs. The two cross-published targets (win-arm64 from x64 Windows, linux-arm64 from
+          # x64 Linux) can't be started here; nothing is compiled on the runner for them, the
+          # runtime and every native dependency arrive prebuilt from NuGet, so the output is the
+          # same as it would be on a native runner — it just goes out unexercised.
+          - { rid: win-x64,     os: windows-latest, archive: zip, native: true }
+          - { rid: win-arm64,   os: windows-latest, archive: zip, native: false }
+          - { rid: linux-x64,   os: ubuntu-latest,  archive: tar, native: true }
+          - { rid: linux-arm64, os: ubuntu-latest,  archive: tar, native: false }
+          - { rid: osx-arm64,   os: macos-latest,   archive: tar, native: true }
+          - { rid: osx-x64,     os: macos-15-intel, archive: tar, native: true }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Compute version and package name
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "PKG=agentic-memory-${VERSION}-${{ matrix.rid }}" >> "$GITHUB_ENV"
+
+      - name: Fetch the prebuilt dashboard
+        uses: actions/download-artifact@v8
+        with:
+          name: dashboard
+          path: agentic-memory/wwwroot
+
+      - name: Publish self-contained ${{ matrix.rid }}
+        run: |
+          dotnet publish agentic-memory/agentic-memory.csproj -c Release \
+            -r ${{ matrix.rid }} --self-contained true \
+            -p:Version=${VERSION} -p:SkipDashboardBuild=true \
+            -o publish/${{ matrix.rid }}
+
+      - name: Confirm the dashboard made it into the publish output
+        run: test -f "publish/${{ matrix.rid }}/wwwroot/index.html"
+
+      - name: Make the launcher executable
+        if: runner.os != 'Windows'
+        run: chmod +x "publish/${{ matrix.rid }}/agentic-memory"
+
+      - name: Ad-hoc codesign
+        if: runner.os == 'macOS'
+        run: |
+          # Apple Silicon refuses to run ANY unsigned Mach-O code, not just unnotarized code.
+          # The SDK ad-hoc signs the apphost itself, but not the loose native libraries a
+          # self-contained publish drops beside it — ONNX Runtime, ClearScript's V8 — and an
+          # unsigned dylib is killed on load just as an unsigned executable is. Signing every
+          # Mach-O found is free and needs no Apple Developer account. It is NOT Developer ID
+          # signing or notarization, which we're deliberately skipping: Gatekeeper still shows
+          # the "unidentified developer" prompt on both architectures.
+          find "publish/${{ matrix.rid }}" -type f -print0 | while IFS= read -r -d '' f; do
+            if file "$f" | grep -q 'Mach-O'; then
+              codesign --force --sign - "$f"
+            fi
+          done
+
+      # Starts the thing we're about to ship and waits for it to answer. This is the only step
+      # that exercises the assembled artifact end to end: the native loads (ONNX Runtime, V8),
+      # the embedding model download, the schema migrator creating a database from nothing, and
+      # Kestrel actually serving. A green unit-test suite says none of that — it runs against a
+      # framework-dependent build with a different layout. /api/admin/health is deliberately
+      # exempt from API-key auth, which is what makes it usable as a readiness probe here just
+      # as it is for an Electron host.
+      - name: Smoke test
+        if: matrix.native
+        run: |
+          set -u
+          BIN="publish/${{ matrix.rid }}/agentic-memory"
+          [ "$RUNNER_OS" = "Windows" ] && BIN="${BIN}.exe"
+
+          DATA="$RUNNER_TEMP/smoke-data"
+          mkdir -p "$DATA"
+
+          "$BIN" --bind 127.0.0.1 --port 45877 --data-dir "$DATA" > smoke.log 2>&1 &
+          SERVER_PID=$!
+
+          READY=0
+          # Generous, because first run downloads the ~90 MB embedding model before it listens.
+          for _ in $(seq 1 90); do
+            if curl -fsS --max-time 5 http://127.0.0.1:45877/api/admin/health > /dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "::error::The server exited before it became ready."
+              break
+            fi
+            sleep 2
+          done
+
+          # The dashboard is served off disk from the content root, which is a separate thing from
+          # the file simply being present in the output — a content root resolved from the wrong
+          # place 404s the UI while every API route keeps answering, so health alone would call
+          # that build good. Ask for the page itself.
+          DASHBOARD=""
+          if [ "$READY" = "1" ]; then
+            DASHBOARD=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:45877/)
+          fi
+
+          # Shut it down, and make sure it is really gone before the next step copies the directory
+          # it is running out of. Git Bash's `kill` does not reliably terminate a native Windows
+          # process — and `$!` there is an MSYS pid, not the Windows one, so taskkill goes by image
+          # name. A survivor holds locks on the publish output, which would make the archive step
+          # fail intermittently rather than obviously.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            taskkill //IM agentic-memory.exe //F //T > /dev/null 2>&1 || true
+          fi
+          kill "$SERVER_PID" 2>/dev/null || true
+          wait "$SERVER_PID" 2>/dev/null || true
+          sleep 2
+
+          echo "--- server output ---"
+          cat smoke.log || true
+
+          if [ "$READY" != "1" ]; then
+            echo "::error::${{ matrix.rid }} build did not answer /api/admin/health."
+            exit 1
+          fi
+          if [ "$DASHBOARD" != "200" ]; then
+            echo "::error::${{ matrix.rid }} build answered health but returned $DASHBOARD for the dashboard at /."
+            exit 1
+          fi
+          echo "${{ matrix.rid }} started, answered health, and served the dashboard."
+
+      - name: Stage the package
+        run: |
+          rm -rf staging && mkdir -p "staging/${PKG}"
+          cp -r "publish/${{ matrix.rid }}/." "staging/${PKG}/"
+
+          # The smoke test ran the binary in place and left its downloaded weights behind. A shipped
+          # build has no Models directory: weights arrive on first run, wherever the install resolves
+          # its models directory to. The asset should be what a fresh publish produces, not what one
+          # run of it happened to leave. Same reasoning for anything else written in place; the
+          # database cannot appear here, since the smoke test is given its own --data-dir, so that
+          # line is a guard against the day it is not.
+          rm -rf "staging/${PKG}/Models" "staging/${PKG}/backups"
+          find "staging/${PKG}" -maxdepth 1 -name '*.db' -delete
+
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar'
+        run: |
+          mkdir -p dist
+          # COPYFILE_DISABLE stops macOS tar writing ._ AppleDouble files into the archive.
+          COPYFILE_DISABLE=1 tar -czf "dist/${PKG}.tar.gz" -C staging "${PKG}"
+
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "staging/$env:PKG" -DestinationPath "dist/$env:PKG.zip"
+
+      - name: Checksum
+        run: |
+          cd dist
+          ARCHIVE=$(ls)
+          if command -v sha256sum > /dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          fi
+          cat "${ARCHIVE}.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.rid }}
+          if-no-files-found: error
+          path: dist/*
+
+  release:
+    needs: [verify-tag, dashboard, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # only this job creates the release / uploads assets
+    steps:
+      - name: Collect the packages
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: package-*  # not the dashboard artifact, which is an input, not an asset
+          merge-multiple: true
+
+      - name: Roll the per-package checksums into one file
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS.txt
+          rm -f ./*.sha256
+          echo "--- SHA256SUMS.txt ---"
+          cat SHA256SUMS.txt
+          ls -la
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A tag with a hyphen is a pre-release by SemVer's own rules (v1.3.0-rc.1), so mark it
+          # as one instead of letting it show up as the latest stable release.
+          PRERELEASE=""
+          case "$GITHUB_REF_NAME" in
+            *-*) PRERELEASE="--prerelease" ;;
+          esac
+
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes $PRERELEASE

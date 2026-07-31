@@ -1,15 +1,65 @@
 import { Outlet, NavLink } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
-import { Brain, LayoutDashboard, Database, MessageSquare, FolderGit2, Activity, Settings2 } from 'lucide-react'
-import { api } from '../api'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { Brain, LayoutDashboard, Database, MessageSquare, FolderGit2, Activity, Settings2, GitFork, User } from 'lucide-react'
+import { api, getUserId, setUserId } from '../api'
 
 const navItems = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
   { to: '/memories', label: 'Memories', icon: Database, end: false },
+  { to: '/conflicts', label: 'Conflicts', icon: GitFork, end: false },
   { to: '/chat', label: 'Chat', icon: MessageSquare, end: false },
   { to: '/projects', label: 'Workspaces', icon: FolderGit2, end: false },
   { to: '/worker', label: 'Worker', icon: Activity, end: false },
 ]
+
+/**
+ * Which user's memories every page is showing.
+ *
+ * Memories are scoped per user, and an unscoped request answers for the one called "default". A
+ * store written to by an agent under its own user id therefore looks completely empty until this is
+ * set, with nothing on screen to say that anything is being scoped away.
+ */
+function ScopeSelector() {
+  const queryClient = useQueryClient()
+  const current = getUserId()
+
+  const { data: users } = useQuery({
+    queryKey: ['users'],
+    queryFn: api.admin.users,
+    staleTime: 60_000,
+  })
+
+  // Keep the selected user visible even if it owns nothing yet, so the control never silently
+  // reads as a user other than the one in effect.
+  const options = [...new Set([...(users ?? []), ...(current ? [current] : [])])].sort()
+  if (!options.length) return null
+
+  return (
+    <div className="px-3 pt-3">
+      <label className="flex items-center gap-2 px-3 py-2 bg-zinc-950/60 border border-zinc-800 rounded-lg">
+        <User className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0" />
+        <select
+          value={current}
+          onChange={(e) => {
+            setUserId(e.target.value)
+            // Everything cached was fetched for the previous user.
+            queryClient.clear()
+          }}
+          className="flex-1 min-w-0 bg-transparent text-xs text-zinc-300 focus:outline-none cursor-pointer"
+        >
+          <option value="">default</option>
+          {options
+            .filter((u) => u !== 'default')
+            .map((u) => (
+              <option key={u} value={u}>
+                {u}
+              </option>
+            ))}
+        </select>
+      </label>
+    </div>
+  )
+}
 
 export default function Layout() {
   const { data: status, isError } = useQuery({
@@ -26,9 +76,17 @@ export default function Layout() {
     retry: false,
   })
 
+  const { data: openConflicts } = useQuery({
+    queryKey: ['conflicts', true],
+    queryFn: () => api.conflicts(true),
+    refetchInterval: 30_000,
+    retry: false,
+  })
+
   const isOnline = !isError && status?.status === 'healthy'
   const serverUrl = status?.server.listeningUrl ?? 'connecting…'
   const workerActive = workerStatus?.isProcessing ?? false
+  const conflictCount = openConflicts?.length ?? 0
 
   return (
     <div className="flex h-screen bg-zinc-950 text-zinc-100 overflow-hidden">
@@ -43,6 +101,8 @@ export default function Layout() {
             <div className="text-xs text-zinc-500 leading-tight">Memory</div>
           </div>
         </div>
+
+        <ScopeSelector />
 
         {/* Nav */}
         <nav className="flex-1 p-3 space-y-0.5">
@@ -63,6 +123,11 @@ export default function Layout() {
               {label}
               {label === 'Worker' && workerActive && (
                 <span className="ml-auto w-2 h-2 rounded-full bg-green-400 animate-pulse flex-shrink-0" />
+              )}
+              {label === 'Conflicts' && conflictCount > 0 && (
+                <span className="ml-auto px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 text-[10px] font-medium tabular-nums flex-shrink-0">
+                  {conflictCount}
+                </span>
               )}
             </NavLink>
           ))}

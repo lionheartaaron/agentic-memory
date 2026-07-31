@@ -201,7 +201,7 @@ public static class ConsoleHelpers
 
         return loopbackOnly
             ? ":unlocked: [grey]None[/] [grey dim]· this machine only[/]"
-            : ":warning:  [yellow]None — reachable from the whole network[/] [grey dim]· set Server:ApiKey[/]";
+            : ":warning:  [yellow]None: reachable from the whole network[/] [grey dim]· set Server:ApiKey[/]";
     }
 
     private static string OriginLabel(PathOrigin origin) => origin switch

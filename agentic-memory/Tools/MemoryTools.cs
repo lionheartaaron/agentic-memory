@@ -100,7 +100,7 @@ public class MemoryTools(
 
         if (result.Conflicts.Count > 0)
         {
-            sb.AppendLine().AppendLine("## Unresolved contradictions — worth asking the user about");
+            sb.AppendLine().AppendLine("## Unresolved contradictions, worth asking the user about");
             foreach (var c in result.Conflicts)
                 sb.AppendLine($"- [{c.Id}] {c.Description}");
         }
@@ -402,46 +402,111 @@ public class MemoryTools(
 
     [McpServerTool(Name = "list_conflicts")]
     [Description("""
-        Contradictions the system refused to resolve on its own. Raising one naturally is good
-        companion behaviour — "wait, I thought you were still at Acme?" — and beats silently
-        picking a side. Settle it with resolve_conflict once the user answers.
+        Contradictions the system refused to resolve on its own, each with both memories in full so
+        you can see what you would be choosing between. Raising one naturally is good companion
+        behaviour ("wait, I thought you were still at Acme?") and beats silently picking a side.
+        Ask the user, then settle it with resolve_conflict.
         """)]
     public async Task<string> ListConflicts(
         [Description("The user")] string user_id,
         [Description("Companion context")] string? companion_id = null,
+        [Description("false to include ones already settled, for auditing a past decision")] bool open_only = true,
         CancellationToken cancellationToken = default)
     {
         var scope     = MemoryScope.For(user_id, companion_id);
-        var conflicts = await repository.GetConflictsAsync(scope, openOnly: true, cancellationToken);
+        var conflicts = await repository.GetConflictDetailsAsync(scope, open_only, cancellationToken);
 
-        if (conflicts.Count == 0) return "No unresolved contradictions.";
+        if (conflicts.Count == 0)
+            return open_only ? "No unresolved contradictions." : "No contradictions on record.";
 
-        var sb = new StringBuilder($"**{conflicts.Count} unresolved contradiction(s)**\n");
-        foreach (var c in conflicts)
-            sb.AppendLine($"\n[{c.Id}] {c.Kind} on '{c.Predicate ?? "(unstructured)"}' about {c.SubjectRef}\n" +
-                          $"  {c.Description}\n  new: {c.NewMemoryId}  existing: {c.ExistingMemoryId}");
+        var sb = new StringBuilder($"**{conflicts.Count} contradiction(s)**\n");
+
+        foreach (var detail in conflicts)
+        {
+            var c = detail.Conflict;
+
+            sb.AppendLine($"\n[{c.Id}] {c.Kind} on '{c.Predicate ?? "(unstructured)"}' about {c.SubjectRef}");
+            sb.AppendLine($"  {c.Description}");
+
+            if (c.Status != ConflictStatus.Open)
+                sb.AppendLine($"  ALREADY {c.Status.ToString().ToUpperInvariant()}" +
+                              (c.WinnerId is { } w ? $" in favour of {w}" : "") + ". Cannot be settled again.");
+
+            AppendSide("EXISTING", detail.Existing);
+            AppendSide("NEW",      detail.New);
+
+            // Named so the model can quote it straight into resolve_conflict without deciding which
+            // of the two ids above goes where.
+            if (c.Status == ConflictStatus.Open)
+                sb.AppendLine($"  → resolve_conflict(conflict_id: {c.Id}, winner_id: <one of the two ids above>)");
+        }
 
         return sb.ToString();
+
+        void AppendSide(string role, ConflictSide? side)
+        {
+            if (side is null)
+            {
+                sb.AppendLine($"  {role}: not visible in this scope");
+                return;
+            }
+
+            var state = side.State == MemoryState.Active ? "current" : side.State.ToString().ToLowerInvariant();
+
+            sb.AppendLine($"  {role} [{state}] id: {side.Id}");
+            sb.AppendLine($"    {side.Title}");
+            if (!string.IsNullOrWhiteSpace(side.Summary)) sb.AppendLine($"    {side.Summary}");
+            if (!string.IsNullOrWhiteSpace(side.ValueKey)) sb.AppendLine($"    value: {side.ValueKey}");
+            sb.AppendLine($"    said {side.ValidFrom:yyyy-MM-dd}, from {side.Source}, confidence {side.Confidence:0.00}");
+        }
     }
 
     [McpServerTool(Name = "resolve_conflict")]
-    [Description("Settle a contradiction once the user has clarified. The losing memory becomes history, never deleted.")]
+    [Description("""
+        Settle a contradiction once the user has clarified. The losing memory becomes history, never
+        deleted, and can be brought back with restore_memory. winner_id must be one of the two ids
+        list_conflicts gave for this conflict; anything else is refused rather than guessed at.
+        """)]
     public async Task<string> ResolveConflict(
         [Description("Conflict ID from list_conflicts")] Guid conflict_id,
         [Description("The user")] string user_id,
-        [Description("ID of the memory that is correct. Omit with dismiss=true if both are fine.")] Guid? winner_id = null,
+        [Description("ID of the memory that is correct, exactly as listed. Omit with dismiss=true if both are fine.")] Guid? winner_id = null,
         [Description("Both memories are valid; just stop flagging it")] bool dismiss = false,
         [Description("Companion context")] string? companion_id = null,
         CancellationToken cancellationToken = default)
     {
         var scope = MemoryScope.For(user_id, companion_id);
-        var ok = await repository.ResolveConflictAsync(
+        var outcome = await repository.ResolveConflictAsync(
             conflict_id, scope, winner_id, dismiss, "mcp:resolve_conflict", cancellationToken);
 
-        return ok
-            ? dismiss ? "Conflict dismissed; both memories remain active."
-                      : $"Conflict resolved in favour of {winner_id}. The other is retained as history."
-            : $"Conflict {conflict_id} not found in this scope.";
+        // Each failure says what to do about it, because the model is the thing that has to recover
+        // and "false" told it nothing.
+        return outcome switch
+        {
+            ConflictResolution.Resolved =>
+                $"Resolved in favour of {winner_id}. The other memory is retained as history and can "
+                + "be brought back with restore_memory.",
+
+            ConflictResolution.Dismissed =>
+                "Dismissed; both memories remain active and it will not be flagged again.",
+
+            ConflictResolution.NotFound =>
+                $"No conflict {conflict_id} for this user. Call list_conflicts for current ids.",
+
+            ConflictResolution.WinnerNotInConflict =>
+                $"{winner_id} is not one of the two memories in conflict {conflict_id}. Nothing was "
+                + "changed. Call list_conflicts and use one of the two ids it gives for this conflict.",
+
+            ConflictResolution.NoChoice =>
+                "Nothing was changed: give winner_id to pick a side, or dismiss=true to keep both.",
+
+            ConflictResolution.AlreadySettled =>
+                $"Conflict {conflict_id} was already settled and nothing was changed. Settling it "
+                + "twice would supersede the first winner as well, leaving nothing current. If the "
+                + "wrong side won, use restore_memory on the one that should have.",
+
+            _ => outcome.ToString(),
+        };
     }
 
     [McpServerTool(Name = "get_memory_history")]

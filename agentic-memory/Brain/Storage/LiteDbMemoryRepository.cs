@@ -629,7 +629,14 @@ public sealed class LiteDbMemoryRepository : IMemoryRepository, IMemoryAdminStor
         return Task.FromResult<IReadOnlyList<MemoryConflict>>(results);
     }
 
-    public Task<bool> ResolveConflictAsync(
+    public async Task<IReadOnlyList<ConflictDetail>> GetConflictDetailsAsync(
+        MemoryScope scope, bool openOnly = true, CancellationToken cancellationToken = default)
+    {
+        var conflicts = await GetConflictsAsync(scope, openOnly, cancellationToken);
+        return conflicts.Select(c => Describe(c, scope)).ToList();
+    }
+
+    public Task<ConflictResolution> ResolveConflictAsync(
         Guid conflictId, MemoryScope scope, Guid? winnerId, bool dismissed, string actor,
         CancellationToken cancellationToken = default)
     {
@@ -637,11 +644,25 @@ public sealed class LiteDbMemoryRepository : IMemoryRepository, IMemoryAdminStor
 
         var conflict = _conflicts.FindById(conflictId);
         if (conflict is null || !string.Equals(conflict.UserId, scope.UserId, StringComparison.Ordinal))
-            return Task.FromResult(false);
+            return Task.FromResult(ConflictResolution.NotFound);
+
+        if (conflict.Status != ConflictStatus.Open)
+            return Task.FromResult(ConflictResolution.AlreadySettled);
+
+        // Every check below runs before anything is written. A contradiction is settled by
+        // superseding a memory, which is the kind of thing that should not happen halfway.
+        if (!dismissed)
+        {
+            if (winnerId is not { } candidate)
+                return Task.FromResult(ConflictResolution.NoChoice);
+
+            if (candidate != conflict.NewMemoryId && candidate != conflict.ExistingMemoryId)
+                return Task.FromResult(ConflictResolution.WinnerNotInConflict);
+        }
 
         conflict.Status     = dismissed ? ConflictStatus.Dismissed : ConflictStatus.Resolved;
         conflict.ResolvedAt = DateTime.UtcNow;
-        conflict.WinnerId   = winnerId;
+        conflict.WinnerId   = dismissed ? null : winnerId;
         _conflicts.Update(conflict);
 
         // Resolving in favour of one side supersedes the other, atomically.
@@ -651,11 +672,47 @@ public sealed class LiteDbMemoryRepository : IMemoryRepository, IMemoryAdminStor
             return ExecuteAsync(
                     new MemoryWriteBatch().ChangeState(loser, MemoryState.Superseded, winner, detail: "conflict resolved"),
                     actor, cancellationToken)
-                .ContinueWith(_ => true, cancellationToken);
+                .ContinueWith(_ => ConflictResolution.Resolved, cancellationToken);
         }
 
         Interlocked.Increment(ref _writeStamp);
-        return Task.FromResult(true);
+        return Task.FromResult(ConflictResolution.Dismissed);
+    }
+
+    public Task<ConflictDetail?> GetConflictAsync(
+        Guid conflictId, MemoryScope scope, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var conflict = _conflicts.FindById(conflictId);
+        if (conflict is null || !string.Equals(conflict.UserId, scope.UserId, StringComparison.Ordinal))
+            return Task.FromResult<ConflictDetail?>(null);
+
+        return Task.FromResult<ConflictDetail?>(Describe(conflict, scope));
+    }
+
+    /// <summary>
+    /// Pairs a conflict with the two memories it is about.
+    ///
+    /// Read straight from the collection rather than through <see cref="GetAsync"/>, which hides a
+    /// forgotten memory on purpose. Here that would blank out one side of a decision the caller is
+    /// being asked to make, and "choose between this and something I will not show you" is not a
+    /// question anyone can answer. Scope is still enforced: a side the scope does not admit is
+    /// returned as null, exactly as <see cref="GetConflictsAsync"/> already requires of both.
+    /// </summary>
+    private ConflictDetail Describe(MemoryConflict conflict, MemoryScope scope)
+    {
+        return new ConflictDetail(conflict, Side(conflict.ExistingMemoryId), Side(conflict.NewMemoryId));
+
+        ConflictSide? Side(Guid id)
+        {
+            var m = _collection.FindById(id);
+            if (m is null || !scope.Admits(m)) return null;
+
+            return new ConflictSide(
+                m.Id, m.Title, m.Summary, m.ValueKey, m.State, m.Source,
+                m.Confidence, m.CreatedAt, m.ValidFrom, m.IsPinned);
+        }
     }
 
     // ── IMemoryAdminStore ─────────────────────────────────────────────────────────────────────

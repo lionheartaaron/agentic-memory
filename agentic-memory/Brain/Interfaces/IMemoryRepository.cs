@@ -110,7 +110,26 @@ public interface IMemoryRepository : IDisposable
         bool openOnly = true,
         CancellationToken cancellationToken = default);
 
-    Task<bool> ResolveConflictAsync(
+    /// <summary>
+    /// The same contradictions, each carrying the two memories it is about, so that a caller can
+    /// see what it is choosing between without a round trip per side.
+    /// </summary>
+    Task<IReadOnlyList<ConflictDetail>> GetConflictDetailsAsync(
+        MemoryScope scope,
+        bool openOnly = true,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>One contradiction with both its sides, or null if this scope has no such conflict.</summary>
+    Task<ConflictDetail?> GetConflictAsync(
+        Guid conflictId,
+        MemoryScope scope,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Settle a contradiction. Returns what happened rather than whether it was found: an invalid
+    /// winner, a missing choice and a second attempt are all caller mistakes that need saying.
+    /// </summary>
+    Task<ConflictResolution> ResolveConflictAsync(
         Guid conflictId, MemoryScope scope, Guid? winnerId, bool dismissed, string actor,
         CancellationToken cancellationToken = default);
 }
