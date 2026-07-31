@@ -76,7 +76,12 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
 
         var superseded = new List<MemoryNodeEntity>();
         var conflicts  = new List<MemoryConflict>();
+        var pending    = new List<ContradictionCandidate>();
         MemoryNodeEntity? duplicate = null;
+
+        // Built once. The frame test needs it against every candidate, and re-deriving it inside
+        // the loop would tokenize the incoming statement once per memory already stored.
+        var incomingPolarity = PolarityProfile.For(entity);
 
         foreach (var (existing, similarity, _) in candidates)
         {
@@ -96,6 +101,22 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
                         entity, existing, similarity > 0 ? similarity : null, out var polarityReason):
                     conflicts.Add(BuildConflict(
                         entity, existing, ConflictKind.PolarityContradiction, polarityReason, scope));
+                    break;
+
+                // Same claim, different value, and no negation on either side for the test above to
+                // catch. Recorded as a question rather than an answer: the shape that fits "a blue
+                // Corolla" against "a red Civic" fits "a dog called Salt" against "a cat called
+                // Pepper" equally well, and only one of those pairs is a contradiction. The caller
+                // decides; ignoring the list leaves both memories active, exactly as before.
+                case SupersedeDecision.Coexist
+                    when pending.Count < MaxAdjudications
+                      && FrameDetector.IsSubstitutionCandidate(
+                             entity, existing, incomingPolarity, PolarityProfile.For(existing),
+                             similarity > 0 ? similarity : null, out var frame):
+                    pending.Add(new ContradictionCandidate(
+                        existing.Id, PolarityDetector.Statement(existing),
+                        entity.Id,   PolarityDetector.Statement(entity),
+                        similarity,  frame));
                     break;
 
                 case SupersedeDecision.Supersede when _settings.AutoSupersedeEnabled:
@@ -147,6 +168,7 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
                 Action             = StoreAction.StoredWithSupersede,
                 SupersededMemories = superseded,
                 Conflicts          = conflicts,
+                ContradictionCandidates = pending,
                 Message = $"Memory stored. Superseded {superseded.Count} previous " +
                           $"memor{(superseded.Count == 1 ? "y" : "ies")}: {titles}.",
             };
@@ -159,6 +181,7 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
                 Memory    = entity,
                 Action    = StoreAction.StoredWithConflict,
                 Conflicts = conflicts,
+                ContradictionCandidates = pending,
                 Message = $"Memory stored. {conflicts.Count} contradiction" +
                           $"{(conflicts.Count == 1 ? "" : "s")} recorded and left for confirmation: " +
                           string.Join("; ", conflicts.Select(c => c.Description)),
@@ -171,6 +194,7 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
             {
                 Memory  = entity,
                 Action  = StoreAction.StoredCoexist,
+                ContradictionCandidates = pending,
                 Message = $"Memory stored alongside {candidates.Count} related memor" +
                           $"{(candidates.Count == 1 ? "y" : "ies")}.",
             };
@@ -187,6 +211,23 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
     // ── Candidate generation ──────────────────────────────────────────────────────────────────
 
     private sealed record CandidateMatch(MemoryNodeEntity Memory, double Similarity, bool IsRestatement);
+
+    /// <summary>
+    /// Ceiling on wording-proposed polarity candidates per store. The test itself is cheap, but it
+    /// tokenizes, and a user who has said "no" a great many times about one subject should not make
+    /// every write proportionally slower.
+    /// </summary>
+    private const int MaxPolarityCandidates = 25;
+
+    /// <summary>
+    /// Ceiling on substitution pairs handed back per store.
+    ///
+    /// Far tighter than the polarity ceiling above, because these are not free: each one costs the
+    /// caller a model call to settle. A write that proposed twenty would turn one remembered
+    /// sentence into twenty adjudications, and the pairs are ranked by similarity, so the ones past
+    /// the first few are the least likely to be real anyway.
+    /// </summary>
+    private const int MaxAdjudications = 3;
 
     /// <summary>
     /// Memories worth comparing against.
@@ -219,6 +260,9 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
         var active     = await _repository.GetActiveAsync(scope, cancellationToken);
         var identity   = RestatementKey(entity);
         var semantic   = new List<CandidateMatch>();
+        var polarity   = 0;
+
+        var incomingPolarity = PolarityProfile.For(entity);
 
         foreach (var m in active)
         {
@@ -233,6 +277,17 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
             if (sameContext && RestatementKey(m) == identity)
             {
                 found[m.Id] = new CandidateMatch(m, 1.0, true);
+                continue;
+            }
+
+            // Polarity pairs have to be proposed on wording. Embedding distance cannot see them:
+            // "no allergies" sits 0.50 from "allergic to bears", below the candidate floor, so the
+            // one memory the new fact actually contradicts was the one reliably filtered out.
+            if (sameContext && polarity < MaxPolarityCandidates &&
+                incomingPolarity.SharesTopicWithOppositePolarity(PolarityProfile.For(m)))
+            {
+                found[m.Id] = new CandidateMatch(m, 0, false);
+                polarity++;
                 continue;
             }
 
@@ -294,7 +349,16 @@ public sealed class ConflictAwareStorageService : IConflictAwareStorage
             Predicate        = incoming.Predicate,
             Kind             = kind,
             CompanionId      = scope.CompanionId,
-            Description      = $"'{incoming.Title}' contradicts '{existing.Title}' ({reason})",
+
+            // Both statements in full, and which of them is the newer one. Naming the two titles was
+            // useless precisely when it mattered most: a user correcting himself uses the same title
+            // twice, so the description read "'Allergies' contradicts 'Allergies'" and left whoever
+            // read it no way to tell what the disagreement was, let alone which side was current.
+            Description =
+                $"newer: \"{PolarityDetector.Statement(incoming)}\" " +
+                $"(recorded {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC) — " +
+                $"earlier: \"{PolarityDetector.Statement(existing)}\" " +
+                $"(recorded {existing.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC) — {reason}",
         };
 
     private static void Normalize(MemoryNodeEntity entity, MemoryScope scope)

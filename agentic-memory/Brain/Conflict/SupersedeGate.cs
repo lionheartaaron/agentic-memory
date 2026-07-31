@@ -71,7 +71,16 @@ public sealed class SupersedeGate(SlotRegistry slots)
             return new(SupersedeDecision.Duplicate, "same slot and value");
 
         // 6. Multi-valued slots never supersede. A second pet does not delete the first.
-        if (slot.Cardinality == SlotCardinality.MultiValued)
+        //
+        //    Unless what is being replaced is the claim that there are none. "No allergies" is not a
+        //    member of the set, it is the assertion that the set is empty, and a single real value
+        //    falsifies it outright. Treating it as one more value is what left "the user is not
+        //    allergic to anything" active and equally retrievable after the user said bears, so
+        //    "what am I allergic to" could be answered either way.
+        var retractsEmptySet = PolarityDetector.AssertsEmptySet(existing, incoming)
+                            && !PolarityDetector.AssertsEmptySet(incoming, existing);
+
+        if (slot.Cardinality == SlotCardinality.MultiValued && !retractsEmptySet)
             return new(SupersedeDecision.Coexist, $"'{predicate}' holds multiple values");
 
         // 7. Scope must not narrow. This is the rule that matters most with several companions: a
@@ -94,7 +103,15 @@ public sealed class SupersedeGate(SlotRegistry slots)
                 $"{incoming.Source} cannot overwrite {existing.Source}",
                 ConflictKind.ProvenanceDowngrade);
 
-        // 9. Slot policy.
+        // 9. Retracting "there are none" is not a change of value, so no policy governs it. An
+        //    escalation here would be a question with only one possible answer — the old memory
+        //    asserted an empty set and cannot be the thing the user meant to keep — while leaving
+        //    both active until someone answers it. Runs after the scope and provenance rails above,
+        //    which still apply: emptiness is not a licence to cross a companion boundary.
+        if (retractsEmptySet)
+            return new(SupersedeDecision.Supersede, $"'{predicate}' was recorded as empty and now has a value");
+
+        // 10. Slot policy.
         return slot.Policy switch
         {
             ConflictPolicy.Immutable =>

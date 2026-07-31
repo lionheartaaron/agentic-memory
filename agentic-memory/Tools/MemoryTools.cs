@@ -125,11 +125,23 @@ public class MemoryTools(
             _ => $" | you have mentioned this {r.TimesSurfacedToCompanion} times already",
         };
 
+        // When a fact was recorded is not a detail — it is the only thing that separates a correction
+        // from the thing it corrected. Two memories about one subject routinely tie on relevance, and
+        // without a date the reader has no way to tell which one the user said most recently.
+        // To the second, because the two memories that most need separating are a statement and the
+        // correction that followed it, and those often arrive within the same minute.
+        var recorded = $" | recorded {r.Memory.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC";
+
+        var contested = r.IsContradicted
+            ? "\n! Another memory in these results contradicts this one. Do not answer from it alone — "
+              + "read both, prefer the more recently recorded, and check the contradictions listed below."
+            : "";
+
         return $"""
             **{r.Memory.Title}** (relevance {r.Score:F2}, via {string.Join("+", r.MatchedChannels)})
             ID: {r.Memory.Id}
             {r.Memory.Summary}
-            about: {r.Memory.SubjectRef} | {scope}{slot} | source: {r.Memory.Source}{told}
+            about: {r.Memory.SubjectRef} | {scope}{slot} | source: {r.Memory.Source}{recorded}{told}{contested}
             """;
     }
 

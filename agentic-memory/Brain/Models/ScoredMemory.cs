@@ -31,4 +31,16 @@ public record ScoredMemory
 
     /// <summary>When this companion last used the memory, or null if she never has.</summary>
     public DateTime? LastSurfacedToCompanionAt { get; init; }
+
+    /// <summary>
+    /// True when an open contradiction names this memory and the memory on its other side is also in
+    /// this result set.
+    ///
+    /// Without it the two halves of a contradiction arrive as two ordinary results of equal
+    /// relevance, and whichever one is read first wins. That is how "I am not allergic to anything",
+    /// contradicted later by "I am allergic to bears", could still be the answer to "what am I
+    /// allergic to": both were returned, both scored 1.00, and nothing in either said the other
+    /// existed.
+    /// </summary>
+    public bool IsContradicted { get; init; }
 }

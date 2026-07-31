@@ -83,6 +83,13 @@ public sealed class SlotRegistry
         new("full_name",             SlotCardinality.Singular,     ConflictPolicy.Immutable,     NeverAutoRemove: true),
         new("birthday",              SlotCardinality.Singular,     ConflictPolicy.Immutable,     NeverAutoRemove: true),
 
+        // Appearance. One current value each, but a change is a deliberate act — somebody dyes
+        // their hair, they do not drift into it — so it is worth confirming rather than
+        // overwriting in silence, and a contradiction is as likely to be a bad reading.
+        new("hair_colour",           SlotCardinality.SingularSoft, ConflictPolicy.EscalateToUser),
+        new("eye_colour",            SlotCardinality.SingularSoft, ConflictPolicy.EscalateToUser),
+        new("height",                SlotCardinality.SingularSoft, ConflictPolicy.EscalateToUser),
+
         // Real but slow-moving preferences — worth a "didn't you say you loved ramen?".
         new("favourite_food",        SlotCardinality.SingularSoft, ConflictPolicy.EscalateToUser),
         new("favourite_colour",      SlotCardinality.SingularSoft, ConflictPolicy.EscalateToUser),

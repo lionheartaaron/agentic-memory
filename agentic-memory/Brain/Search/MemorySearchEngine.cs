@@ -220,7 +220,12 @@ public sealed class MemorySearchEngine : ISearchService
                     LastSurfacedToCompanionAt = seen?.LastSurfacedAt,
                 };
             })
+            // Recency breaks exact ties. Two memories can only tie when every channel scored them
+            // identically, which is precisely what a user restating a fact produces — and leaving
+            // the order to chance there means a corrected fact and its correction swap places
+            // between one query and the next.
             .OrderByDescending(s => s.Score)
+            .ThenByDescending(s => s.Memory.ValidFrom)
             .ToList();
 
         // ── 5. Diversify, so the result set is not five paraphrases of one fact ───────────────
@@ -267,6 +272,20 @@ public sealed class MemorySearchEngine : ISearchService
         var conflicts = (await _repository.GetConflictsAsync(request.Scope, openOnly: true, cancellationToken))
             .Where(c => touched.Contains(c.NewMemoryId) || touched.Contains(c.ExistingMemoryId))
             .ToList();
+
+        // Mark the results a contradiction is actually between, so the caller cannot read one half of
+        // a disagreement as settled fact. Only pairs where both sides came back are marked: a lone
+        // result whose counterpart fell outside the scope or the top-N is not something the reader
+        // can weigh, and flagging it would only teach them to distrust every answer.
+        var contested = conflicts
+            .Where(c => touched.Contains(c.NewMemoryId) && touched.Contains(c.ExistingMemoryId))
+            .SelectMany(c => new[] { c.NewMemoryId, c.ExistingMemoryId })
+            .ToHashSet();
+
+        if (contested.Count > 0)
+            selected = selected
+                .Select(s => contested.Contains(s.Memory.Id) ? s with { IsContradicted = true } : s)
+                .ToList();
 
         return new MemoryRetrievalResult
         {

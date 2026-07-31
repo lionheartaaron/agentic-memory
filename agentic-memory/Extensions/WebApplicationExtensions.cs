@@ -1,3 +1,4 @@
+using AgenticMemory.Brain.Conflict;
 using AgenticMemory.Brain.Interfaces;
 using AgenticMemory.Brain.Models;
 using AgenticMemory.Brain.Retrieval;
@@ -177,6 +178,68 @@ public static class WebApplicationExtensions
         {
             var detail = await repository.GetConflictAsync(id, ScopeFrom(userId, companionId), ct);
             return detail is null ? Results.NotFound() : Results.Ok(detail);
+        });
+
+        // The way a contradiction gets recorded when the service could not judge it alone.
+        //
+        // Substitution pairs — same claim, different value, no slot and no negation — come back on
+        // a store result as candidates rather than conflicts, because "one car, two colours" and
+        // "two pets, two names" are the same shape in wording and only one of them disagrees.
+        // Whatever model the caller already has decides, and posts the yes back here.
+        //
+        // Idempotent by pair: an adjudication that is retried after a dropped response returns the
+        // conflict already open rather than raising the same question twice.
+        app.MapPost("/api/memory/conflicts", async (
+            ConflictRecordRequest request, IMemoryRepository repository, CancellationToken ct) =>
+        {
+            var scope = ScopeFrom(request.UserId, request.CompanionId);
+
+            if (request.ExistingMemoryId == request.NewMemoryId)
+                return Results.BadRequest(new { error = "A memory cannot contradict itself." });
+
+            // Both sides fetched through the scope, so a caller cannot raise a contradiction about
+            // a memory it is not allowed to see — which would leak its existence through the very
+            // conflict list built to surface it.
+            var existing = await repository.GetAsync(request.ExistingMemoryId, scope, ct);
+            var fresh    = await repository.GetAsync(request.NewMemoryId, scope, ct);
+
+            if (existing is null || fresh is null)
+                return Results.NotFound(new
+                {
+                    error = "Both memories must exist and be visible to this scope.",
+                });
+
+            var open = await repository.GetConflictsAsync(scope, true, ct);
+            var already = open.FirstOrDefault(c =>
+                (c.NewMemoryId == fresh.Id && c.ExistingMemoryId == existing.Id) ||
+                (c.NewMemoryId == existing.Id && c.ExistingMemoryId == fresh.Id));
+
+            if (already is not null)
+                return Results.Ok(already);
+
+            var conflict = new MemoryConflict
+            {
+                UserId           = fresh.UserId,
+                NewMemoryId      = fresh.Id,
+                ExistingMemoryId = existing.Id,
+                SubjectRef       = fresh.SubjectRef,
+                Predicate        = fresh.Predicate,
+                Kind             = ConflictKind.SubstitutionContradiction,
+                CompanionId      = scope.CompanionId,
+
+                // Same shape the service writes for the contradictions it finds itself, so the
+                // studio and the chat card render both without knowing which produced them.
+                Description =
+                    $"newer: \"{PolarityDetector.Statement(fresh)}\" " +
+                    $"(recorded {fresh.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC) — " +
+                    $"earlier: \"{PolarityDetector.Statement(existing)}\" " +
+                    $"(recorded {existing.ValidFrom:yyyy-MM-dd HH:mm:ss} UTC) — {request.Reason}",
+            };
+
+            await repository.ExecuteAsync(
+                new MemoryWriteBatch().RecordConflict(conflict), "api:POST /api/memory/conflicts", ct);
+
+            return Results.Created($"/api/memory/conflicts/{conflict.Id}", conflict);
         });
 
         app.MapPost("/api/memory/conflicts/{id:guid}/resolve", async (

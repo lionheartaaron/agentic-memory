@@ -73,6 +73,17 @@ public enum ConflictKind
     /// <summary>One memory denies what another asserts, with no structured slot on either side.
     /// Detected from wording and polarity rather than from the slot registry.</summary>
     PolarityContradiction = 5,
+
+    /// <summary>
+    /// Two memories fill the same claim with different values, with no structured slot on either
+    /// side and no negation on either — "my car is a blue Corolla" against "my car is a red Civic".
+    ///
+    /// The slot registry cannot see it (nothing registered), and the polarity detector cannot see
+    /// it (both affirmative), so before this existed the pair coexisted and retrieval returned both.
+    /// Proposed by wording and adjudicated by a model, never by wording alone: the same shape covers
+    /// "I have a dog called Salt" and "I have a cat called Pepper", which are both true.
+    /// </summary>
+    SubstitutionContradiction = 6,
 }
 
 public enum ConflictStatus

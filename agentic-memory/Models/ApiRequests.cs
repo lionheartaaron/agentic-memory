@@ -67,6 +67,25 @@ public record ConflictResolveRequest(
     string? CompanionId = null);
 
 /// <summary>
+/// Record a contradiction that something else judged.
+///
+/// The store proposes substitution pairs on <c>StoreResult.ContradictionCandidates</c> but refuses
+/// to call them contradictions itself, because wording cannot tell two claims about one car from
+/// two facts about two pets. This is where the answer comes back once a model has read them.
+///
+/// Deliberately narrow: the kind is fixed rather than taken from the caller, so this cannot be used
+/// to manufacture an immutable violation or a cross-scope contradiction. Those are findings the
+/// service makes about its own invariants, and no client is in a position to assert one.
+/// </summary>
+/// <param name="Reason">Why they conflict, in the adjudicator's words. Shown to the user.</param>
+public record ConflictRecordRequest(
+    Guid ExistingMemoryId,
+    Guid NewMemoryId,
+    string Reason,
+    string? UserId = null,
+    string? CompanionId = null);
+
+/// <summary>
 /// Request model for local generative inference.
 /// </summary>
 /// <param name="UserPrompt">The user message to send to the model.</param>

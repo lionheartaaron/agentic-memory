@@ -48,6 +48,29 @@ public static class TextAnalysis
         "stopped", "quit", "former", "ex", "longer",
     };
 
+    /// <summary>
+    /// Words that stand in for "any member at all" instead of naming one.
+    ///
+    /// These separate the two kinds of denial that a bag of words otherwise makes identical. "Not
+    /// allergic to bears" denies one value and leaves the rest of the set alone; "not allergic to
+    /// anything" claims the set is empty, which every later value contradicts outright. Only the
+    /// second is safe to replace automatically, so the distinction has to be visible here.
+    ///
+    /// Held in stemmed form because <see cref="ContentSkeleton"/> stems: "anything" reaches this set
+    /// as "anyth", and a raw list would silently never match.
+    /// </summary>
+    public static readonly HashSet<string> UniversalPlaceholders =
+        new[]
+        {
+            "anything", "anyone", "anybody", "any", "all", "known", "whatsoever",
+            "nothing", "none", "nobody", "everything", "everyone", "else", "specific", "particular",
+        }
+        .Select(Stem)
+        .ToHashSet(StringComparer.Ordinal);
+
+    /// <summary>Shortest prefix two tokens must share to count as forms of one root.</summary>
+    private const int RootPrefixLength = 5;
+
     public static bool IsStopWord(string term) => StopWords.Contains(term);
 
     /// <summary>
@@ -157,4 +180,37 @@ public static class TextAnalysis
     /// same claim with opposite signs.</summary>
     public static List<string> ContentSkeleton(string? text) =>
         Tokenize(text).Where(t => !NegationMarkers.Contains(t)).ToList();
+
+    /// <summary>
+    /// True when <paramref name="skeleton"/> names no value of its own — everything in it is either
+    /// the topic the two statements share or a placeholder standing in for "any at all".
+    ///
+    /// This is the wording half of a negative existential. "The user is not allergic to anything"
+    /// against "the user is allergic to bears" leaves the residue {anything}, which names nothing;
+    /// "the user is not allergic to bears" against "the user is allergic to peanuts" leaves {bears},
+    /// which names a value and is therefore an ordinary denial rather than a claim of emptiness.
+    ///
+    /// Topic membership is matched by root as well as exactly, because the two halves of this
+    /// comparison routinely use different parts of speech for the same idea — the slot is
+    /// "allergies", the sentence says "allergic", and the conservative stemmer here deliberately
+    /// does not conflate them.
+    /// </summary>
+    public static bool NamesNoSpecificValue(IEnumerable<string> skeleton, IReadOnlyCollection<string> topic)
+    {
+        foreach (var term in skeleton)
+        {
+            if (UniversalPlaceholders.Contains(term)) continue;
+            if (topic.Contains(term)) continue;
+            if (topic.Any(t => SharesRoot(t, term))) continue;
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>"allergies" and "allergic" are the same idea in different parts of speech.</summary>
+    private static bool SharesRoot(string a, string b) =>
+        a.Length >= RootPrefixLength && b.Length >= RootPrefixLength &&
+        a.AsSpan(0, RootPrefixLength).SequenceEqual(b.AsSpan(0, RootPrefixLength));
 }
